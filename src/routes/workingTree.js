@@ -147,4 +147,121 @@ router.get('/', requireAnyPermission(
   res.json({ mode, summary, people, unassignedPool: unassigned });
 });
 
+/**
+ * Drill-down: list leads (or follow-up rows) for a working-tree bucket.
+ * Query: bucket, userId? (optional — omit for team/all aggregate)
+ */
+router.get('/leads', requireAnyPermission(
+  'working_tree:view_all',
+  'working_tree:view_team',
+  'working_tree:view_own',
+), (req, res) => {
+  const { bucket, userId } = req.query;
+  if (!bucket) {
+    return res.status(400).json({ error: 'bucket required' });
+  }
+
+  const canAll = roleHasPermission(req.user.role, 'working_tree:view_all');
+  const canTeam = roleHasPermission(req.user.role, 'working_tree:view_team');
+
+  let assigneeFilter = null;
+  if (userId) {
+    if (!canAll && !canTeam && userId !== req.user.id) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    if (!canAll && canTeam && req.user.role === 'telesales' && userId !== req.user.id) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    assigneeFilter = userId;
+  } else if (!canAll && !canTeam) {
+    assigneeFilter = req.user.id;
+  } else if (!canAll && canTeam && req.user.role === 'telesales') {
+    assigneeFilter = req.user.id;
+  }
+
+  const leadCols = `l.id, l.name, l.email, l.phone, l.company, l.country, l.source, l.status,
+    l.assigned_to, l.next_follow_up_at, l.estimated_value, l.created_at,
+    u.name AS assigned_name`;
+
+  const leadJoin = `FROM leads l LEFT JOIN users u ON u.id = l.assigned_to`;
+
+  let rows = [];
+  let title = String(bucket).replace(/_/g, ' ');
+
+  if (bucket === 'unassigned') {
+    if (!canAll && !canTeam) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    rows = db
+      .prepare(
+        `SELECT ${leadCols} ${leadJoin}
+         WHERE l.assigned_to IS NULL AND l.status IN (${OPEN_STATUSES.map(() => '?').join(',')})
+         ORDER BY l.created_at DESC`,
+      )
+      .all(...OPEN_STATUSES);
+    title = 'Unassigned open leads';
+  } else if (bucket === 'open' || bucket === 'open_leads') {
+    const clauses = [`l.status IN (${OPEN_STATUSES.map(() => '?').join(',')})`];
+    const params = [...OPEN_STATUSES];
+    if (assigneeFilter) {
+      clauses.push('l.assigned_to = ?');
+      params.push(assigneeFilter);
+    } else {
+      clauses.push('l.assigned_to IS NOT NULL');
+    }
+    rows = db
+      .prepare(`SELECT ${leadCols} ${leadJoin} WHERE ${clauses.join(' AND ')} ORDER BY l.updated_at DESC`)
+      .all(...params);
+    title = 'Open leads';
+  } else if (['new', 'contacted', 'follow_up_scheduled', 'converted', 'lost'].includes(bucket)) {
+    const clauses = ['l.status = ?'];
+    const params = [bucket];
+    if (assigneeFilter) {
+      clauses.push('l.assigned_to = ?');
+      params.push(assigneeFilter);
+    }
+    rows = db
+      .prepare(`SELECT ${leadCols} ${leadJoin} WHERE ${clauses.join(' AND ')} ORDER BY l.updated_at DESC`)
+      .all(...params);
+    title = bucket.replace(/_/g, ' ');
+  } else if (
+    bucket === 'followups_overdue' ||
+    bucket === 'followups_pending' ||
+    bucket === 'followups_today' ||
+    bucket === 'overdue'
+  ) {
+    const fuClauses = [];
+    const params = [];
+    if (bucket === 'followups_overdue' || bucket === 'overdue') {
+      fuClauses.push(`f.status IN ('pending','overdue') AND f.due_at < datetime('now')`);
+      title = 'Overdue follow-ups';
+    } else if (bucket === 'followups_pending') {
+      fuClauses.push(`f.status = 'pending'`);
+      title = 'Pending follow-ups';
+    } else {
+      fuClauses.push(`f.status IN ('pending','overdue') AND date(f.due_at) = date('now')`);
+      title = 'Follow-ups due today';
+    }
+    if (assigneeFilter) {
+      fuClauses.push('f.assigned_to = ?');
+      params.push(assigneeFilter);
+    }
+    rows = db
+      .prepare(
+        `SELECT DISTINCT ${leadCols},
+          f.id AS follow_up_id, f.due_at AS follow_up_due, f.status AS follow_up_status, f.note AS follow_up_note
+         FROM follow_ups f
+         JOIN leads l ON l.id = f.lead_id
+         LEFT JOIN users u ON u.id = l.assigned_to
+         WHERE ${fuClauses.join(' AND ')}
+         ORDER BY f.due_at ASC`,
+      )
+      .all(...params);
+  } else {
+    return res.status(400).json({ error: 'Unknown bucket', bucket });
+  }
+
+  res.json({ bucket, title, userId: assigneeFilter || null, leads: rows });
+});
+
 export default router;
