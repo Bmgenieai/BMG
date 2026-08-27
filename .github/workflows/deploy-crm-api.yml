@@ -1,0 +1,37 @@
+name: Deploy CRM API to Windows
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-crm-api-windows
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy CRM API (Windows)
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH pull + PM2 restart
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          command_timeout: 20m
+          script: |
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+            $path = '${{ secrets.CRM_DEPLOY_PATH }}'
+            if ([string]::IsNullOrWhiteSpace($path)) { $path = 'D:\bmg-crm' }
+            Set-Location $path
+            & .\scripts\windows\deploy-crm-api.ps1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & .\scripts\windows\verify-crm-api.ps1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Host 'ALL_OK'
+            exit 0
