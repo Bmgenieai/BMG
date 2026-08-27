@@ -13,6 +13,7 @@ import followUpsRoutes from './routes/followUps.js';
 import workingTreeRoutes from './routes/workingTree.js';
 import analyticsRoutes from './routes/analytics.js';
 import ingestRoutes from './routes/ingest.js';
+import emailRoutes from './routes/email.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -69,6 +70,7 @@ app.use('/api/follow-ups', followUpsRoutes);
 app.use('/api/working-tree', workingTreeRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/ingest', ingestRoutes);
+app.use('/api/email', emailRoutes);
 
 // cPanel / production: serve React build from frontend/dist at site root
 const distPath = path.join(__dirname, '..', '..', 'frontend', 'dist');
