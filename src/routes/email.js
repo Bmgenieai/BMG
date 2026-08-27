@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { v4 as uuid } from 'uuid';
 import { authRequired, requirePermission } from '../middleware/auth.js';
 import { db } from '../db.js';
 import { brevoEnabled, sendTransactionalEmail } from '../lib/brevo.js';
@@ -43,15 +44,9 @@ router.post(
       });
 
       db.prepare(
-        `INSERT INTO lead_activities (id, lead_id, user_id, type, body, created_at)
-         VALUES (?, ?, ?, ?, ?, datetime('now'))`,
-      ).run(
-        crypto.randomUUID(),
-        lead.id,
-        req.user.id,
-        'email_sent',
-        `Brevo: ${subject}`,
-      );
+        `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(uuid(), lead.id, req.user.id, 'email_sent', `Brevo: ${subject}`);
 
       res.json({ ok: true, brevo: result });
     } catch (err) {
