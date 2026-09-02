@@ -1,73 +1,84 @@
-# Connect git on Windows so CRM backend auto-deploys
+# Connect git + auto-deploy pipeline (Windows CRM API)
 
-Do this **after** `http://127.0.0.1:4050/api/health` works and `.env` exists.
+Production folder on office PC: **`D:\crm-api.bmgenie.ai`**  
+GitHub repo: **`Bmgenieai/BMG`** (branch `main`)
 
-The office zip had **no `.git`**. Pipeline needs the folder linked to GitHub **`Bmgenieai/BMG`**.
+## One-time: link zip folder to GitHub
 
-## One-time on `D:\bmg-crm` (remote or TeamViewer)
+If the server was deployed from a zip (no `.git`), run once in **PowerShell as Administrator**:
 
 ```powershell
-cd D:\bmg-crm
+cd D:\crm-api.bmgenie.ai
 
-# Keep .env and SQLite data — never delete them
+Copy-Item .env D:\.env.crm.backup -Force
+Copy-Item -Recurse data D:\data.crm.backup -Force -ErrorAction SilentlyContinue
+
 git init
 git remote add origin https://github.com/Bmgenieai/BMG.git
 git fetch origin main
-git checkout -B main origin/main
+git reset --hard origin/main
 
-# If git complains about local files, prefer remote code but KEEP .env:
-#   git reset --hard origin/main
-#   (then confirm .env still exists; restore from ENV-FOR-WINDOWS.env if needed)
+Copy-Item D:\.env.crm.backup .env -Force
+Copy-Item -Recurse D:\data.crm.backup data -Force -ErrorAction SilentlyContinue
 
-git status
-# Should track origin/main. .env must remain untracked (in .gitignore).
+npm install
 ```
 
-Ensure `.gitignore` includes:
+Start/restart the API (IIS site or PM2) after first pull.
 
-```
-.env
-.env.local
-node_modules/
-data/
-*.db
-```
+## GitHub Actions secrets
 
-## GitHub Actions secrets (`Bmgenieai/BMG`)
-
-Repo → **Settings → Secrets and variables → Actions**
+**Bmgenieai/BMG** → Settings → Secrets and variables → Actions
 
 | Secret | Value |
 |--------|--------|
-| `DEPLOY_HOST` | Same as main BMGenie Windows SSH (or `202.59.75.242`) |
-| `DEPLOY_USER` | Windows SSH user |
-| `SERVER_PASSWORD` | Windows SSH password |
-| `CRM_DEPLOY_PATH` | `D:\bmg-crm` (optional; workflow defaults to this) |
+| `DEPLOY_HOST` | Windows public IP (e.g. same as main BMGenie server) |
+| `DEPLOY_USER` | SSH username (e.g. `Wasim`) |
+| `SERVER_PASSWORD` | SSH password |
+| `CRM_DEPLOY_PATH` | `D:\crm-api.bmgenie.ai` |
 
-Use the **same** `DEPLOY_*` secrets as `Bmgenieai/backend` if it is the same PC.
+Use the same `DEPLOY_*` secrets as the main backend repo if it is the same machine.
 
-## How deploys work after that
+## Enable SSH on Windows (required for pipeline)
 
-```text
-Push to Bmgenieai/BMG  main
-    → GitHub Action "Deploy CRM API to Windows"
-    → SSH into PC
-    → git pull in D:\bmg-crm
-    → npm ci
-    → pm2 restart bmg-crm-api
-    → verify http://127.0.0.1:4050/api/health
+On the Windows PC:
+
+1. **Settings → Apps → Optional features → OpenSSH Server** → Install  
+2. **Services** → `OpenSSH SSH Server` → Start + Automatic  
+3. Firewall: allow inbound **TCP 22** (or your SSH port)
+
+Test from your laptop:
+
+```bash
+ssh Wasim@YOUR_WINDOWS_IP
 ```
 
-Frontend is separate:
+## What happens on every push to `main`
 
 ```text
-Push to Bmgenieai/BMG-CRM  main  →  Vercel  →  crm.bmgenie.ai
+Push to Bmgenieai/BMG main
+  → GitHub Action "Deploy CRM API to Windows"
+  → SSH into Windows PC
+  → D:\crm-api.bmgenie.ai\scripts\windows\deploy-crm-api.ps1
+       • stop API (PM2 or kill port 4050)
+       • git pull
+       • npm install
+       • restart (PM2 or touch web.config for IIS)
+  → verify http://127.0.0.1:4050/api/health
 ```
 
-## First test of pipeline
+## Manual deploy (fallback)
 
-1. From your laptop: tiny change on `BMG` (e.g. README) → push as Bmgenieai author  
-2. GitHub → **BMG** → **Actions** → workflow green  
-3. On Windows: `pm2 status` still online; health still OK  
+```powershell
+cd D:\crm-api.bmgenie.ai
+.\scripts\windows\deploy-crm-api.ps1
+.\scripts\windows\verify-crm-api.ps1
+```
 
-Office person does **not** need to redeploy after this.
+## First pipeline test
+
+1. Push any commit to `Bmgenieai/BMG` `main`
+2. GitHub → **Actions** → **Deploy CRM API to Windows** → should go green
+3. Check `https://crm-api.bmgenie.ai/api/health`
+
+Frontend deploys separately: push **BMG-CRM** → Vercel → `crm.bmgenie.ai`

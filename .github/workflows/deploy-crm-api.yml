@@ -3,9 +3,6 @@ name: Deploy CRM API to Windows
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
   workflow_dispatch:
 
 concurrency:
@@ -17,7 +14,7 @@ jobs:
     name: Deploy CRM API (Windows)
     runs-on: ubuntu-latest
     steps:
-      - name: SSH pull + PM2 restart
+      - name: SSH deploy on Windows PC
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -27,7 +24,8 @@ jobs:
           script: |
             Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
             $path = '${{ secrets.CRM_DEPLOY_PATH }}'
-            if ([string]::IsNullOrWhiteSpace($path)) { $path = 'D:\bmg-crm' }
+            if ([string]::IsNullOrWhiteSpace($path)) { $path = 'D:\crm-api.bmgenie.ai' }
+            if (-not (Test-Path $path)) { throw "CRM path not found: $path" }
             Set-Location $path
             & .\scripts\windows\deploy-crm-api.ps1
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

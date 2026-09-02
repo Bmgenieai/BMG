@@ -14,7 +14,7 @@ Leads are **pushed from bmgenie.ai → CRM API** when users sign up, use free cr
 
 ## Step 1 — Windows CRM API (one-time)
 
-On the machine at `D:\bmg-crm` (same PC that ran old BMGenie, CRM-only now):
+On the machine at `D:\crm-api.bmgenie.ai`:
 
 ```powershell
 cd D:\bmg-crm
@@ -56,32 +56,32 @@ Health check: `https://crm-api.bmgenie.ai/api/health`
 
 ---
 
-## Step 2 — GitHub Actions pipeline (auto-deploy backend)
+## Step 2 — GitHub Actions pipeline (auto-deploy on push to main)
 
-Pipeline already exists: `.github/workflows/deploy-crm-api.yml` in **Bmgenieai/BMG**.
+Pipeline: **Bmgenieai/BMG** → Actions → **Deploy CRM API to Windows**
 
-### If pipeline is not set up yet
-
-1. On Windows, init git in `D:\bmg-crm` (see `docs/GIT-AND-PIPELINE.md`)
-2. GitHub → **Bmgenieai/BMG** → Settings → Secrets → Actions:
+### GitHub secrets (Bmgenieai/BMG → Settings → Secrets)
 
 | Secret | Value |
 |--------|--------|
-| `DEPLOY_HOST` | Windows public IP |
+| `DEPLOY_HOST` | Windows server public IP |
 | `DEPLOY_USER` | SSH username |
 | `SERVER_PASSWORD` | SSH password |
-| `CRM_DEPLOY_PATH` | `D:\bmg-crm` |
+| `CRM_DEPLOY_PATH` | `D:\crm-api.bmgenie.ai` |
 
-3. Push to `main` on BMG repo → Actions runs → `git pull` + `npm ci` + `pm2 restart bmg-crm-api`
+### Windows requirements
 
-### Manual deploy (if pipeline unavailable)
+- **OpenSSH Server** installed and running (port 22)
+- Folder linked to git (see `docs/GIT-AND-PIPELINE.md`)
+- `.env` present in deploy folder
+
+Every push to `main` runs: stop API → `git pull` → `npm install` → restart → health check.
+
+### Manual deploy (if pipeline not ready)
 
 ```powershell
-cd D:\bmg-crm
-git pull origin main
-npm ci
-pm2 restart bmg-crm-api --update-env
-curl http://127.0.0.1:4050/api/health
+cd D:\crm-api.bmgenie.ai
+.\scripts\windows\deploy-crm-api.ps1
 ```
 
 ---
