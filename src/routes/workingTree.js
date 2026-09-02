@@ -213,7 +213,7 @@ router.get('/leads', requireAnyPermission(
       .prepare(`SELECT ${leadCols} ${leadJoin} WHERE ${clauses.join(' AND ')} ORDER BY l.updated_at DESC`)
       .all(...params);
     title = 'Open leads';
-  } else if (['new', 'contacted', 'follow_up_scheduled', 'converted', 'lost'].includes(bucket)) {
+  } else if (['new', 'contacted', 'interested', 'neutral', 'follow_up_scheduled', 'converted', 'not_interested', 'lost'].includes(bucket)) {
     const clauses = ['l.status = ?'];
     const params = [bucket];
     if (assigneeFilter) {

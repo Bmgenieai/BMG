@@ -7,6 +7,9 @@ import { authRequired, requirePermission, requireAnyPermission } from '../middle
 import {
   LEAD_SOURCES,
   LEAD_STATUSES,
+  LEAD_STATUS_TABS,
+  PRODUCT_LEAD_TABS,
+  STATUS_LABELS,
   canAccessLead,
   roleHasPermission,
 } from '../lib/permissions.js';
@@ -38,7 +41,50 @@ router.get('/meta', (_req, res) => {
   res.json({
     sources: Object.values(LEAD_SOURCES),
     statuses: LEAD_STATUSES,
+    statusLabels: STATUS_LABELS,
+    statusTabs: LEAD_STATUS_TABS,
+    productTabs: PRODUCT_LEAD_TABS,
   });
+});
+
+/** Counts for sidebar tabs (marketing dashboard style). */
+router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
+  const assigneeClause = !roleHasPermission(req.user.role, 'leads:view_all')
+    ? 'AND assigned_to = ?'
+    : '';
+  const assigneeParam = assigneeClause ? [req.user.id] : [];
+
+  const total = db
+    .prepare(`SELECT COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause}`)
+    .get(...assigneeParam).c;
+
+  const byStatus = db
+    .prepare(
+      `SELECT status, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} GROUP BY status`,
+    )
+    .all(...assigneeParam);
+  const statusMap = Object.fromEntries(byStatus.map((r) => [r.status, r.c]));
+
+  const statusCounts = {};
+  for (const tab of LEAD_STATUS_TABS) {
+    if (tab.statuses) {
+      statusCounts[tab.slug] = tab.statuses.reduce((s, st) => s + (statusMap[st] || 0), 0);
+    } else {
+      statusCounts[tab.slug] = statusMap[tab.status] || 0;
+    }
+  }
+
+  const bySource = db
+    .prepare(
+      `SELECT source, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} GROUP BY source`,
+    )
+    .all(...assigneeParam);
+  const sourceMap = Object.fromEntries(bySource.map((r) => [r.source, r.c]));
+  const productCounts = Object.fromEntries(
+    PRODUCT_LEAD_TABS.map((t) => [t.slug, sourceMap[t.source] || 0]),
+  );
+
+  res.json({ total, statusCounts, productCounts });
 });
 
 router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
@@ -62,8 +108,14 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     params.push(source);
   }
   if (status) {
-    clauses.push('l.status = ?');
-    params.push(status);
+    const statuses = String(status).split(',').map((s) => s.trim()).filter(Boolean);
+    if (statuses.length > 1) {
+      clauses.push(`l.status IN (${statuses.map(() => '?').join(',')})`);
+      params.push(...statuses);
+    } else {
+      clauses.push('l.status = ?');
+      params.push(statuses[0]);
+    }
   }
   if (q) {
     clauses.push(

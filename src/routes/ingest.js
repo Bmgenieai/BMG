@@ -38,10 +38,10 @@ function findOpenByUser(bmgenieUserId, email) {
       .prepare(
         `SELECT * FROM leads
          WHERE bmgenie_user_id = ?
-           AND status IN ('new','contacted','follow_up_scheduled')
+           AND status IN (${OPEN_STATUSES.map(() => '?').join(',')})
          ORDER BY created_at DESC LIMIT 1`,
       )
-      .get(bmgenieUserId);
+      .get(bmgenieUserId, ...OPEN_STATUSES);
     if (byId) return byId;
   }
   if (email) {
@@ -49,10 +49,10 @@ function findOpenByUser(bmgenieUserId, email) {
       .prepare(
         `SELECT * FROM leads
          WHERE email = ? COLLATE NOCASE
-           AND status IN ('new','contacted','follow_up_scheduled')
+           AND status IN (${OPEN_STATUSES.map(() => '?').join(',')})
          ORDER BY created_at DESC LIMIT 1`,
       )
-      .get(email);
+      .get(email, ...OPEN_STATUSES);
   }
   return null;
 }

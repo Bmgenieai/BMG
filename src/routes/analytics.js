@@ -25,10 +25,13 @@ router.get(
       .prepare(
         `SELECT
           COUNT(*) AS total_leads,
-          SUM(CASE WHEN status IN ('new','contacted','follow_up_scheduled') THEN 1 ELSE 0 END) AS open_leads,
+          SUM(CASE WHEN status IN ('new','contacted','interested','neutral','follow_up_scheduled') THEN 1 ELSE 0 END) AS open_leads,
+          SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) AS new_leads,
+          SUM(CASE WHEN status = 'interested' THEN 1 ELSE 0 END) AS interested,
+          SUM(CASE WHEN status = 'follow_up_scheduled' THEN 1 ELSE 0 END) AS follow_up,
           SUM(CASE WHEN status = 'converted' THEN 1 ELSE 0 END) AS converted,
-          SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) AS lost,
-          SUM(CASE WHEN assigned_to IS NULL AND status IN ('new','contacted','follow_up_scheduled') THEN 1 ELSE 0 END) AS unassigned
+          SUM(CASE WHEN status IN ('not_interested','lost') THEN 1 ELSE 0 END) AS lost,
+          SUM(CASE WHEN assigned_to IS NULL AND status IN ('new','contacted','interested','neutral','follow_up_scheduled') THEN 1 ELSE 0 END) AS unassigned
          FROM leads WHERE 1=1 ${leadFilter}`,
       )
       .get(...params);
@@ -70,7 +73,7 @@ router.get(
         .prepare(
           `SELECT u.id, u.name, u.email,
             COUNT(l.id) AS leads_assigned,
-            SUM(CASE WHEN l.status IN ('new','contacted','follow_up_scheduled') THEN 1 ELSE 0 END) AS open_leads,
+            SUM(CASE WHEN l.status IN ('new','contacted','interested','neutral','follow_up_scheduled') THEN 1 ELSE 0 END) AS open_leads,
             SUM(CASE WHEN l.status = 'converted' THEN 1 ELSE 0 END) AS converted,
             SUM(CASE WHEN l.status = 'lost' THEN 1 ELSE 0 END) AS lost,
             (SELECT COUNT(*) FROM follow_ups f WHERE f.assigned_to = u.id AND f.status IN ('pending','overdue') AND f.due_at < datetime('now')) AS overdue_followups,

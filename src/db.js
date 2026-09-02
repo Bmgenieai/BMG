@@ -107,6 +107,13 @@ export function migrate() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+
+  // One-time: legacy status → marketing pipeline
+  try {
+    db.prepare(`UPDATE leads SET status = 'not_interested' WHERE status = 'lost'`).run();
+  } catch {
+    /* ignore */
+  }
 }
 
 migrate();
