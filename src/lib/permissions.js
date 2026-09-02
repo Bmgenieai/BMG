@@ -19,7 +19,6 @@ export const PERMISSIONS = {
   'leads:update_own': ['ceo', 'manager', 'telesales'],
   'leads:import': ['ceo', 'manager'],
   'leads:assign': ['ceo', 'manager'],
-  'leads:generate_segments': ['ceo', 'manager'],
 
   // Follow-ups
   'followups:view_all': ['ceo', 'manager'],
