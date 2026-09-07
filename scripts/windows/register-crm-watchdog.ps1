@@ -50,14 +50,14 @@ if (-not $cred) {
 
 $action = New-ScheduledTaskAction -Execute $wrapper
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-  -RepetitionInterval (New-TimeSpan -Minutes 120) `
+  -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
   -RepetitionDuration (New-TimeSpan -Days 3650)
 
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
   -DontStopIfGoingOnBatteries `
   -StartWhenAvailable `
-  -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+  -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
   -MultipleInstances IgnoreNew
 
 try {
@@ -69,7 +69,7 @@ try {
     -Password $cred.GetNetworkCredential().Password `
     -RunLevel Highest `
     -Settings $settings `
-    -Description 'CRM Watchdog: every 120 min check health and pm2 restart if down' | Out-Null
+    -Description "CRM Watchdog: every $IntervalMinutes min check health and pm2 restart if down" | Out-Null
 } catch {
   $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
   if (-not (Test-Path $schtasks)) {
@@ -79,7 +79,7 @@ try {
   if ($user -notmatch '\\') { $user = "$env:USERDOMAIN\$user" }
   $pass = $cred.GetNetworkCredential().Password
   $tr = "`"$wrapper`""
-  $out = & $schtasks /Create /TN $TaskName /TR $tr /SC MINUTE /MO 120 /RU $user /RP $pass /RL HIGHEST /F 2>&1
+  $out = & $schtasks /Create /TN $TaskName /TR $tr /SC MINUTE /MO $IntervalMinutes /RU $user /RP $pass /RL HIGHEST /F 2>&1
   if ($LASTEXITCODE -ne 0) {
     throw "Both Register-ScheduledTask and schtasks failed. Last: $out / First: $_"
   }
@@ -93,6 +93,6 @@ if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) {
 }
 
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-Write-Host ("OK: '{0}' state={1} - every 120 minutes" -f $task.TaskName, $task.State)
+Write-Host ("OK: '{0}' state={1} - every {2} minutes" -f $task.TaskName, $task.State, $IntervalMinutes)
 Write-Host ("Log: {0}" -f (Join-Path $Root 'logs\crm-watchdog.log'))
 Write-Host 'Start-ScheduledTask -TaskName BMG-CRM-Watchdog'
