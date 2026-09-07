@@ -1,10 +1,11 @@
-# Register BMG-CRM-Watchdog Scheduled Task (every 120 minutes).
+# Register BMG-CRM-Watchdog Scheduled Task (every 10 minutes).
 # Run: Right-click PowerShell -> Run as administrator
 #Requires -Version 5.1
 #Requires -RunAsAdministrator
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'BMG-CRM-Watchdog'
+$IntervalMinutes = 10
 
 $sys32 = Join-Path $env:SystemRoot 'System32'
 if ($env:Path -notlike "*${sys32}*") {

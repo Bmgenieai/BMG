@@ -1,5 +1,5 @@
 # CRM Watchdog - if CRM API is down, bring it back via PM2.
-# Runs every 120 minutes via Scheduled Task BMG-CRM-Watchdog.
+# Runs every 10 minutes via Scheduled Task BMG-CRM-Watchdog.
 #Requires -Version 5.1
 
 $ErrorActionPreference = 'Continue'
