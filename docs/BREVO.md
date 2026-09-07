@@ -5,7 +5,7 @@ Cold / sales outreach from CRM via **Brevo** transactional API + contact list sy
 
 ## Brevo account setup
 1. Log in: https://app.brevo.com (Bmgenie account)
-2. **Senders** — verify domain or email (e.g. `sales@bmgenie.ai`)
+2. **Senders** — verify domain or email (e.g. `magic.retouching@bmgenie.ai`)
 3. **SMTP & API** → create API key (`xkeysib-...`)
 4. **CRM → Lists** — note list ID (e.g. `#2` for "Your first list")
 
@@ -14,7 +14,7 @@ Cold / sales outreach from CRM via **Brevo** transactional API + contact list sy
 ```env
 BREVO_ENABLED=true
 BREVO_API_KEY=xkeysib-your-key-here
-BREVO_SENDER_EMAIL=sales@bmgenie.ai
+BREVO_SENDER_EMAIL=magic.retouching@bmgenie.ai
 BREVO_SENDER_NAME=BMGenie Sales
 BREVO_LIST_ID=2
 ```

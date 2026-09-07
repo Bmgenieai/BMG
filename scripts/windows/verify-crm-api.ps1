@@ -13,6 +13,9 @@ foreach ($i in 1..8) {
     $res = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 10
     if ($res.ok) {
       Write-Host "Health OK: $($res | ConvertTo-Json -Compress)"
+      if ($res.deployMarker) {
+        Write-Host "deployMarker: $($res.deployMarker)"
+      }
       $ok = $true
       break
     }

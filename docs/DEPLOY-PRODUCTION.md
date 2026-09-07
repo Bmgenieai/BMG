@@ -45,7 +45,7 @@ CRM_INGEST_API_KEY=<generate-long-random-secret>
 # Brevo cold email — paste from app.brevo.com → SMTP & API
 BREVO_ENABLED=true
 BREVO_API_KEY=xkeysib-xxxxxxxx
-BREVO_SENDER_EMAIL=sales@bmgenie.ai
+BREVO_SENDER_EMAIL=magic.retouching@bmgenie.ai
 BREVO_SENDER_NAME=BMGenie Sales
 BREVO_LIST_ID=2
 ```
@@ -138,7 +138,7 @@ Expected: `{"ok":true,"action":"created",...}`
 
 ## Step 5 — Brevo setup (cold email)
 
-1. https://app.brevo.com → **Senders** → verify `sales@bmgenie.ai`
+1. https://app.brevo.com → **Senders** → verify `magic.retouching@bmgenie.ai`
 2. **SMTP & API** → Create API key → copy `xkeysib-…`
 3. **CRM → Lists** → note list ID (e.g. `#2`)
 4. Paste into Windows `.env` (see Step 1)
