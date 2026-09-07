@@ -110,13 +110,13 @@ function Restart-CrmApi {
 
 Stop-PortListener -Port 4050
 
+# Repo may already be at origin/main (workflow pulls before invoking this script).
+# Still sync here for manual runs.
 git fetch origin main
 if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
 git reset --hard origin/main
 if ($LASTEXITCODE -ne 0) { throw 'git reset --hard failed' }
 git clean -fd -e .env -e .env.local -e node_modules -e data -e web.config
-git pull origin main
-if ($LASTEXITCODE -ne 0) { throw 'git pull failed' }
 
 # npm install is more reliable on Windows when native modules are locked (better-sqlite3)
 npm install

@@ -27,6 +27,11 @@ jobs:
             if ([string]::IsNullOrWhiteSpace($path)) { $path = 'D:\crm-api.bmgenie.ai' }
             if (-not (Test-Path $path)) { throw "CRM path not found: $path" }
             Set-Location $path
+            # Pull FIRST so we run the latest deploy script (not the previous commit's copy)
+            git fetch origin main
+            if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+            git reset --hard origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'git reset --hard failed' }
             & .\scripts\windows\deploy-crm-api.ps1
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             & .\scripts\windows\verify-crm-api.ps1
