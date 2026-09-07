@@ -20,13 +20,19 @@ if ($env:Path -notlike "*${npmBin}*") {
 
 $port = if ($env:CRM_PORT) { $env:CRM_PORT } else { '4050' }
 $healthUrl = "http://127.0.0.1:$port/api/health"
-$logDir = Join-Path $env:LOCALAPPDATA 'BMG-CRM'
+# Prefer project logs folder (easier to find than LOCALAPPDATA under Task Scheduler)
+$logDir = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $logFile = Join-Path $logDir 'crm-watchdog.log'
+# Also mirror under LOCALAPPDATA when available
+$altLogDir = Join-Path $env:LOCALAPPDATA 'BMG-CRM'
+try { New-Item -ItemType Directory -Force -Path $altLogDir | Out-Null } catch {}
+$altLogFile = Join-Path $altLogDir 'crm-watchdog.log'
 
 function Write-WatchLog([string]$msg) {
   $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg"
-  Add-Content -Path $logFile -Value $line -Encoding UTF8
+  Add-Content -Path $logFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+  Add-Content -Path $altLogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
   Write-Host $line
 }
 
