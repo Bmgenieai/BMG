@@ -51,7 +51,12 @@ try {
 } catch {}
 
 Write-Host '==> Starting bmg-crm-api on PM2...'
+# delete may fail if process never existed — ignore that
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 pm2 delete bmg-crm-api 2>$null | Out-Null
+$ErrorActionPreference = $prevEap
+
 pm2 start src/server.js --name bmg-crm-api
 if ($LASTEXITCODE -ne 0) { throw 'pm2 start failed' }
 
