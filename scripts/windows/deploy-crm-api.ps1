@@ -122,14 +122,6 @@ git clean -fd -e .env -e .env.local -e node_modules -e data -e web.config
 npm install
 if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
 
-# TEMPORARY — patch Brevo From address on .env (remove ensure-brevo-sender-env.ps1 after verified)
-$envFile = Join-Path $Root '.env'
-$ensureBrevo = Join-Path $PSScriptRoot 'ensure-brevo-sender-env.ps1'
-if (Test-Path $ensureBrevo) {
-  & $ensureBrevo -EnvFile $envFile
-  if ($LASTEXITCODE -ne 0) { throw 'ensure-brevo-sender-env.ps1 failed' }
-}
-
 Restart-CrmApi
 
 Write-Host 'CRM deploy OK'

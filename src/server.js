@@ -60,7 +60,7 @@ app.get('/api/health', (_req, res) => {
     frontendUrl: FRONTEND_URL || null,
     publicApiUrl: PUBLIC_API_URL || null,
     // CI/CD smoke marker — bump when verifying Windows auto-deploy
-    deployMarker: 'brevo-sender-magic-retouching-2026-09-07',
+    deployMarker: 'cicd-ok-2026-09-07b',
   });
 });
 
