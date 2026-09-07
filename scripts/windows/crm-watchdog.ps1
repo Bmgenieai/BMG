@@ -1,10 +1,10 @@
-# CRM Watchdog — if CRM API is down, bring it back via PM2.
-# Intended to run every 120 minutes via Scheduled Task "BMG-CRM-Watchdog".
+# CRM Watchdog - if CRM API is down, bring it back via PM2.
+# Runs every 120 minutes via Scheduled Task BMG-CRM-Watchdog.
 #Requires -Version 5.1
 
 $ErrorActionPreference = 'Continue'
 $Root = if ($PSScriptRoot) {
-  Resolve-Path (Join-Path $PSScriptRoot '..\..')
+  (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 } else {
   'D:\crm-api.bmgenie.ai'
 }
@@ -50,7 +50,7 @@ function Get-Pm2Cmd {
 function Repair-CrmApi {
   $pm2 = Get-Pm2Cmd
   if (-not $pm2) {
-    Write-WatchLog 'ERROR: pm2.cmd not found — cannot repair'
+    Write-WatchLog 'ERROR: pm2.cmd not found - cannot repair'
     return $false
   }
 
@@ -61,7 +61,8 @@ function Repair-CrmApi {
   if ($LASTEXITCODE -eq 0) {
     & $pm2 restart bmg-crm-api --update-env 2>&1 | Out-String | ForEach-Object { Write-WatchLog $_ }
   } else {
-    & $pm2 start (Join-Path $Root 'src\server.js') --name bmg-crm-api 2>&1 | Out-String | ForEach-Object { Write-WatchLog $_ }
+    $serverJs = Join-Path $Root 'src\server.js'
+    & $pm2 start $serverJs --name bmg-crm-api 2>&1 | Out-String | ForEach-Object { Write-WatchLog $_ }
   }
 
   & $pm2 save 2>$null | Out-Null
@@ -69,14 +70,14 @@ function Repair-CrmApi {
   return (Test-CrmHealthy)
 }
 
-Write-WatchLog "Watchdog check → $healthUrl"
+Write-WatchLog "Watchdog check -> $healthUrl"
 
 if (Test-CrmHealthy) {
-  Write-WatchLog 'OK: CRM API healthy — no action'
+  Write-WatchLog 'OK: CRM API healthy - no action'
   exit 0
 }
 
-Write-WatchLog 'DOWN: CRM API unhealthy — attempting restart'
+Write-WatchLog 'DOWN: CRM API unhealthy - attempting restart'
 if (Repair-CrmApi) {
   Write-WatchLog 'RECOVERED: CRM API is healthy again'
   exit 0
