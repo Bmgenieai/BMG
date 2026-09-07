@@ -6,6 +6,11 @@
 $ErrorActionPreference = 'Stop'
 $TaskName = 'BMG-CRM-Watchdog'
 
+$sys32 = Join-Path $env:SystemRoot 'System32'
+if ($env:Path -notlike "*${sys32}*") {
+  $env:Path = "$sys32;$env:Path"
+}
+
 $Root = if ($PSScriptRoot) {
   (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 } else {
@@ -36,17 +41,43 @@ if (-not $cred) {
   throw 'Cancelled - no credential entered.'
 }
 
-# schtasks /SC MINUTE /MO 120 = every 120 minutes, indefinite (avoids invalid MaxValue duration)
-$user = $cred.UserName
-if ($user -notmatch '\\') {
-  $user = "$env:USERDOMAIN\$user"
-}
-$pass = $cred.GetNetworkCredential().Password
-$tr = "`"$wrapper`""
+$action = New-ScheduledTaskAction -Execute $wrapper
+# Use 10 years (not TimeSpan.MaxValue - Windows rejects that)
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+  -RepetitionInterval (New-TimeSpan -Minutes 120) `
+  -RepetitionDuration (New-TimeSpan -Days 3650)
 
-$create = & schtasks.exe /Create /TN $TaskName /TR $tr /SC MINUTE /MO 120 /RU $user /RP $pass /RL HIGHEST /F
-if ($LASTEXITCODE -ne 0) {
-  throw "schtasks create failed (exit $LASTEXITCODE): $create"
+$settings = New-ScheduledTaskSettingsSet `
+  -AllowStartIfOnBatteries `
+  -DontStopIfGoingOnBatteries `
+  -StartWhenAvailable `
+  -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+  -MultipleInstances IgnoreNew
+
+try {
+  Register-ScheduledTask `
+    -TaskName $TaskName `
+    -Action $action `
+    -Trigger $trigger `
+    -User $cred.UserName `
+    -Password $cred.GetNetworkCredential().Password `
+    -RunLevel Highest `
+    -Settings $settings `
+    -Description 'CRM Watchdog: every 120 min check health and pm2 restart if down' | Out-Null
+} catch {
+  # Fallback: full path to schtasks.exe (SSH/Admin PATH often missing System32)
+  $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
+  if (-not (Test-Path $schtasks)) {
+    throw "Register-ScheduledTask failed: $_. Also missing $schtasks"
+  }
+  $user = $cred.UserName
+  if ($user -notmatch '\\') { $user = "$env:USERDOMAIN\$user" }
+  $pass = $cred.GetNetworkCredential().Password
+  $tr = "`"$wrapper`""
+  $out = & $schtasks /Create /TN $TaskName /TR $tr /SC MINUTE /MO 120 /RU $user /RP $pass /RL HIGHEST /F 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    throw "Both Register-ScheduledTask and schtasks failed. Last: $out / First: $_"
+  }
 }
 
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
