@@ -59,6 +59,8 @@ app.get('/api/health', (_req, res) => {
     environment: process.env.NODE_ENV || 'development',
     frontendUrl: FRONTEND_URL || null,
     publicApiUrl: PUBLIC_API_URL || null,
+    // CI/CD smoke marker — bump when verifying Windows auto-deploy
+    deployMarker: 'cicd-ok-2026-09-07',
   });
 });
 
