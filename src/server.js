@@ -60,7 +60,7 @@ app.get('/api/health', (_req, res) => {
     frontendUrl: FRONTEND_URL || null,
     publicApiUrl: PUBLIC_API_URL || null,
     // CI/CD smoke marker — bump when verifying Windows auto-deploy
-    deployMarker: 'cicd-ok-2026-09-07b',
+    deployMarker: 'lead-gen-employees-2026-09-07',
   });
 });
 

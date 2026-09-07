@@ -106,7 +106,36 @@ export function migrate() {
       occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS lead_employees (
+      id TEXT PRIMARY KEY,
+      lead_id TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      phone TEXT,
+      email TEXT,
+      job_title TEXT,
+      notes TEXT,
+      created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_lead_employees_lead ON lead_employees(lead_id);
   `);
+
+  // Additive columns for telesales lead-gen (safe on existing DBs)
+  const leadAlters = [
+    `ALTER TABLE leads ADD COLUMN state TEXT`,
+    `ALTER TABLE leads ADD COLUMN job_title TEXT`,
+    `ALTER TABLE leads ADD COLUMN created_by TEXT REFERENCES users(id) ON DELETE SET NULL`,
+  ];
+  for (const sql of leadAlters) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* column already exists */
+    }
+  }
 
   // One-time: legacy status → marketing pipeline
   try {

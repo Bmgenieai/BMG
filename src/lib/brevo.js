@@ -159,7 +159,7 @@ Best,
   {
     id: 'meta_intro',
     label: 'Meta / CSV lead intro',
-    sources: ['csv_import', 'manual'],
+    sources: ['csv_import', 'manual', 'telesales'],
     subject: 'BMGenie for {{company}} — AI listing photos',
     htmlContent: `<p>Hi {{first_name}},</p>
 <p>I'm reaching out from BMGenie — we help real-estate media teams deliver HDR-quality listing photos with AI, fast.</p>

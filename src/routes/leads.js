@@ -24,9 +24,12 @@ function leadSelect(extraWhere = '1=1', params = []) {
     .prepare(
       `SELECT l.*,
         u.name AS assigned_name,
-        u.email AS assigned_email
+        u.email AS assigned_email,
+        c.name AS created_by_name,
+        c.email AS created_by_email
        FROM leads l
        LEFT JOIN users u ON u.id = l.assigned_to
+       LEFT JOIN users c ON c.id = l.created_by
        WHERE ${extraWhere}
        ORDER BY
          CASE WHEN l.next_follow_up_at IS NOT NULL AND l.next_follow_up_at <= datetime('now') THEN 0 ELSE 1 END,
@@ -35,6 +38,35 @@ function leadSelect(extraWhere = '1=1', params = []) {
          l.created_at DESC`,
     )
     .all(...params);
+}
+
+function getLeadWithJoins(id) {
+  return db
+    .prepare(
+      `SELECT l.*,
+        u.name AS assigned_name,
+        u.email AS assigned_email,
+        c.name AS created_by_name,
+        c.email AS created_by_email
+       FROM leads l
+       LEFT JOIN users u ON u.id = l.assigned_to
+       LEFT JOIN users c ON c.id = l.created_by
+       WHERE l.id = ?`,
+    )
+    .get(id);
+}
+
+function requireLeadAccess(req, res) {
+  const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(req.params.id);
+  if (!lead) {
+    res.status(404).json({ error: 'Lead not found' });
+    return null;
+  }
+  if (!canAccessLead(req.user, lead)) {
+    res.status(403).json({ error: 'Permission denied' });
+    return null;
+  }
+  return lead;
 }
 
 router.get('/meta', (_req, res) => {
@@ -50,9 +82,9 @@ router.get('/meta', (_req, res) => {
 /** Counts for sidebar tabs (marketing dashboard style). */
 router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
   const assigneeClause = !roleHasPermission(req.user.role, 'leads:view_all')
-    ? 'AND assigned_to = ?'
+    ? 'AND (assigned_to = ? OR created_by = ?)'
     : '';
-  const assigneeParam = assigneeClause ? [req.user.id] : [];
+  const assigneeParam = assigneeClause ? [req.user.id, req.user.id] : [];
 
   const total = db
     .prepare(`SELECT COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause}`)
@@ -93,8 +125,8 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   const params = [];
 
   if (!roleHasPermission(req.user.role, 'leads:view_all')) {
-    clauses.push('l.assigned_to = ?');
-    params.push(req.user.id);
+    clauses.push('(l.assigned_to = ? OR l.created_by = ?)');
+    params.push(req.user.id, req.user.id);
   } else if (assigned_to) {
     clauses.push('l.assigned_to = ?');
     params.push(assigned_to);
@@ -119,10 +151,10 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   }
   if (q) {
     clauses.push(
-      `(l.name LIKE ? OR l.email LIKE ? OR l.company LIKE ? OR l.phone LIKE ? OR l.country LIKE ?)`,
+      `(l.name LIKE ? OR l.email LIKE ? OR l.company LIKE ? OR l.phone LIKE ? OR l.country LIKE ? OR l.state LIKE ? OR l.job_title LIKE ?)`,
     );
     const like = `%${q}%`;
-    params.push(like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like);
   }
 
   const where = clauses.length ? clauses.join(' AND ') : '1=1';
@@ -130,13 +162,7 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
 });
 
 router.get('/:id', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
-  const lead = db
-    .prepare(
-      `SELECT l.*, u.name AS assigned_name, u.email AS assigned_email
-       FROM leads l LEFT JOIN users u ON u.id = l.assigned_to
-       WHERE l.id = ?`,
-    )
-    .get(req.params.id);
+  const lead = getLeadWithJoins(req.params.id);
   if (!lead) return res.status(404).json({ error: 'Lead not found' });
   if (!canAccessLead(req.user, lead)) {
     return res.status(403).json({ error: 'Permission denied' });
@@ -155,7 +181,14 @@ router.get('/:id', requireAnyPermission('leads:view_all', 'leads:view_own'), (re
        WHERE f.lead_id = ? ORDER BY f.due_at ASC`,
     )
     .all(lead.id);
-  res.json({ ...lead, activities, followUps });
+  const employees = db
+    .prepare(
+      `SELECT e.*, us.name AS created_by_name FROM lead_employees e
+       LEFT JOIN users us ON us.id = e.created_by
+       WHERE e.lead_id = ? ORDER BY e.created_at ASC`,
+    )
+    .all(lead.id);
+  res.json({ ...lead, activities, followUps, employees });
 });
 
 router.post('/', requirePermission('leads:create'), (req, res) => {
@@ -165,19 +198,32 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     phone,
     company,
     country,
-    source = 'manual',
+    state,
+    job_title,
+    source: rawSource,
     notes,
     estimated_value,
     bmgenie_user_id,
   } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
+
+  const isTelesales = req.user.role === 'telesales';
+  const source = rawSource || (isTelesales ? 'telesales' : 'manual');
   if (!LEAD_SOURCES[source]) {
     return res.status(400).json({ error: 'Invalid source', allowed: Object.keys(LEAD_SOURCES) });
   }
+  // Telesales can only create telesales-sourced leads
+  if (isTelesales && source !== 'telesales') {
+    return res.status(403).json({ error: 'Telesales can only create telesales leads' });
+  }
+
   const id = uuid();
+  const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO leads (id, name, email, phone, company, country, source, notes, estimated_value, bmgenie_user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO leads (
+      id, name, email, phone, company, country, state, job_title, source, notes,
+      estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     name.trim(),
@@ -185,25 +231,32 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     phone || null,
     company || null,
     country || null,
+    state || null,
+    job_title || null,
     source,
     notes || null,
     Number(estimated_value) || 0,
     bmgenie_user_id || null,
+    req.user.id,
+    req.user.id,
+    now,
+    req.user.id,
   );
   db.prepare(
     `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
      VALUES (?, ?, ?, 'created', ?)`,
-  ).run(uuid(), id, req.user.id, `Lead created (${LEAD_SOURCES[source].label})`);
-  const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(id);
-  res.status(201).json(lead);
+  ).run(
+    uuid(),
+    id,
+    req.user.id,
+    `Lead created by ${req.user.name} (${LEAD_SOURCES[source].label})`,
+  );
+  res.status(201).json(getLeadWithJoins(id));
 });
 
 router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'), (req, res) => {
-  const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(req.params.id);
-  if (!lead) return res.status(404).json({ error: 'Lead not found' });
-  if (!canAccessLead(req.user, lead) && !roleHasPermission(req.user.role, 'leads:update_any')) {
-    return res.status(403).json({ error: 'Permission denied' });
-  }
+  const lead = requireLeadAccess(req, res);
+  if (!lead) return;
 
   const {
     name,
@@ -211,6 +264,8 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     phone,
     company,
     country,
+    state,
+    job_title,
     status,
     notes,
     estimated_value,
@@ -234,6 +289,8 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
       phone = COALESCE(?, phone),
       company = COALESCE(?, company),
       country = COALESCE(?, country),
+      state = COALESCE(?, state),
+      job_title = COALESCE(?, job_title),
       status = COALESCE(?, status),
       notes = COALESCE(?, notes),
       estimated_value = COALESCE(?, estimated_value),
@@ -248,6 +305,8 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     phone !== undefined ? phone : null,
     company !== undefined ? company : null,
     country !== undefined ? country : null,
+    state !== undefined ? state : null,
+    job_title !== undefined ? job_title : null,
     status ?? null,
     notes !== undefined ? notes : null,
     estimated_value !== undefined ? Number(estimated_value) : null,
@@ -264,18 +323,15 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     ).run(uuid(), lead.id, req.user.id, `Status: ${lead.status} → ${status}`, status);
   }
 
-  res.json(db.prepare(`SELECT * FROM leads WHERE id = ?`).get(lead.id));
+  res.json(getLeadWithJoins(lead.id));
 });
 
 router.post(
   '/:id/activities',
   requireAnyPermission('leads:update_any', 'leads:update_own'),
   (req, res) => {
-    const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(req.params.id);
-    if (!lead) return res.status(404).json({ error: 'Lead not found' });
-    if (!canAccessLead(req.user, lead)) {
-      return res.status(403).json({ error: 'Permission denied' });
-    }
+    const lead = requireLeadAccess(req, res);
+    if (!lead) return;
     const { type = 'note', summary, outcome, next_follow_up_at, status } = req.body || {};
     if (!summary) return res.status(400).json({ error: 'summary required' });
 
@@ -299,6 +355,115 @@ router.post(
   },
 );
 
+/** Company contacts (employees) under a lead */
+router.get(
+  '/:id/employees',
+  requireAnyPermission('leads:view_all', 'leads:view_own'),
+  (req, res) => {
+    const lead = requireLeadAccess(req, res);
+    if (!lead) return;
+    const rows = db
+      .prepare(
+        `SELECT e.*, us.name AS created_by_name FROM lead_employees e
+         LEFT JOIN users us ON us.id = e.created_by
+         WHERE e.lead_id = ? ORDER BY e.created_at ASC`,
+      )
+      .all(lead.id);
+    res.json(rows);
+  },
+);
+
+router.post(
+  '/:id/employees',
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    const lead = requireLeadAccess(req, res);
+    if (!lead) return;
+    const { name, phone, email, job_title, notes } = req.body || {};
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'name required' });
+    }
+    const id = uuid();
+    db.prepare(
+      `INSERT INTO lead_employees (id, lead_id, name, phone, email, job_title, notes, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      lead.id,
+      String(name).trim(),
+      phone || null,
+      email || null,
+      job_title || null,
+      notes || null,
+      req.user.id,
+    );
+    db.prepare(
+      `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
+       VALUES (?, ?, ?, 'employee_added', ?)`,
+    ).run(uuid(), lead.id, req.user.id, `Employee added: ${String(name).trim()}`);
+    res.status(201).json(db.prepare(`SELECT * FROM lead_employees WHERE id = ?`).get(id));
+  },
+);
+
+router.patch(
+  '/:id/employees/:empId',
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    const lead = requireLeadAccess(req, res);
+    if (!lead) return;
+    const emp = db
+      .prepare(`SELECT * FROM lead_employees WHERE id = ? AND lead_id = ?`)
+      .get(req.params.empId, lead.id);
+    if (!emp) return res.status(404).json({ error: 'Employee not found' });
+
+    const { name, phone, email, job_title, notes } = req.body || {};
+    db.prepare(
+      `UPDATE lead_employees SET
+        name = COALESCE(?, name),
+        phone = COALESCE(?, phone),
+        email = COALESCE(?, email),
+        job_title = COALESCE(?, job_title),
+        notes = COALESCE(?, notes),
+        updated_at = datetime('now')
+       WHERE id = ?`,
+    ).run(
+      name !== undefined ? String(name).trim() || emp.name : null,
+      phone !== undefined ? phone : null,
+      email !== undefined ? email : null,
+      job_title !== undefined ? job_title : null,
+      notes !== undefined ? notes : null,
+      emp.id,
+    );
+    res.json(db.prepare(`SELECT * FROM lead_employees WHERE id = ?`).get(emp.id));
+  },
+);
+
+router.delete(
+  '/:id/employees/:empId',
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    const lead = requireLeadAccess(req, res);
+    if (!lead) return;
+    const emp = db
+      .prepare(`SELECT * FROM lead_employees WHERE id = ? AND lead_id = ?`)
+      .get(req.params.empId, lead.id);
+    if (!emp) return res.status(404).json({ error: 'Employee not found' });
+    db.prepare(`DELETE FROM lead_employees WHERE id = ?`).run(emp.id);
+    db.prepare(
+      `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
+       VALUES (?, ?, ?, 'employee_removed', ?)`,
+    ).run(uuid(), lead.id, req.user.id, `Employee removed: ${emp.name}`);
+    res.json({ ok: true });
+  },
+);
+
+function csvCell(row, ...keys) {
+  for (const k of keys) {
+    if (row[k] != null && String(row[k]).trim() !== '') return String(row[k]).trim();
+  }
+  return null;
+}
+
 router.post(
   '/import/csv',
   requirePermission('leads:import'),
@@ -306,9 +471,6 @@ router.post(
   (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'CSV file required (field: file)' });
     const sourceLabel = req.body?.source_label || 'csv_import';
-    if (!LEAD_SOURCES[sourceLabel] && sourceLabel !== 'csv_import') {
-      // allow csv_import only as canonical, or map meta → csv_import
-    }
     const source = 'csv_import';
 
     let records;
@@ -332,30 +494,69 @@ router.post(
     let imported = 0;
     let skipped = 0;
     const insert = db.prepare(
-      `INSERT INTO leads (id, name, email, phone, company, country, source, notes, estimated_value, import_batch_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO leads (
+        id, name, email, phone, company, country, state, job_title, source, notes,
+        estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
+    const now = new Date().toISOString();
     const tx = db.transaction(() => {
       for (const row of records) {
-        const name =
-          row.name || row.Name || row.full_name || row['Full Name'] || row.email || row.Email;
+        const name = csvCell(
+          row,
+          'name',
+          'Name',
+          'full_name',
+          'Full Name',
+          'email',
+          'Email',
+        );
         if (!name) {
           skipped += 1;
           continue;
         }
-        const email = row.email || row.Email || null;
-        const phone = row.phone || row.Phone || row.mobile || null;
-        const company = row.company || row.Company || null;
-        const country = row.country || row.Country || null;
-        const notes = row.notes || row.Notes || `Imported from ${req.file.originalname}`;
-        const estimated = Number(row.estimated_value || row.value || 0) || 0;
+        const email = csvCell(row, 'email', 'Email');
+        const phone = csvCell(row, 'contact', 'Contact', 'phone', 'Phone', 'mobile', 'Mobile');
+        const company = csvCell(row, 'company', 'Company');
+        const country = csvCell(row, 'country', 'Country');
+        const state = csvCell(row, 'state', 'State');
+        const jobTitle = csvCell(row, 'job_title', 'Job Title', 'job title', 'title', 'Title');
+        const notes =
+          csvCell(row, 'follow_up_notes', 'Follow up notes', 'notes', 'Notes') ||
+          `Imported from ${req.file.originalname}`;
+        const estimated =
+          Number(
+            csvCell(row, 'estimated_revenue', 'estimated_value', 'Estimated Revenue', 'value') || 0,
+          ) || 0;
         const id = uuid();
-        insert.run(id, String(name), email, phone, company, country, source, notes, estimated, batchId);
+        insert.run(
+          id,
+          name,
+          email,
+          phone,
+          company,
+          country,
+          state,
+          jobTitle,
+          source,
+          notes,
+          estimated,
+          batchId,
+          req.user.id,
+          req.user.id,
+          now,
+          req.user.id,
+        );
         db.prepare(
           `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
            VALUES (?, ?, ?, 'imported', ?)`,
-        ).run(uuid(), id, req.user.id, `CSV import (${sourceLabel})`);
+        ).run(
+          uuid(),
+          id,
+          req.user.id,
+          `CSV / Google Sheet import by ${req.user.name} (${sourceLabel})`,
+        );
         imported += 1;
       }
       db.prepare(

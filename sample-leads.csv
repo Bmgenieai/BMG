@@ -1,4 +1,4 @@
-name,email,phone,company,country,estimated_value,notes
-Sunset Realty Photos,info@sunsetrealtyphotos.com,+1-602-555-0144,Sunset Realty Photos,US,65,Meta campaign spring
-Casa Visual Madrid,hola@casavisual.es,,Casa Visual,ES,450,Meta EU lookalike
-Edinburgh Nest Media,hi@edinest.uk,+44-131-555-0190,Edinburgh Nest,UK,65,Lead form
+name,contact,company,state,job_title,follow_up_notes,email,estimated_revenue
+Abdullah Khan,+1-602-555-0144,Sunset Realty Photos,Arizona,Owner,Called Mon — interested in Pro pack,info@sunsetrealtyphotos.com,450
+Maria Lopez,+34-600-555-019,Casa Visual,Madrid,Studio Manager,Follow up after demo,hola@casavisual.es,65
+James Wright,+44-131-555-0190,Edinburgh Nest Media,Scotland,Photographer,Meta sheet import,hi@edinest.uk,65
