@@ -66,10 +66,17 @@ if ($LASTEXITCODE -ne 0) { throw 'pm2 save failed' }
 Write-Host '==> Registering PM2 for Windows startup...'
 try {
   pm2-startup install
-  Write-Host 'Startup registered (survives reboot when this user logs on / service starts).'
+  Write-Host 'pm2-startup registry entry OK (helps on user logon).'
 } catch {
   Write-Warning "pm2-startup install failed: $_"
-  Write-Warning 'Re-run this script in an elevated (Admin) PowerShell as the deploy SSH user.'
+}
+
+Write-Host '==> Registering boot Scheduled Task (survives power outage without login)...'
+try {
+  & (Join-Path $PSScriptRoot 'register-pm2-boot-task.ps1')
+} catch {
+  Write-Warning "Boot task registration failed: $_"
+  Write-Warning 'Re-run as Admin: .\scripts\windows\register-pm2-boot-task.ps1'
 }
 
 Write-Host '==> Local health check...'

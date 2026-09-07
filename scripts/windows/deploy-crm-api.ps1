@@ -60,37 +60,41 @@ function Stop-PortListener {
 }
 
 function Restart-CrmApi {
-  $pm2 = Get-Command pm2 -ErrorAction SilentlyContinue
-  if (-not $pm2) {
-    $pm2Cmd = Join-Path $env:APPDATA 'npm\pm2.cmd'
-    if (Test-Path $pm2Cmd) { $pm2 = $pm2Cmd }
+  # Prefer pm2.cmd so PowerShell doesn't wrap stderr as terminating errors
+  $pm2Exe = $null
+  $pm2Cmd = Join-Path $env:APPDATA 'npm\pm2.cmd'
+  if (Test-Path $pm2Cmd) {
+    $pm2Exe = $pm2Cmd
+  } elseif (Get-Command pm2.cmd -ErrorAction SilentlyContinue) {
+    $pm2Exe = (Get-Command pm2.cmd).Source
+  } elseif (Get-Command pm2 -ErrorAction SilentlyContinue) {
+    $pm2Exe = (Get-Command pm2).Source
   }
 
-  if ($pm2) {
-    try {
-      $listJson = & pm2 jlist 2>$null
-      $existing = $null
-      if ($listJson) {
-        $existing = $listJson | ConvertFrom-Json | Where-Object { $_.name -eq 'bmg-crm-api' }
-      }
-      if ($existing) {
-        & pm2 restart bmg-crm-api --update-env
-        if ($LASTEXITCODE -eq 0) {
-          & pm2 save 2>$null | Out-Null
-          Write-Host 'Restarted via PM2'
-          return
-        }
-      } else {
-        & pm2 start src/server.js --name bmg-crm-api
-        if ($LASTEXITCODE -eq 0) {
-          & pm2 save 2>$null | Out-Null
-          Write-Host 'Started via PM2'
-          return
-        }
-      }
-    } catch {
-      Write-Host "PM2 restart skipped: $_"
+  if ($pm2Exe) {
+    Write-Host "Using PM2 at $pm2Exe"
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+
+    # Avoid `pm2 jlist | ConvertFrom-Json` — PM2 JSON has duplicate username/USERNAME keys on Windows
+    & $pm2Exe restart bmg-crm-api --update-env 2>&1 | Out-Host
+    if ($LASTEXITCODE -eq 0) {
+      & $pm2Exe save 2>&1 | Out-Null
+      $ErrorActionPreference = $prevEap
+      Write-Host 'Restarted via PM2'
+      return
     }
+
+    & $pm2Exe start src/server.js --name bmg-crm-api 2>&1 | Out-Host
+    if ($LASTEXITCODE -eq 0) {
+      & $pm2Exe save 2>&1 | Out-Null
+      $ErrorActionPreference = $prevEap
+      Write-Host 'Started via PM2'
+      return
+    }
+
+    $ErrorActionPreference = $prevEap
+    throw "PM2 restart/start failed (exit $LASTEXITCODE)"
   }
 
   $pool = $env:CRM_APP_POOL_NAME
