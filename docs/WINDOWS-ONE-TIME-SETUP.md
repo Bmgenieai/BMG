@@ -27,17 +27,29 @@ JWT_SECRET=<long-random-secret>
 CRM_INGEST_API_KEY=<shared-secret-with-main-bmgenie-api>
 ```
 
-## 3. Install + seed + PM2
+## 3. Install + seed + PM2 (auto-start on reboot)
 
 ```powershell
 npm install
 npm run seed
-npm install -g pm2
-pm2 start src/server.js --name bmg-crm-api
-pm2 save
+# Prefer the setup script (PM2 + pm2-windows-startup):
+# Run PowerShell as Administrator, same user as GitHub DEPLOY_USER
+.\scripts\windows\setup-pm2-crm-api.ps1
 ```
 
-Optional: Windows firewall allow inbound TCP **4050** (or only via IIS/Cloudflare tunnel).
+Or manually:
+
+```powershell
+npm install -g pm2
+npm install -g pm2-windows-startup
+pm2 start src/server.js --name bmg-crm-api
+pm2 save
+pm2-startup install
+```
+
+**Do not** run the API under IIS node hosting anymore — PM2 owns port **4050**. IIS may only reverse-proxy if needed.
+
+Optional: Windows firewall allow inbound TCP **4050** (or only via Cloudflare tunnel).
 
 ## 4. Public DNS (Cloudflare — usually done by another person)
 

@@ -1,9 +1,25 @@
 # Quick health check after CRM deploy (Windows)
 $ErrorActionPreference = 'Stop'
+$sys32 = Join-Path $env:SystemRoot 'System32'
+if ($env:Path -notlike "*${sys32}*") {
+  $env:Path = "$sys32;$env:Path"
+}
 $port = if ($env:CRM_PORT) { $env:CRM_PORT } else { '4050' }
 $url = "http://127.0.0.1:$port/api/health"
 Write-Host "Checking $url"
-$res = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15
-if (-not $res.ok) { throw "Health failed: $($res | ConvertTo-Json -Compress)" }
-Write-Host "Health OK: $($res | ConvertTo-Json -Compress)"
+$ok = $false
+foreach ($i in 1..8) {
+  try {
+    $res = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 10
+    if ($res.ok) {
+      Write-Host "Health OK: $($res | ConvertTo-Json -Compress)"
+      $ok = $true
+      break
+    }
+  } catch {
+    Write-Host "Attempt $i failed: $_"
+    Start-Sleep -Seconds 2
+  }
+}
+if (-not $ok) { throw "Health check failed for $url" }
 exit 0

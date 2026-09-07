@@ -9,6 +9,12 @@ $Root = if ($PSScriptRoot) {
 }
 Set-Location $Root
 
+# SSH sessions often lack System32 on PATH — fix before any native tools
+$sys32 = Join-Path $env:SystemRoot 'System32'
+if ($env:Path -notlike "*${sys32}*") {
+  $env:Path = "$sys32;$env:Path"
+}
+
 Write-Host "==> CRM deploy in $Root"
 
 if (-not (Test-Path .env)) {
@@ -17,35 +23,67 @@ if (-not (Test-Path .env)) {
 
 function Stop-PortListener {
   param([int]$Port = 4050)
-  $lines = netstat -ano | Select-String ":$Port" | Select-String 'LISTENING'
-  foreach ($line in $lines) {
-    if ($line -match '\s(\d+)\s*$') {
-      $pid = [int]$Matches[1]
-      if ($pid -gt 0) {
-        Write-Host "Stopping process on port $Port (PID $pid)"
-        taskkill /PID $pid /F 2>$null | Out-Null
+
+  $pids = @()
+
+  # Prefer PowerShell cmdlet (works over SSH without netstat PATH issues)
+  try {
+    $conns = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    foreach ($c in $conns) {
+      if ($c.OwningProcess -gt 0) { $pids += [int]$c.OwningProcess }
+    }
+  } catch {
+    Write-Host "Get-NetTCPConnection unavailable: $_"
+  }
+
+  if (-not $pids) {
+    $netstat = Join-Path $env:SystemRoot 'System32\netstat.exe'
+    if (Test-Path $netstat) {
+      $lines = & $netstat -ano 2>$null | Select-String ":$Port" | Select-String 'LISTENING'
+      foreach ($line in $lines) {
+        if ($line -match '\s(\d+)\s*$') {
+          $procId = [int]$Matches[1]
+          if ($procId -gt 0) { $pids += $procId }
+        }
       }
+    } else {
+      Write-Host 'netstat.exe not found — will rely on PM2 restart only'
     }
   }
-  Start-Sleep -Seconds 2
+
+  $pids = $pids | Select-Object -Unique
+  foreach ($procId in $pids) {
+    Write-Host "Stopping process on port $Port (PID $procId)"
+    & taskkill.exe /PID $procId /F 2>$null | Out-Null
+  }
+  if ($pids.Count -gt 0) { Start-Sleep -Seconds 2 }
 }
 
 function Restart-CrmApi {
   $pm2 = Get-Command pm2 -ErrorAction SilentlyContinue
+  if (-not $pm2) {
+    $pm2Cmd = Join-Path $env:APPDATA 'npm\pm2.cmd'
+    if (Test-Path $pm2Cmd) { $pm2 = $pm2Cmd }
+  }
+
   if ($pm2) {
     try {
-      $existing = pm2 jlist 2>$null | ConvertFrom-Json | Where-Object { $_.name -eq 'bmg-crm-api' }
+      $listJson = & pm2 jlist 2>$null
+      $existing = $null
+      if ($listJson) {
+        $existing = $listJson | ConvertFrom-Json | Where-Object { $_.name -eq 'bmg-crm-api' }
+      }
       if ($existing) {
-        pm2 restart bmg-crm-api --update-env
+        & pm2 restart bmg-crm-api --update-env
         if ($LASTEXITCODE -eq 0) {
-          pm2 save 2>$null | Out-Null
+          & pm2 save 2>$null | Out-Null
           Write-Host 'Restarted via PM2'
           return
         }
       } else {
-        pm2 start src/server.js --name bmg-crm-api
+        & pm2 start src/server.js --name bmg-crm-api
         if ($LASTEXITCODE -eq 0) {
-          pm2 save 2>$null | Out-Null
+          & pm2 save 2>$null | Out-Null
           Write-Host 'Started via PM2'
           return
         }
@@ -63,8 +101,7 @@ function Restart-CrmApi {
     return
   }
 
-  Write-Host 'Starting node directly (no PM2 / no CRM_APP_POOL_NAME)'
-  Start-Process -FilePath 'node' -ArgumentList 'src/server.js' -WorkingDirectory $Root -WindowStyle Hidden
+  throw 'PM2 not available and CRM_APP_POOL_NAME not set — install PM2 (see scripts/windows/setup-pm2-crm-api.ps1)'
 }
 
 Stop-PortListener -Port 4050
