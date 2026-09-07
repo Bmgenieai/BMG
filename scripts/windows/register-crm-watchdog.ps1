@@ -22,14 +22,20 @@ if (-not (Test-Path $watchdog)) {
   throw "Watchdog script not found: $watchdog. Run: git pull origin main"
 }
 
+$psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if (-not (Test-Path $psExe)) {
+  throw "powershell.exe not found at $psExe"
+}
+
 $wrapperDir = Join-Path $env:LOCALAPPDATA 'BMG-CRM'
 New-Item -ItemType Directory -Force -Path $wrapperDir | Out-Null
 $wrapper = Join-Path $wrapperDir 'crm-watchdog.cmd'
 
+# Use FULL paths - this machine often has a broken PATH (no System32)
 $cmdLines = @(
   '@echo off'
-  'set PATH=%APPDATA%\npm;%ProgramFiles%\nodejs;%ProgramFiles(x86)%\nodejs;%SystemRoot%\System32;%PATH%'
-  ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $watchdog)
+  ('set PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%APPDATA%\npm;%ProgramFiles%\nodejs;%PATH%')
+  ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $psExe, $watchdog)
 )
 Set-Content -Path $wrapper -Value $cmdLines -Encoding ASCII
 
@@ -42,7 +48,6 @@ if (-not $cred) {
 }
 
 $action = New-ScheduledTaskAction -Execute $wrapper
-# Use 10 years (not TimeSpan.MaxValue - Windows rejects that)
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
   -RepetitionInterval (New-TimeSpan -Minutes 120) `
   -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -65,7 +70,6 @@ try {
     -Settings $settings `
     -Description 'CRM Watchdog: every 120 min check health and pm2 restart if down' | Out-Null
 } catch {
-  # Fallback: full path to schtasks.exe (SSH/Admin PATH often missing System32)
   $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
   if (-not (Test-Path $schtasks)) {
     throw "Register-ScheduledTask failed: $_. Also missing $schtasks"
@@ -80,11 +84,14 @@ try {
   }
 }
 
+# Smoke-test watchdog once now (same session - do not spawn nested powershell)
+Write-Host 'Running watchdog once to verify...'
+& $watchdog
+if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) {
+  Write-Warning "Watchdog exited with code $LASTEXITCODE - check logs"
+}
+
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
 Write-Host ("OK: '{0}' state={1} - every 120 minutes" -f $task.TaskName, $task.State)
-Write-Host ("Script: {0}" -f $watchdog)
-Write-Host ("Log:    {0}\BMG-CRM\crm-watchdog.log" -f $env:LOCALAPPDATA)
-Write-Host ''
-Write-Host 'Test once now:'
-Write-Host '  Start-ScheduledTask -TaskName BMG-CRM-Watchdog'
-Write-Host ("  Get-Content {0}\BMG-CRM\crm-watchdog.log -Tail 10" -f $env:LOCALAPPDATA)
+Write-Host ("Log: {0}" -f (Join-Path $Root 'logs\crm-watchdog.log'))
+Write-Host 'Start-ScheduledTask -TaskName BMG-CRM-Watchdog'
