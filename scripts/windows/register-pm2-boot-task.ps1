@@ -1,7 +1,8 @@
 # Register a Windows Scheduled Task that resurrects PM2 after reboot
 # even if nobody is at the login screen (electricity / internet recovery).
-# Run as Administrator once (same user as DEPLOY_USER / wasim).
+# MUST run: Right-click PowerShell → Run as administrator (same user as DEPLOY_USER).
 #Requires -Version 5.1
+#Requires -RunAsAdministrator
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'BMG-CRM-PM2-Resurrect'
@@ -28,12 +29,12 @@ Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Silent
 
 $action = New-ScheduledTaskAction -Execute $wrapper
 $trigger = New-ScheduledTaskTrigger -AtStartup
-# Delay 1 minute so disks / Cloudflare tunnel can come up
 $trigger.Delay = 'PT1M'
 
 Write-Host 'Enter the Windows password for THIS user (stored only in Task Scheduler).'
 Write-Host 'Needed so PM2 can start after reboot without anyone logging in.'
 $cred = Get-Credential -UserName $env:USERNAME -Message 'Password for BMG CRM PM2 boot task'
+if (-not $cred) { throw 'Cancelled — no credential entered.' }
 
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
@@ -41,18 +42,22 @@ $settings = New-ScheduledTaskSettingsSet `
   -StartWhenAvailable `
   -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
 
-Register-ScheduledTask `
-  -TaskName $TaskName `
-  -Action $action `
-  -Trigger $trigger `
-  -User $cred.UserName `
-  -Password $cred.GetNetworkCredential().Password `
-  -RunLevel Highest `
-  -Settings $settings | Out-Null
+try {
+  Register-ScheduledTask `
+    -TaskName $TaskName `
+    -Action $action `
+    -Trigger $trigger `
+    -User $cred.UserName `
+    -Password $cred.GetNetworkCredential().Password `
+    -RunLevel Highest `
+    -Settings $settings | Out-Null
+} catch {
+  throw "Register-ScheduledTask failed: $_. Open PowerShell via 'Run as administrator' and try again."
+}
 
-Write-Host "OK: Scheduled task '$TaskName' will run 'pm2 resurrect' 1 min after every boot."
-Write-Host "Check: Get-ScheduledTask -TaskName $TaskName | Format-List TaskName,State"
+$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+Write-Host "OK: Scheduled task '$($task.TaskName)' state=$($task.State)"
+Write-Host "On every boot (after ~1 min) it runs: pm2 resurrect"
 Write-Host ''
 Write-Host 'Also ensure Cloudflare tunnel service is Automatic:'
 Write-Host '  Get-Service *cloud* | Format-Table Name,Status,StartType'
-Write-Host '  (Set-Service cloudflared -StartupType Automatic; Start-Service cloudflared)'
