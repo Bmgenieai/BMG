@@ -1,4 +1,4 @@
-name,contact,company,state,job_title,follow_up_notes,email,estimated_revenue
-Abdullah Khan,+1-602-555-0144,Sunset Realty Photos,Arizona,Owner,Called Mon — interested in Pro pack,info@sunsetrealtyphotos.com,450
-Maria Lopez,+34-600-555-019,Casa Visual,Madrid,Studio Manager,Follow up after demo,hola@casavisual.es,65
-James Wright,+44-131-555-0190,Edinburgh Nest Media,Scotland,Photographer,Meta sheet import,hi@edinest.uk,65
+name,contact,company,state,job_title,industry,contact_format,follow_up_notes,email,estimated_revenue
+Sunset Realty Photos,+1-602-555-0144,Sunset Realty Photos,Arizona,,Real estate photography,company,Called Mon — interested in Pro pack,info@sunsetrealtyphotos.com,450
+Maria Lopez,+34-600-555-019,Casa Visual,Madrid,Studio Manager,Real estate photography,employee,Follow up after demo,hola@casavisual.es,65
+Edinburgh Nest Media,+44-131-555-0190,Edinburgh Nest Media,Scotland,,Architecture photography,company,Meta sheet import,hi@edinest.uk,65

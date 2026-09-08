@@ -16,6 +16,7 @@ import {
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const router = Router();
+const CONTACT_FORMATS = ['company', 'employee'];
 
 router.use(authRequired);
 
@@ -76,6 +77,7 @@ router.get('/meta', (_req, res) => {
     statusLabels: STATUS_LABELS,
     statusTabs: LEAD_STATUS_TABS,
     productTabs: PRODUCT_LEAD_TABS,
+    contactFormats: CONTACT_FORMATS,
   });
 });
 
@@ -151,10 +153,10 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   }
   if (q) {
     clauses.push(
-      `(l.name LIKE ? OR l.email LIKE ? OR l.company LIKE ? OR l.phone LIKE ? OR l.country LIKE ? OR l.state LIKE ? OR l.job_title LIKE ?)`,
+      `(l.name LIKE ? OR l.email LIKE ? OR l.company LIKE ? OR l.phone LIKE ? OR l.country LIKE ? OR l.state LIKE ? OR l.job_title LIKE ? OR l.industry LIKE ?)`,
     );
     const like = `%${q}%`;
-    params.push(like, like, like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like);
   }
 
   const where = clauses.length ? clauses.join(' AND ') : '1=1';
@@ -200,13 +202,19 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     country,
     state,
     job_title,
+    industry,
+    contact_format: rawFormat,
     source: rawSource,
     notes,
     estimated_value,
     bmgenie_user_id,
   } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
+  if (!industry || !String(industry).trim()) {
+    return res.status(400).json({ error: 'industry required' });
+  }
 
+  const contactFormat = CONTACT_FORMATS.includes(rawFormat) ? rawFormat : 'company';
   const isTelesales = req.user.role === 'telesales';
   const source = rawSource || (isTelesales ? 'telesales' : 'manual');
   if (!LEAD_SOURCES[source]) {
@@ -217,22 +225,32 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     return res.status(403).json({ error: 'Telesales can only create telesales leads' });
   }
 
+  const nameTrim = name.trim();
+  const industryTrim = String(industry).trim();
+  // Company format: primary name is the company; keep company column in sync when omitted
+  const companyVal =
+    contactFormat === 'company'
+      ? company?.trim() || nameTrim
+      : company?.trim() || null;
+
   const id = uuid();
   const now = new Date().toISOString();
   db.prepare(
     `INSERT INTO leads (
-      id, name, email, phone, company, country, state, job_title, source, notes,
-      estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, name, email, phone, company, country, state, job_title, industry, contact_format,
+      source, notes, estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
-    name.trim(),
+    nameTrim,
     email || null,
     phone || null,
-    company || null,
+    companyVal,
     country || null,
     state || null,
-    job_title || null,
+    contactFormat === 'employee' ? job_title || null : null,
+    industryTrim,
+    contactFormat,
     source,
     notes || null,
     Number(estimated_value) || 0,
@@ -249,7 +267,7 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     uuid(),
     id,
     req.user.id,
-    `Lead created by ${req.user.name} (${LEAD_SOURCES[source].label})`,
+    `Lead created by ${req.user.name} (${LEAD_SOURCES[source].label}, ${contactFormat})`,
   );
   res.status(201).json(getLeadWithJoins(id));
 });
@@ -266,6 +284,8 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     country,
     state,
     job_title,
+    industry,
+    contact_format,
     status,
     notes,
     estimated_value,
@@ -275,6 +295,12 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
 
   if (status && !LEAD_STATUSES.includes(status)) {
     return res.status(400).json({ error: 'Invalid status' });
+  }
+  if (contact_format != null && !CONTACT_FORMATS.includes(contact_format)) {
+    return res.status(400).json({ error: 'Invalid contact_format', allowed: CONTACT_FORMATS });
+  }
+  if (industry !== undefined && industry !== null && !String(industry).trim()) {
+    return res.status(400).json({ error: 'industry required' });
   }
 
   const convertedAt =
@@ -291,6 +317,8 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
       country = COALESCE(?, country),
       state = COALESCE(?, state),
       job_title = COALESCE(?, job_title),
+      industry = COALESCE(?, industry),
+      contact_format = COALESCE(?, contact_format),
       status = COALESCE(?, status),
       notes = COALESCE(?, notes),
       estimated_value = COALESCE(?, estimated_value),
@@ -307,6 +335,8 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     country !== undefined ? country : null,
     state !== undefined ? state : null,
     job_title !== undefined ? job_title : null,
+    industry !== undefined ? String(industry).trim() : null,
+    contact_format ?? null,
     status ?? null,
     notes !== undefined ? notes : null,
     estimated_value !== undefined ? Number(estimated_value) : null,
@@ -495,9 +525,9 @@ router.post(
     let skipped = 0;
     const insert = db.prepare(
       `INSERT INTO leads (
-        id, name, email, phone, company, country, state, job_title, source, notes,
-        estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id, name, email, phone, company, country, state, job_title, industry, contact_format,
+        source, notes, estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
     const now = new Date().toISOString();
@@ -522,6 +552,13 @@ router.post(
         const country = csvCell(row, 'country', 'Country');
         const state = csvCell(row, 'state', 'State');
         const jobTitle = csvCell(row, 'job_title', 'Job Title', 'job title', 'title', 'Title');
+        const industry = csvCell(row, 'industry', 'Industry');
+        const rawFormat = String(
+          csvCell(row, 'contact_format', 'Contact Format', 'format', 'Format') || 'company',
+        )
+          .trim()
+          .toLowerCase();
+        const contactFormat = CONTACT_FORMATS.includes(rawFormat) ? rawFormat : 'company';
         const notes =
           csvCell(row, 'follow_up_notes', 'Follow up notes', 'notes', 'Notes') ||
           `Imported from ${req.file.originalname}`;
@@ -529,16 +566,20 @@ router.post(
           Number(
             csvCell(row, 'estimated_revenue', 'estimated_value', 'Estimated Revenue', 'value') || 0,
           ) || 0;
+        const companyVal =
+          contactFormat === 'company' ? company || name : company || null;
         const id = uuid();
         insert.run(
           id,
           name,
           email,
           phone,
-          company,
+          companyVal,
           country,
           state,
-          jobTitle,
+          contactFormat === 'employee' ? jobTitle : null,
+          industry || null,
+          contactFormat,
           source,
           notes,
           estimated,

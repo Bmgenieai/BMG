@@ -128,6 +128,8 @@ export function migrate() {
     `ALTER TABLE leads ADD COLUMN state TEXT`,
     `ALTER TABLE leads ADD COLUMN job_title TEXT`,
     `ALTER TABLE leads ADD COLUMN created_by TEXT REFERENCES users(id) ON DELETE SET NULL`,
+    `ALTER TABLE leads ADD COLUMN industry TEXT`,
+    `ALTER TABLE leads ADD COLUMN contact_format TEXT DEFAULT 'company'`,
   ];
   for (const sql of leadAlters) {
     try {
