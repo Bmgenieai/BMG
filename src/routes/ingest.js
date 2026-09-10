@@ -86,7 +86,7 @@ function insertLead({
   bmgenieUserId,
   estimatedValue,
   notes,
-  status = 'new',
+  status = 'qualified',
 }) {
   const id = uuid();
   db.prepare(
@@ -211,7 +211,7 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
     }
   } else if (event === 'user.free_credit_used') {
     const open = findOpenByUser(bmgenieUserId, normalizedEmail);
-    if (open && open.status !== 'converted') {
+    if (open && open.status !== 'paid') {
       lead = updateLead(
         open.id,
         {
@@ -251,7 +251,7 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
       lead = updateLead(
         any.id,
         {
-          status: 'converted',
+          status: 'paid',
           converted_at: new Date().toISOString(),
           name: displayName,
           email: normalizedEmail || any.email,
@@ -259,9 +259,9 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
           estimated_value: estimatedValue ?? any.estimated_value,
           notes: notes || 'Purchased a BMGenie package',
         },
-        'Marked converted — package purchased',
+        'Marked paid — package purchased',
       );
-      action = 'converted';
+      action = 'paid';
     } else {
       lead = insertLead({
         name: displayName,
@@ -273,13 +273,13 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
         bmgenieUserId,
         estimatedValue: estimatedValue ?? 65,
         notes: notes || 'Purchased a BMGenie package',
-        status: 'converted',
+        status: 'paid',
       });
       db.prepare(
         `UPDATE leads SET converted_at = datetime('now') WHERE id = ?`,
       ).run(lead.id);
       lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(lead.id);
-      action = 'created_converted';
+      action = 'created_paid';
     }
   } else if (event === 'user.credits_depleted') {
     // Win-back: paid once, credits gone, no repurchase yet
@@ -287,7 +287,7 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
     if (openWinback && openWinback.source === 'purchased_no_repurchase') {
       lead = openWinback;
       action = 'skipped';
-    } else if (openWinback && openWinback.status !== 'converted') {
+    } else if (openWinback && openWinback.status !== 'paid') {
       lead = updateLead(
         openWinback.id,
         {
@@ -306,7 +306,7 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
         .prepare(
           `SELECT * FROM leads
            WHERE (bmgenie_user_id = ? OR email = ? COLLATE NOCASE)
-             AND status = 'converted'
+             AND status = 'paid'
              AND converted_at >= datetime('now', '-1 day')
            ORDER BY converted_at DESC LIMIT 1`,
         )

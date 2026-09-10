@@ -85,39 +85,79 @@ export const LEAD_SOURCES = {
   },
 };
 
-/** Marketing pipeline statuses (matches staff portal tabs). */
+/**
+ * Sales funnel stages (queues).
+ * Outreach (email / LinkedIn / call / reply) is logged as activities; rates live on Funnel dashboard.
+ */
 export const LEAD_STATUSES = [
-  'new',
-  'contacted',
-  'interested',
-  'neutral',
-  'follow_up_scheduled',
-  'not_interested',
-  'converted',
-  'lost', // legacy — treated as not_interested in UI
+  'qualified',
+  'conversation',
+  'demo_booked',
+  'trial',
+  'paid',
+  'lost',
 ];
 
+/** Map legacy disposition statuses → funnel stages (read + one-time migrate). */
+export const LEGACY_STATUS_MAP = {
+  new: 'qualified',
+  contacted: 'qualified',
+  interested: 'conversation',
+  neutral: 'conversation',
+  follow_up_scheduled: 'conversation',
+  not_interested: 'lost',
+  converted: 'paid',
+};
+
 export const STATUS_LABELS = {
-  new: 'New Leads',
-  contacted: 'Contacted',
-  interested: 'Interested',
-  neutral: 'Neutral',
-  follow_up_scheduled: 'Follow Up',
-  not_interested: 'Not Interested',
-  converted: 'Converted',
-  lost: 'Not Interested',
+  qualified: 'Qualified',
+  conversation: 'Conversation',
+  demo_booked: 'Demo booked',
+  trial: 'Trial',
+  paid: 'Paid',
+  lost: 'Lost',
+  // legacy labels (pre-migration reads)
+  new: 'Qualified',
+  contacted: 'Qualified',
+  interested: 'Conversation',
+  neutral: 'Conversation',
+  follow_up_scheduled: 'Conversation',
+  not_interested: 'Lost',
+  converted: 'Paid',
 };
 
 /** Sidebar status tabs → URL slug under /leads/:filter */
 export const LEAD_STATUS_TABS = [
-  { slug: 'new', status: 'new', label: 'New Leads' },
-  { slug: 'contacted', status: 'contacted', label: 'Contacted' },
-  { slug: 'interested', status: 'interested', label: 'Interested' },
-  { slug: 'neutral', status: 'neutral', label: 'Neutral' },
-  { slug: 'follow-up', status: 'follow_up_scheduled', label: 'Follow Up' },
-  { slug: 'not-interested', statuses: ['not_interested', 'lost'], label: 'Not Interested' },
-  { slug: 'converted', status: 'converted', label: 'Converted' },
+  { slug: 'qualified', status: 'qualified', label: 'Qualified' },
+  { slug: 'conversation', status: 'conversation', label: 'Conversation' },
+  { slug: 'demo-booked', status: 'demo_booked', label: 'Demo booked' },
+  { slug: 'trial', status: 'trial', label: 'Trial' },
+  { slug: 'paid', status: 'paid', label: 'Paid' },
+  { slug: 'lost', status: 'lost', label: 'Lost' },
 ];
+
+export const LOST_REASONS = [
+  'No response',
+  'Not interested',
+  'Budget / price',
+  'Competitor',
+  'Timing / not ready',
+  'Wrong fit',
+  'Unqualified',
+  'Other',
+];
+
+export const ACTIVITY_TYPES = [
+  'call',
+  'email',
+  'linkedin',
+  'reply',
+  'demo_shown',
+  'note',
+  'whatsapp',
+];
+
+export const REPLY_OUTCOMES = ['positive', 'negative', 'neutral', 'no_reply'];
 
 /** Product segment tabs (auto-created from bmgenie.ai). */
 export const PRODUCT_LEAD_TABS = [
@@ -126,17 +166,17 @@ export const PRODUCT_LEAD_TABS = [
   { slug: 'winback', source: 'purchased_no_repurchase', label: 'Win-back · no repurchase' },
 ];
 
-export const OPEN_STATUSES = [
-  'new',
-  'contacted',
-  'interested',
-  'neutral',
-  'follow_up_scheduled',
-];
-export const END_STATUSES = ['converted', 'not_interested', 'lost'];
+export const OPEN_STATUSES = ['qualified', 'conversation', 'demo_booked', 'trial'];
+export const END_STATUSES = ['paid', 'lost'];
+
+export function normalizeStatus(status) {
+  if (!status) return status;
+  return LEGACY_STATUS_MAP[status] || status;
+}
 
 export function statusLabel(status) {
-  return STATUS_LABELS[status] || String(status || '').replace(/_/g, ' ');
+  const key = normalizeStatus(status);
+  return STATUS_LABELS[key] || String(status || '').replace(/_/g, ' ');
 }
 
 export function resolveLeadFilter(slug) {

@@ -217,16 +217,7 @@ router.post(
 
       logEmailActivity(lead.id, req.user.id, content.subject);
 
-      if (lead.status === 'new') {
-        db.prepare(
-          `UPDATE leads SET status = 'contacted', updated_at = datetime('now') WHERE id = ?`,
-        ).run(lead.id);
-        db.prepare(
-          `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, outcome)
-           VALUES (?, ?, ?, 'status_change', ?, ?)`,
-        ).run(uuid(), lead.id, req.user.id, 'Status: new → contacted', 'contacted');
-      }
-
+      // Outreach stays on qualified — funnel stage only advances on reply/demo/trial/paid
       res.json({ ok: true, brevo: result, subject: content.subject });
     } catch (err) {
       const status = err.status || (err.code === 'BREVO_DISABLED' ? 503 : 500);
@@ -296,11 +287,6 @@ router.post(
           });
 
           logEmailActivity(lead.id, req.user.id, content.subject, 'Brevo bulk');
-          if (lead.status === 'new') {
-            db.prepare(
-              `UPDATE leads SET status = 'contacted', updated_at = datetime('now') WHERE id = ?`,
-            ).run(lead.id);
-          }
           sent += 1;
           await new Promise((r) => setTimeout(r, 200));
         } catch (e) {

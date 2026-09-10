@@ -75,9 +75,6 @@ router.post('/', requireAnyPermission('followups:manage_own', 'followups:manage_
   db.prepare(
     `UPDATE leads SET
       next_follow_up_at = ?,
-      status = CASE WHEN status = 'new' THEN 'follow_up_scheduled'
-                   WHEN status = 'contacted' THEN 'follow_up_scheduled'
-                   ELSE status END,
       updated_at = datetime('now')
      WHERE id = ?`,
   ).run(dueAt, leadId);
@@ -128,15 +125,16 @@ router.post(
          VALUES (?, ?, ?, ?, ?, ?)`,
       ).run(nid, fu.lead_id, fu.assigned_to, nextDueAt, 'Auto next follow-up', req.user.id);
       db.prepare(
-        `UPDATE leads SET next_follow_up_at = ?, status = 'follow_up_scheduled', updated_at = datetime('now')
+        `UPDATE leads SET next_follow_up_at = ?, updated_at = datetime('now')
          WHERE id = ?`,
       ).run(nextDueAt, fu.lead_id);
     } else if (leadStatus) {
+      const status = leadStatus === 'converted' ? 'paid' : leadStatus;
       db.prepare(
         `UPDATE leads SET status = ?, updated_at = datetime('now'),
-          converted_at = CASE WHEN ? = 'converted' THEN datetime('now') ELSE converted_at END
+          converted_at = CASE WHEN ? = 'paid' THEN datetime('now') ELSE converted_at END
          WHERE id = ?`,
-      ).run(leadStatus, leadStatus, fu.lead_id);
+      ).run(status, status, fu.lead_id);
     }
 
     res.json(db.prepare(`SELECT * FROM follow_ups WHERE id = ?`).get(fu.id));

@@ -149,8 +149,8 @@ router.get('/queue-stats', requirePermission('leads:assign'), (_req, res) => {
   const byRep = db
     .prepare(
       `SELECT u.id, u.name, u.email,
-        SUM(CASE WHEN l.status IN ('new','contacted','follow_up_scheduled') THEN 1 ELSE 0 END) AS open_count,
-        SUM(CASE WHEN l.status = 'converted' THEN 1 ELSE 0 END) AS converted_count,
+        SUM(CASE WHEN l.status IN ('qualified','conversation','demo_booked','trial') THEN 1 ELSE 0 END) AS open_count,
+        SUM(CASE WHEN l.status = 'paid' THEN 1 ELSE 0 END) AS converted_count,
         COUNT(l.id) AS total_assigned
        FROM users u
        LEFT JOIN leads l ON l.assigned_to = u.id

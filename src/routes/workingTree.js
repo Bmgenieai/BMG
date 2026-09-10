@@ -7,10 +7,10 @@ const router = Router();
 router.use(authRequired);
 
 function toneFor(status, overdueCount) {
-  if (status === 'converted') return 'green';
-  if (status === 'lost') return 'grey';
+  if (status === 'paid' || status === 'converted') return 'green';
+  if (status === 'lost' || status === 'not_interested') return 'grey';
   if (overdueCount > 0) return 'red';
-  if (status === 'follow_up_scheduled' || status === 'contacted') return 'amber';
+  if (status === 'demo_booked' || status === 'trial' || status === 'conversation') return 'amber';
   return 'blue';
 }
 
@@ -213,7 +213,23 @@ router.get('/leads', requireAnyPermission(
       .prepare(`SELECT ${leadCols} ${leadJoin} WHERE ${clauses.join(' AND ')} ORDER BY l.updated_at DESC`)
       .all(...params);
     title = 'Open leads';
-  } else if (['new', 'contacted', 'interested', 'neutral', 'follow_up_scheduled', 'converted', 'not_interested', 'lost'].includes(bucket)) {
+  } else if (
+    [
+      'qualified',
+      'conversation',
+      'demo_booked',
+      'trial',
+      'paid',
+      'lost',
+      'new',
+      'contacted',
+      'interested',
+      'neutral',
+      'follow_up_scheduled',
+      'converted',
+      'not_interested',
+    ].includes(bucket)
+  ) {
     const clauses = ['l.status = ?'];
     const params = [bucket];
     if (assigneeFilter) {

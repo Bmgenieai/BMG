@@ -60,7 +60,7 @@ app.get('/api/health', (_req, res) => {
     frontendUrl: FRONTEND_URL || null,
     publicApiUrl: PUBLIC_API_URL || null,
     // CI/CD smoke marker — bump when verifying Windows auto-deploy
-    deployMarker: 'contact-formats-industry-2026-09-08',
+    deployMarker: 'sales-funnel-2026-09-10',
   });
 });
 

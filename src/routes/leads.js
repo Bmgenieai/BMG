@@ -10,6 +10,10 @@ import {
   LEAD_STATUS_TABS,
   PRODUCT_LEAD_TABS,
   STATUS_LABELS,
+  LOST_REASONS,
+  ACTIVITY_TYPES,
+  REPLY_OUTCOMES,
+  normalizeStatus,
   canAccessLead,
   roleHasPermission,
 } from '../lib/permissions.js';
@@ -78,6 +82,9 @@ router.get('/meta', (_req, res) => {
     statusTabs: LEAD_STATUS_TABS,
     productTabs: PRODUCT_LEAD_TABS,
     contactFormats: CONTACT_FORMATS,
+    lostReasons: LOST_REASONS,
+    activityTypes: ACTIVITY_TYPES,
+    replyOutcomes: REPLY_OUTCOMES,
   });
 });
 
@@ -238,8 +245,8 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
   db.prepare(
     `INSERT INTO leads (
       id, name, email, phone, company, country, state, job_title, industry, contact_format,
-      source, notes, estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      source, status, notes, estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'qualified', ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     nameTrim,
@@ -294,7 +301,13 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
   } = req.body || {};
 
   if (status && !LEAD_STATUSES.includes(status)) {
-    return res.status(400).json({ error: 'Invalid status' });
+    return res.status(400).json({ error: 'Invalid status', allowed: LEAD_STATUSES });
+  }
+  if (status === 'lost') {
+    const reason = lost_reason !== undefined ? lost_reason : lead.lost_reason;
+    if (!reason || !String(reason).trim()) {
+      return res.status(400).json({ error: 'lost_reason required when marking lost', allowed: LOST_REASONS });
+    }
   }
   if (contact_format != null && !CONTACT_FORMATS.includes(contact_format)) {
     return res.status(400).json({ error: 'Invalid contact_format', allowed: CONTACT_FORMATS });
@@ -304,7 +317,7 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
   }
 
   const convertedAt =
-    status === 'converted' && lead.status !== 'converted'
+    status === 'paid' && lead.status !== 'paid'
       ? new Date().toISOString()
       : lead.converted_at;
 
@@ -362,8 +375,23 @@ router.post(
   (req, res) => {
     const lead = requireLeadAccess(req, res);
     if (!lead) return;
-    const { type = 'note', summary, outcome, next_follow_up_at, status } = req.body || {};
+    const { type = 'note', summary, outcome, next_follow_up_at, status: rawStatus } = req.body || {};
     if (!summary) return res.status(400).json({ error: 'summary required' });
+
+    let status = rawStatus ? normalizeStatus(rawStatus) : undefined;
+    if (status && !LEAD_STATUSES.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status', allowed: LEAD_STATUSES });
+    }
+
+    // Auto-advance: positive reply → conversation (if still qualified)
+    if (
+      !status &&
+      type === 'reply' &&
+      outcome === 'positive' &&
+      (lead.status === 'qualified' || lead.status === 'new' || lead.status === 'contacted')
+    ) {
+      status = 'conversation';
+    }
 
     const actId = uuid();
     db.prepare(
@@ -372,13 +400,23 @@ router.post(
     ).run(actId, lead.id, req.user.id, type, summary, outcome || null, next_follow_up_at || null);
 
     if (next_follow_up_at || status) {
+      const paidAt =
+        status === 'paid' && lead.status !== 'paid' ? new Date().toISOString() : lead.converted_at;
       db.prepare(
         `UPDATE leads SET
           next_follow_up_at = COALESCE(?, next_follow_up_at),
           status = COALESCE(?, status),
+          converted_at = COALESCE(?, converted_at),
           updated_at = datetime('now')
          WHERE id = ?`,
-      ).run(next_follow_up_at || null, status || null, lead.id);
+      ).run(next_follow_up_at || null, status || null, paidAt || null, lead.id);
+
+      if (status && status !== lead.status) {
+        db.prepare(
+          `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, outcome)
+           VALUES (?, ?, ?, 'status_change', ?, ?)`,
+        ).run(uuid(), lead.id, req.user.id, `Status: ${lead.status} → ${status}`, status);
+      }
     }
 
     res.status(201).json(db.prepare(`SELECT * FROM lead_activities WHERE id = ?`).get(actId));
@@ -526,8 +564,8 @@ router.post(
     const insert = db.prepare(
       `INSERT INTO leads (
         id, name, email, phone, company, country, state, job_title, industry, contact_format,
-        source, notes, estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        source, status, notes, estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'qualified', ?, ?, ?, ?, ?, ?, ?)`,
     );
 
     const now = new Date().toISOString();

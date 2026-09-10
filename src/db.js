@@ -36,7 +36,7 @@ export function migrate() {
       company TEXT,
       country TEXT,
       source TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'new',
+      status TEXT NOT NULL DEFAULT 'qualified',
       assigned_to TEXT REFERENCES users(id) ON DELETE SET NULL,
       assigned_at TEXT,
       assigned_by TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -139,11 +139,22 @@ export function migrate() {
     }
   }
 
-  // One-time: legacy status → marketing pipeline
-  try {
-    db.prepare(`UPDATE leads SET status = 'not_interested' WHERE status = 'lost'`).run();
-  } catch {
-    /* ignore */
+  // One-time: legacy disposition → sales funnel stages
+  const statusMigrates = [
+    [`UPDATE leads SET status = 'qualified' WHERE status IN ('new','contacted')`, 'qualified'],
+    [
+      `UPDATE leads SET status = 'conversation' WHERE status IN ('interested','neutral','follow_up_scheduled')`,
+      'conversation',
+    ],
+    [`UPDATE leads SET status = 'lost' WHERE status = 'not_interested'`, 'lost'],
+    [`UPDATE leads SET status = 'paid' WHERE status = 'converted'`, 'paid'],
+  ];
+  for (const [sql] of statusMigrates) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
