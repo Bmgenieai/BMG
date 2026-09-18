@@ -17,7 +17,7 @@ export const PERMISSIONS = {
   'leads:create': ['ceo', 'manager', 'telesales'],
   'leads:update_any': ['ceo', 'manager'],
   'leads:update_own': ['ceo', 'manager', 'telesales'],
-  'leads:import': ['ceo', 'manager'],
+  'leads:import': ['ceo', 'manager', 'telesales'],
   'leads:assign': ['ceo', 'manager'],
 
   // Follow-ups

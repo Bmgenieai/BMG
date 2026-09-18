@@ -539,7 +539,10 @@ router.post(
   (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'CSV file required (field: file)' });
     const sourceLabel = req.body?.source_label || 'csv_import';
-    const source = 'csv_import';
+    // Telesales CSV rows are their own generated leads (same as New lead):
+    // created_by + assigned_to = uploader, source = telesales.
+    const isTelesales = req.user.role === 'telesales';
+    const source = isTelesales ? 'telesales' : 'csv_import';
 
     let records;
     try {
