@@ -121,6 +121,51 @@ export function migrate() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_lead_employees_lead ON lead_employees(lead_id);
+
+    CREATE TABLE IF NOT EXISTS demo_bookings (
+      id TEXT PRIMARY KEY,
+      lead_id TEXT REFERENCES leads(id) ON DELETE SET NULL,
+      name TEXT,
+      email TEXT,
+      phone TEXT,
+      scheduled_at TEXT,
+      timezone TEXT,
+      duration_minutes INTEGER,
+      calendly_event_uri TEXT,
+      calendly_invitee_uri TEXT,
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      questions_json TEXT,
+      raw_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_demo_bookings_scheduled ON demo_bookings(scheduled_at);
+    CREATE INDEX IF NOT EXISTS idx_demo_bookings_email ON demo_bookings(email);
+
+    CREATE TABLE IF NOT EXISTS chat_threads (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL DEFAULT 'tawk',
+      external_chat_id TEXT NOT NULL,
+      visitor_name TEXT,
+      visitor_email TEXT,
+      bmgenie_user_id TEXT,
+      lead_id TEXT REFERENCES leads(id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      page_url TEXT,
+      preview TEXT,
+      transcript_json TEXT,
+      started_at TEXT,
+      ended_at TEXT,
+      tawk_property_id TEXT,
+      raw_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(provider, external_chat_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_chat_threads_started ON chat_threads(started_at);
+    CREATE INDEX IF NOT EXISTS idx_chat_threads_status ON chat_threads(status);
   `);
 
   // Additive columns for telesales lead-gen (safe on existing DBs)
@@ -130,6 +175,7 @@ export function migrate() {
     `ALTER TABLE leads ADD COLUMN created_by TEXT REFERENCES users(id) ON DELETE SET NULL`,
     `ALTER TABLE leads ADD COLUMN industry TEXT`,
     `ALTER TABLE leads ADD COLUMN contact_format TEXT DEFAULT 'company'`,
+    `ALTER TABLE leads ADD COLUMN metadata TEXT`,
   ];
   for (const sql of leadAlters) {
     try {

@@ -116,12 +116,31 @@ Redeploy main API after setting these.
 
 | User action on bmgenie.ai | CRM lead source | CRM status |
 |---------------------------|-----------------|------------|
-| Signs up (no purchase) | `signup_no_listing` | New |
-| Uses free credit, no purchase | `free_credit_no_purchase` | New |
-| Buys a package | — | **Converted** |
-| Uses all paid credits, no repurchase | `purchased_no_repurchase` | New (win-back) |
+| Signs up (no purchase) | `signup_no_listing` | Qualified |
+| Uses free credit, no purchase | `free_credit_no_purchase` | Qualified |
+| Buys a package | — | **Paid** |
+| Uses all paid credits, no repurchase | `purchased_no_repurchase` | Qualified (win-back) |
+| Opens Stripe then abandons | `checkout_abandoned` | Open |
+| Requests listing revisions | `revision_requested` | Open |
+| Books Calendly demo | `demo_booking` | **Demo booked** (+ **Book a demo** tab) |
+| Starts Tawk chat | `chat_support` | Chat thread in **Chat support** |
 
-View in CRM sidebar under **From bmgenie.ai**.
+View product queues in CRM sidebar under **From bmgenie.ai**. CEO **Product analytics** page shows daily counts (live from main API when `BMGENIE_API_URL` is set).
+
+### Webhooks to configure (ops)
+
+| Provider | CRM endpoint |
+|----------|----------------|
+| Calendly (`invitee.created`) | `https://crm-api.bmgenie.ai/api/ingest/calendly` |
+| Tawk.to (chat start / transcript) | `https://crm-api.bmgenie.ai/api/ingest/tawk` |
+
+Optional Windows `.env`:
+
+```env
+BMGENIE_API_URL=https://api.bmgenie.ai
+CALENDLY_ALLOW_UNSIGNED=true
+TAWK_PROPERTY_ID=6aaf9e58d673343444374636
+```
 
 ### Test ingest from office PC
 
@@ -133,6 +152,15 @@ curl -X POST https://crm-api.bmgenie.ai/api/ingest/product-leads `
 ```
 
 Expected: `{"ok":true,"action":"created",...}`
+
+Also try checkout / revision / chat:
+
+```powershell
+curl -X POST https://crm-api.bmgenie.ai/api/ingest/product-leads `
+  -H "Content-Type: application/json" `
+  -H "X-CRM-Ingest-Key: YOUR_SHARED_SECRET" `
+  -d '{"event":"user.checkout_abandoned","bmgenieUserId":"test-2","name":"Abandon User","email":"abandon@example.com","metadata":{"stripePaymentIntentId":"pi_test","packageType":"professional"}}'
+```
 
 ---
 

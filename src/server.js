@@ -14,6 +14,8 @@ import workingTreeRoutes from './routes/workingTree.js';
 import analyticsRoutes from './routes/analytics.js';
 import ingestRoutes from './routes/ingest.js';
 import emailRoutes from './routes/email.js';
+import demosRoutes from './routes/demos.js';
+import chatsRoutes from './routes/chats.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -60,7 +62,7 @@ app.get('/api/health', (_req, res) => {
     frontendUrl: FRONTEND_URL || null,
     publicApiUrl: PUBLIC_API_URL || null,
     // CI/CD smoke marker — bump when verifying Windows auto-deploy
-    deployMarker: 'sales-funnel-2026-09-10',
+    deployMarker: 'product-tracking-2026-09-21',
   });
 });
 
@@ -72,6 +74,8 @@ app.use('/api/follow-ups', followUpsRoutes);
 app.use('/api/working-tree', workingTreeRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/ingest', ingestRoutes);
+app.use('/api/demos', demosRoutes);
+app.use('/api/chats', chatsRoutes);
 app.use('/api/email', emailRoutes);
 
 // cPanel / production: serve React build from frontend/dist at site root

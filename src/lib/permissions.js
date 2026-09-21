@@ -68,6 +68,26 @@ export const LEAD_SOURCES = {
     label: 'Credits used · no repurchase',
     description: 'Bought a package, used all credits, has not repurchased',
   },
+  checkout_abandoned: {
+    key: 'checkout_abandoned',
+    label: 'Stripe · abandoned checkout',
+    description: 'Opened Stripe payment box on BMGenie but did not complete payment',
+  },
+  revision_requested: {
+    key: 'revision_requested',
+    label: 'Asked for revisions',
+    description: 'Requested listing revisions on BMGenie',
+  },
+  demo_booking: {
+    key: 'demo_booking',
+    label: 'Book a demo',
+    description: 'Booked a demo via Calendly on bmgenie.ai',
+  },
+  chat_support: {
+    key: 'chat_support',
+    label: 'Chat support',
+    description: 'Started a Tawk.to chat on bmgenie.ai',
+  },
   csv_import: {
     key: 'csv_import',
     label: 'CSV / Google Sheet',
@@ -164,6 +184,8 @@ export const PRODUCT_LEAD_TABS = [
   { slug: 'signup', source: 'signup_no_listing', label: 'Signup · no purchase' },
   { slug: 'free-credit', source: 'free_credit_no_purchase', label: 'Free credit · no purchase' },
   { slug: 'winback', source: 'purchased_no_repurchase', label: 'Win-back · no repurchase' },
+  { slug: 'checkout-abandoned', source: 'checkout_abandoned', label: 'Stripe · abandoned' },
+  { slug: 'revisions', source: 'revision_requested', label: 'Asked for revisions' },
 ];
 
 export const OPEN_STATUSES = ['qualified', 'conversation', 'demo_booked', 'trial'];

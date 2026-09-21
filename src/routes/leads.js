@@ -125,7 +125,18 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     PRODUCT_LEAD_TABS.map((t) => [t.slug, sourceMap[t.source] || 0]),
   );
 
-  res.json({ total, statusCounts, productCounts });
+  const demosCount = db.prepare(`SELECT COUNT(*) AS c FROM demo_bookings`).get().c;
+  const chatsOpen = db
+    .prepare(`SELECT COUNT(*) AS c FROM chat_threads WHERE status = 'open'`)
+    .get().c;
+
+  res.json({
+    total,
+    statusCounts,
+    productCounts,
+    demosCount,
+    chatsOpen,
+  });
 });
 
 router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {

@@ -3,6 +3,7 @@ import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
 import { authRequired, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { LEAD_SOURCES, OPEN_STATUSES, roleHasPermission } from '../lib/permissions.js';
+import { fetchBmgenieCrmAnalytics, normalizeUserRows } from '../lib/bmgenieApi.js';
 
 const router = Router();
 router.use(authRequired);
@@ -273,6 +274,168 @@ router.get(
     });
   },
 );
+
+/**
+ * CEO product-user analytics for bmgenie.ai.
+ * Prefers live main-API /crm-analytics/*; falls back to CRM ingest / local tables.
+ */
+router.get(
+  '/product-tracking',
+  requireAnyPermission('analytics:view_all', 'analytics:view_team'),
+  async (req, res) => {
+    const date = req.query.date || new Date().toISOString().slice(0, 10);
+    const query = { date };
+
+    const cards = [
+      {
+        key: 'daily_new_users',
+        title: 'Daily new users',
+        description: 'New BMGenie signups for the day',
+        mainPath: '/crm-analytics/daily-new-users',
+        localSource: 'signup_no_listing',
+        localMode: 'created_today',
+      },
+      {
+        key: 'daily_no_listings',
+        title: 'Came today · no listings',
+        description: 'Signed up today and have not created any listings',
+        mainPath: '/crm-analytics/daily-no-listings',
+        localSource: 'signup_no_listing',
+        localMode: 'created_today',
+      },
+      {
+        key: 'free_not_paid',
+        title: 'Free listing · not paid',
+        description: 'Used free credit but never purchased a package',
+        mainPath: '/crm-analytics/free-not-paid',
+        localSource: 'free_credit_no_purchase',
+        localMode: 'open_source',
+      },
+      {
+        key: 'checkout_abandoned',
+        title: 'Opened Stripe · abandoned',
+        description: 'Opened payment box then did not complete',
+        mainPath: '/crm-analytics/checkout-abandoned',
+        localSource: 'checkout_abandoned',
+        localMode: 'open_source',
+      },
+      {
+        key: 'revisions_requested',
+        title: 'Asked for revisions',
+        description: 'Requested listing revisions on BMGenie',
+        mainPath: '/crm-analytics/revisions-requested',
+        localSource: 'revision_requested',
+        localMode: 'created_today',
+      },
+    ];
+
+    const results = [];
+    let mainAvailable = false;
+    let mainError = null;
+
+    for (const card of cards) {
+      const remote = await fetchBmgenieCrmAnalytics(card.mainPath, query);
+      if (remote.ok && remote.data) {
+        mainAvailable = true;
+        const users = normalizeUserRows(remote.data.users || remote.data.items || []);
+        results.push({
+          key: card.key,
+          title: card.title,
+          description: card.description,
+          source: 'bmgenie_api',
+          date: remote.data.date || date,
+          timezone: remote.data.timezone || null,
+          definition: remote.data.definition || null,
+          count: remote.data.count ?? users.length,
+          users,
+        });
+        continue;
+      }
+
+      if (remote.error) mainError = remote.error;
+
+      const local = localProductCard(card, date);
+      results.push({
+        key: card.key,
+        title: card.title,
+        description: card.description,
+        source: 'crm_fallback',
+        date,
+        timezone: null,
+        definition: local.definition,
+        count: local.count,
+        users: local.users,
+        fallbackReason: remote.error || 'Main API unavailable',
+      });
+    }
+
+    const demosToday = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM demo_bookings
+         WHERE date(COALESCE(scheduled_at, created_at)) = date(?)`,
+      )
+      .get(date).c;
+    const chatsToday = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM chat_threads
+         WHERE date(COALESCE(started_at, created_at)) = date(?)`,
+      )
+      .get(date).c;
+
+    res.json({
+      date,
+      mainAvailable,
+      mainError: mainAvailable ? null : mainError,
+      bmgenieApiConfigured: Boolean(
+        (process.env.BMGENIE_API_URL || '').trim() && (process.env.CRM_INGEST_API_KEY || '').trim(),
+      ),
+      cards: results,
+      extras: {
+        demosToday,
+        chatsToday,
+        demosHref: '/demos',
+        chatsHref: '/chats',
+      },
+    });
+  },
+);
+
+function localProductCard(card, date) {
+  const openList = OPEN_STATUSES.map((s) => `'${s}'`).join(',');
+  if (card.localMode === 'created_today') {
+    const users = db
+      .prepare(
+        `SELECT id, name, email, phone, company, created_at AS createdAt, bmgenie_user_id AS bmgenieUserId
+         FROM leads
+         WHERE source = ?
+           AND date(created_at) = date(?)
+         ORDER BY created_at DESC
+         LIMIT 200`,
+      )
+      .all(card.localSource, date);
+    return {
+      count: users.length,
+      users: normalizeUserRows(users),
+      definition: `CRM fallback: leads with source=${card.localSource} created on ${date}`,
+    };
+  }
+
+  const users = db
+    .prepare(
+      `SELECT id, name, email, phone, company, created_at AS createdAt, bmgenie_user_id AS bmgenieUserId
+       FROM leads
+       WHERE source = ?
+         AND status IN (${openList})
+       ORDER BY updated_at DESC
+       LIMIT 200`,
+    )
+    .all(card.localSource);
+  return {
+    count: users.length,
+    users: normalizeUserRows(users),
+    definition: `CRM fallback: open leads with source=${card.localSource}`,
+  };
+}
 
 router.post('/revenue', requirePermission('revenue:record'), (req, res) => {
   const { amount, currency = 'USD', label, leadId, occurredAt } = req.body || {};
