@@ -17,6 +17,7 @@ import {
   canAccessLead,
   roleHasPermission,
 } from '../lib/permissions.js';
+import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const router = Router();
@@ -85,25 +86,36 @@ router.get('/meta', (_req, res) => {
     lostReasons: LOST_REASONS,
     activityTypes: ACTIVITY_TYPES,
     replyOutcomes: REPLY_OUTCOMES,
+    cohorts: [
+      { key: 'all', label: 'All users', definition: COHORT_DEFINITIONS.all },
+      { key: 'new', label: 'New users', definition: COHORT_DEFINITIONS.new },
+      { key: 'old', label: 'Old users', definition: COHORT_DEFINITIONS.old },
+    ],
   });
 });
 
 /** Counts for sidebar tabs (marketing dashboard style). */
 router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
+  const cohort = normalizeCohort(req.query.cohort);
+  const refDate = cohortRefDate(req.query.date);
+  const cohortPred = cohortSql('COALESCE(signed_up_at, created_at)', cohort, refDate);
+
   const assigneeClause = !roleHasPermission(req.user.role, 'leads:view_all')
     ? 'AND (assigned_to = ? OR created_by = ?)'
     : '';
   const assigneeParam = assigneeClause ? [req.user.id, req.user.id] : [];
+  const cohortClause = cohortPred.sql === '1=1' ? '' : `AND ${cohortPred.sql}`;
+  const baseParams = [...assigneeParam, ...cohortPred.params];
 
   const total = db
-    .prepare(`SELECT COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause}`)
-    .get(...assigneeParam).c;
+    .prepare(`SELECT COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause}`)
+    .get(...baseParams).c;
 
   const byStatus = db
     .prepare(
-      `SELECT status, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} GROUP BY status`,
+      `SELECT status, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} GROUP BY status`,
     )
-    .all(...assigneeParam);
+    .all(...baseParams);
   const statusMap = Object.fromEntries(byStatus.map((r) => [r.status, r.c]));
 
   const statusCounts = {};
@@ -117,9 +129,9 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
 
   const bySource = db
     .prepare(
-      `SELECT source, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} GROUP BY source`,
+      `SELECT source, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} GROUP BY source`,
     )
-    .all(...assigneeParam);
+    .all(...baseParams);
   const sourceMap = Object.fromEntries(bySource.map((r) => [r.source, r.c]));
   const productCounts = Object.fromEntries(
     PRODUCT_LEAD_TABS.map((t) => [t.slug, sourceMap[t.source] || 0]),
@@ -136,11 +148,13 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     productCounts,
     demosCount,
     chatsOpen,
+    cohort,
+    cohortDate: refDate,
   });
 });
 
 router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
-  const { source, status, assigned_to, q, unassigned } = req.query;
+  const { source, status, assigned_to, q, unassigned, cohort: cohortRaw, date } = req.query;
   const clauses = [];
   const params = [];
 
@@ -175,6 +189,16 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     );
     const like = `%${q}%`;
     params.push(like, like, like, like, like, like, like, like);
+  }
+
+  const cohortPred = cohortSql(
+    'COALESCE(l.signed_up_at, l.created_at)',
+    cohortRaw,
+    date,
+  );
+  if (cohortPred.sql !== '1=1') {
+    clauses.push(cohortPred.sql);
+    params.push(...cohortPred.params);
   }
 
   const where = clauses.length ? clauses.join(' AND ') : '1=1';

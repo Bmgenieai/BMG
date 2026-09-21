@@ -107,11 +107,14 @@ function insertLead({
   metadata,
 }) {
   const id = uuid();
+  const signedUpAt =
+    (metadata && (metadata.signedUpAt || metadata.signed_up_at || metadata.createdAt)) ||
+    null;
   db.prepare(
     `INSERT INTO leads (
       id, name, email, phone, company, country, source, status,
-      bmgenie_user_id, estimated_value, notes, metadata
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      bmgenie_user_id, estimated_value, notes, metadata, signed_up_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`,
   ).run(
     id,
     name,
@@ -125,6 +128,7 @@ function insertLead({
     Number(estimatedValue) || 0,
     notes || null,
     serializeMetadata(metadata),
+    signedUpAt ? String(signedUpAt) : null,
   );
   db.prepare(
     `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)

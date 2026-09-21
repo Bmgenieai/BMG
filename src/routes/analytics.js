@@ -4,6 +4,7 @@ import { db } from '../db.js';
 import { authRequired, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { LEAD_SOURCES, OPEN_STATUSES, roleHasPermission } from '../lib/permissions.js';
 import { fetchBmgenieCrmAnalytics, normalizeUserRows } from '../lib/bmgenieApi.js';
+import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
 
 const router = Router();
 router.use(authRequired);
@@ -284,7 +285,8 @@ router.get(
   requireAnyPermission('analytics:view_all', 'analytics:view_team'),
   async (req, res) => {
     const date = req.query.date || new Date().toISOString().slice(0, 10);
-    const query = { date };
+    const cohort = normalizeCohort(req.query.cohort);
+    const query = { date, cohort };
 
     const cards = [
       {
@@ -294,6 +296,7 @@ router.get(
         mainPath: '/crm-analytics/daily-new-users',
         localSource: 'signup_no_listing',
         localMode: 'created_today',
+        // This card is already "new that day"; old cohort is always empty.
       },
       {
         key: 'daily_no_listings',
@@ -337,7 +340,8 @@ router.get(
       const remote = await fetchBmgenieCrmAnalytics(card.mainPath, query);
       if (remote.ok && remote.data) {
         mainAvailable = true;
-        const users = normalizeUserRows(remote.data.users || remote.data.items || []);
+        let users = normalizeUserRows(remote.data.users || remote.data.items || []);
+        users = filterUsersByCohort(users, cohort, date);
         results.push({
           key: card.key,
           title: card.title,
@@ -346,15 +350,16 @@ router.get(
           date: remote.data.date || date,
           timezone: remote.data.timezone || null,
           definition: remote.data.definition || null,
-          count: remote.data.count ?? users.length,
+          count: users.length,
           users,
+          cohort,
         });
         continue;
       }
 
       if (remote.error) mainError = remote.error;
 
-      const local = localProductCard(card, date);
+      const local = localProductCard(card, date, cohort);
       results.push({
         key: card.key,
         title: card.title,
@@ -365,25 +370,43 @@ router.get(
         definition: local.definition,
         count: local.count,
         users: local.users,
+        cohort,
         fallbackReason: remote.error || 'Main API unavailable',
       });
     }
 
+    const demoCohort = cohortSql(
+      `COALESCE(NULLIF(l.signed_up_at, ''), NULLIF(l.created_at, ''), d.created_at)`,
+      cohort,
+      date,
+    );
+    const chatCohort = cohortSql(
+      `COALESCE(NULLIF(l.signed_up_at, ''), NULLIF(l.created_at, ''), NULLIF(c.started_at, ''), c.created_at)`,
+      cohort,
+      date,
+    );
+
     const demosToday = db
       .prepare(
-        `SELECT COUNT(*) AS c FROM demo_bookings
-         WHERE date(COALESCE(scheduled_at, created_at)) = date(?)`,
+        `SELECT COUNT(*) AS c FROM demo_bookings d
+         LEFT JOIN leads l ON l.id = d.lead_id
+         WHERE date(COALESCE(d.scheduled_at, d.created_at)) = date(?)
+           AND (${demoCohort.sql})`,
       )
-      .get(date).c;
+      .get(date, ...demoCohort.params).c;
     const chatsToday = db
       .prepare(
-        `SELECT COUNT(*) AS c FROM chat_threads
-         WHERE date(COALESCE(started_at, created_at)) = date(?)`,
+        `SELECT COUNT(*) AS c FROM chat_threads c
+         LEFT JOIN leads l ON l.id = c.lead_id
+         WHERE date(COALESCE(c.started_at, c.created_at)) = date(?)
+           AND (${chatCohort.sql})`,
       )
-      .get(date).c;
+      .get(date, ...chatCohort.params).c;
 
     res.json({
       date,
+      cohort,
+      cohortDefinition: COHORT_DEFINITIONS[cohort],
       mainAvailable,
       mainError: mainAvailable ? null : mainError,
       bmgenieApiConfigured: Boolean(
@@ -393,47 +416,69 @@ router.get(
       extras: {
         demosToday,
         chatsToday,
-        demosHref: '/demos',
-        chatsHref: '/chats',
+        demosHref: `/demos?cohort=${cohort}`,
+        chatsHref: `/chats?cohort=${cohort}`,
       },
     });
   },
 );
 
-function localProductCard(card, date) {
+function filterUsersByCohort(users, cohort, refDate) {
+  const c = normalizeCohort(cohort);
+  if (c === 'all') return users;
+  const day = cohortRefDate(refDate);
+  return users.filter((u) => {
+    const raw = u.createdAt || u.created_at || u.signedUpAt || u.signed_up_at;
+    if (!raw) return c === 'all';
+    const ymd = String(raw).slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return false;
+    if (c === 'new') return ymd === day;
+    if (c === 'old') return ymd < day;
+    return true;
+  });
+}
+
+function localProductCard(card, date, cohort = 'all') {
   const openList = OPEN_STATUSES.map((s) => `'${s}'`).join(',');
+  const cohortPred = cohortSql('COALESCE(signed_up_at, created_at)', cohort, date);
+
   if (card.localMode === 'created_today') {
+    // Daily cards: event day = selected date; still apply cohort on signup day.
     const users = db
       .prepare(
-        `SELECT id, name, email, phone, company, created_at AS createdAt, bmgenie_user_id AS bmgenieUserId
+        `SELECT id, name, email, phone, company, created_at AS createdAt,
+                signed_up_at AS signedUpAt, bmgenie_user_id AS bmgenieUserId
          FROM leads
          WHERE source = ?
            AND date(created_at) = date(?)
+           AND (${cohortPred.sql})
          ORDER BY created_at DESC
          LIMIT 200`,
       )
-      .all(card.localSource, date);
+      .all(card.localSource, date, ...cohortPred.params);
     return {
       count: users.length,
       users: normalizeUserRows(users),
-      definition: `CRM fallback: leads with source=${card.localSource} created on ${date}`,
+      definition: `CRM fallback: leads with source=${card.localSource} created on ${date} (${cohort} users)`,
     };
   }
 
   const users = db
     .prepare(
-      `SELECT id, name, email, phone, company, created_at AS createdAt, bmgenie_user_id AS bmgenieUserId
+      `SELECT id, name, email, phone, company, created_at AS createdAt,
+              signed_up_at AS signedUpAt, bmgenie_user_id AS bmgenieUserId
        FROM leads
        WHERE source = ?
          AND status IN (${openList})
+         AND (${cohortPred.sql})
        ORDER BY updated_at DESC
        LIMIT 200`,
     )
-    .all(card.localSource);
+    .all(card.localSource, ...cohortPred.params);
   return {
     count: users.length,
     users: normalizeUserRows(users),
-    definition: `CRM fallback: open leads with source=${card.localSource}`,
+    definition: `CRM fallback: open leads with source=${card.localSource} (${cohort} users)`,
   };
 }
 

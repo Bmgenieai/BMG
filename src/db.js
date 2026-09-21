@@ -176,8 +176,28 @@ export function migrate() {
     `ALTER TABLE leads ADD COLUMN industry TEXT`,
     `ALTER TABLE leads ADD COLUMN contact_format TEXT DEFAULT 'company'`,
     `ALTER TABLE leads ADD COLUMN metadata TEXT`,
+    `ALTER TABLE leads ADD COLUMN signed_up_at TEXT`,
   ];
   for (const sql of leadAlters) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* column already exists */
+    }
+  }
+
+  try {
+    db.exec(
+      `UPDATE leads SET signed_up_at = created_at WHERE signed_up_at IS NULL OR TRIM(signed_up_at) = ''`,
+    );
+  } catch {
+    /* ignore */
+  }
+
+  const chatAlters = [
+    `ALTER TABLE chat_threads ADD COLUMN crm_replies_json TEXT`,
+  ];
+  for (const sql of chatAlters) {
     try {
       db.exec(sql);
     } catch {
