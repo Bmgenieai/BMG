@@ -5,11 +5,15 @@ import { authRequired, requirePermission, requireAnyPermission } from '../middle
 import { LEAD_SOURCES, OPEN_STATUSES, roleHasPermission } from '../lib/permissions.js';
 import { fetchBmgenieCrmAnalytics, normalizeUserRows } from '../lib/bmgenieApi.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
+import { resolveWorkingPeriod } from '../lib/periodBounds.js';
 
 const router = Router();
 router.use(authRequired);
 
 const OPEN_LIST = OPEN_STATUSES.map((s) => `'${s}'`).join(',');
+
+/** Normalize mixed ISO / SQLite datetime strings for range compares. */
+const DT = (col) => `datetime(REPLACE(REPLACE(${col}, 'T', ' '), 'Z', ''))`;
 
 router.get(
   '/overview',
@@ -481,6 +485,254 @@ function localProductCard(card, date, cohort = 'all') {
     definition: `CRM fallback: open leads with source=${card.localSource} (${cohort} users)`,
   };
 }
+
+/**
+ * Period-based telesales working + performance.
+ * CEO/manager: all active telesales (optional ?userId= for detail).
+ * Telesales: own row + feed only.
+ *
+ * Query: ?period=today|yesterday|week|month&userId=
+ */
+router.get(
+  '/telesales-working',
+  requireAnyPermission('analytics:view_all', 'analytics:view_team', 'analytics:view_own'),
+  (req, res) => {
+    const isCeo = roleHasPermission(req.user.role, 'analytics:view_all');
+    const isManager = roleHasPermission(req.user.role, 'analytics:view_team');
+    const canViewTeam = isCeo || isManager;
+    const bounds = resolveWorkingPeriod(req.query.period);
+    const { from, to } = bounds;
+
+    let focusUserId = req.query.userId ? String(req.query.userId) : null;
+    if (!canViewTeam) {
+      focusUserId = req.user.id;
+    }
+
+    const reps = canViewTeam
+      ? db
+          .prepare(
+            `SELECT id, name, email FROM users
+             WHERE role = 'telesales' AND is_active = 1
+             ORDER BY name COLLATE NOCASE`,
+          )
+          .all()
+      : db
+          .prepare(`SELECT id, name, email FROM users WHERE id = ?`)
+          .all(req.user.id);
+
+    const leadAdds = db
+      .prepare(
+        `SELECT created_by AS user_id,
+           SUM(CASE WHEN import_batch_id IS NULL OR import_batch_id = '' THEN 1 ELSE 0 END) AS leads_manual,
+           SUM(CASE WHEN import_batch_id IS NOT NULL AND import_batch_id != '' THEN 1 ELSE 0 END) AS leads_csv,
+           COUNT(*) AS leads_added
+         FROM leads
+         WHERE created_by IS NOT NULL
+           AND ${DT('created_at')} >= datetime(?)
+           AND ${DT('created_at')} < datetime(?)
+         GROUP BY created_by`,
+      )
+      .all(from, to);
+
+    const activityAgg = db
+      .prepare(
+        `SELECT user_id,
+           SUM(CASE WHEN type = 'call' THEN 1 ELSE 0 END) AS calls,
+           SUM(CASE WHEN type = 'whatsapp' THEN 1 ELSE 0 END) AS messages,
+           SUM(CASE WHEN type IN ('email', 'email_sent') THEN 1 ELSE 0 END) AS emails,
+           SUM(CASE WHEN type = 'note' THEN 1 ELSE 0 END) AS notes,
+           SUM(CASE WHEN type = 'linkedin' THEN 1 ELSE 0 END) AS linkedin,
+           SUM(CASE WHEN type IN ('call','whatsapp','email','email_sent','linkedin','note') THEN 1 ELSE 0 END) AS total_outreach,
+           COUNT(DISTINCT CASE WHEN type IN ('call','whatsapp','email','email_sent','linkedin','note','reply') THEN lead_id END) AS leads_touched
+         FROM lead_activities
+         WHERE user_id IS NOT NULL
+           AND ${DT('created_at')} >= datetime(?)
+           AND ${DT('created_at')} < datetime(?)
+         GROUP BY user_id`,
+      )
+      .all(from, to);
+
+    const statusMoves = db
+      .prepare(
+        `SELECT user_id,
+           SUM(CASE WHEN outcome = 'conversation' OR summary LIKE '%→ conversation%' OR summary LIKE '%to conversation%' THEN 1 ELSE 0 END) AS to_conversation,
+           SUM(CASE WHEN outcome = 'demo_booked' OR summary LIKE '%→ demo_booked%' OR summary LIKE '%to demo_booked%' THEN 1 ELSE 0 END) AS to_demo,
+           SUM(CASE WHEN outcome = 'trial' OR summary LIKE '%→ trial%' OR summary LIKE '%to trial%' THEN 1 ELSE 0 END) AS to_trial,
+           SUM(CASE WHEN outcome = 'paid' OR summary LIKE '%→ paid%' OR summary LIKE '%to paid%' THEN 1 ELSE 0 END) AS to_paid,
+           SUM(CASE WHEN type = 'status_change' THEN 1 ELSE 0 END) AS status_changes
+         FROM lead_activities
+         WHERE user_id IS NOT NULL
+           AND type = 'status_change'
+           AND ${DT('created_at')} >= datetime(?)
+           AND ${DT('created_at')} < datetime(?)
+         GROUP BY user_id`,
+      )
+      .all(from, to);
+
+    const paidInPeriod = db
+      .prepare(
+        `SELECT assigned_to AS user_id, COUNT(*) AS paid
+         FROM leads
+         WHERE assigned_to IS NOT NULL
+           AND status = 'paid'
+           AND (
+             (${DT('converted_at')} >= datetime(?) AND ${DT('converted_at')} < datetime(?))
+             OR (
+               (converted_at IS NULL OR converted_at = '')
+               AND ${DT('updated_at')} >= datetime(?)
+               AND ${DT('updated_at')} < datetime(?)
+             )
+           )
+         GROUP BY assigned_to`,
+      )
+      .all(from, to, from, to);
+
+    const followUpsDone = db
+      .prepare(
+        `SELECT assigned_to AS user_id, COUNT(*) AS followups_completed
+         FROM follow_ups
+         WHERE status = 'completed'
+           AND ${DT("COALESCE(completed_at, updated_at)")} >= datetime(?)
+           AND ${DT("COALESCE(completed_at, updated_at)")} < datetime(?)
+         GROUP BY assigned_to`,
+      )
+      .all(from, to);
+
+    const overdueFollowups = db
+      .prepare(
+        `SELECT assigned_to AS user_id, COUNT(*) AS overdue_followups
+         FROM follow_ups
+         WHERE assigned_to IS NOT NULL
+           AND status IN ('pending', 'overdue')
+           AND ${DT('due_at')} < datetime('now')
+         GROUP BY assigned_to`,
+      )
+      .all();
+
+    const byId = (rows) => {
+      const m = new Map();
+      for (const r of rows) m.set(r.user_id, r);
+      return m;
+    };
+    const addsMap = byId(leadAdds);
+    const actMap = byId(activityAgg);
+    const moveMap = byId(statusMoves);
+    const paidMap = byId(paidInPeriod);
+    const fuMap = byId(followUpsDone);
+    const overdueMap = byId(overdueFollowups);
+
+    const num = (v) => Number(v) || 0;
+
+    const repRows = reps.map((u) => {
+      const a = addsMap.get(u.id) || {};
+      const act = actMap.get(u.id) || {};
+      const mv = moveMap.get(u.id) || {};
+      const paid = num(paidMap.get(u.id)?.paid);
+      const leadsAdded = num(a.leads_added);
+      const leadsTouched = num(act.leads_touched);
+      return {
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        leadsManual: num(a.leads_manual),
+        leadsCsv: num(a.leads_csv),
+        leadsAdded,
+        calls: num(act.calls),
+        messages: num(act.messages),
+        emails: num(act.emails),
+        notes: num(act.notes),
+        linkedin: num(act.linkedin),
+        totalOutreach: num(act.total_outreach),
+        leadsTouched,
+        toConversation: num(mv.to_conversation),
+        toDemo: num(mv.to_demo),
+        toTrial: num(mv.to_trial),
+        toPaid: num(mv.to_paid),
+        statusChanges: num(mv.status_changes),
+        paid,
+        followupsCompleted: num(fuMap.get(u.id)?.followups_completed),
+        overdueFollowups: num(overdueMap.get(u.id)?.overdue_followups),
+        conversionRate:
+          leadsTouched > 0 ? Math.round((paid / leadsTouched) * 1000) / 10 : paid > 0 ? 100 : 0,
+      };
+    });
+
+    // Sort: most outreach, then leads added
+    repRows.sort(
+      (x, y) =>
+        y.totalOutreach - x.totalOutreach ||
+        y.leadsAdded - x.leadsAdded ||
+        y.paid - x.paid ||
+        x.name.localeCompare(y.name),
+    );
+
+    const sumField = (field) => repRows.reduce((s, r) => s + (r[field] || 0), 0);
+    const totals = {
+      leadsManual: sumField('leadsManual'),
+      leadsCsv: sumField('leadsCsv'),
+      leadsAdded: sumField('leadsAdded'),
+      calls: sumField('calls'),
+      messages: sumField('messages'),
+      emails: sumField('emails'),
+      notes: sumField('notes'),
+      linkedin: sumField('linkedin'),
+      totalOutreach: sumField('totalOutreach'),
+      leadsTouched: sumField('leadsTouched'),
+      toConversation: sumField('toConversation'),
+      toDemo: sumField('toDemo'),
+      toTrial: sumField('toTrial'),
+      paid: sumField('paid'),
+      followupsCompleted: sumField('followupsCompleted'),
+    };
+
+    let feed = [];
+    let leadsCreated = [];
+    const detailId = focusUserId || (repRows.length === 1 ? repRows[0].id : null);
+
+    if (detailId) {
+      feed = db
+        .prepare(
+          `SELECT a.id, a.type, a.summary, a.outcome, a.created_at,
+                  a.lead_id, l.name AS lead_name, l.email AS lead_email, l.status AS lead_status
+           FROM lead_activities a
+           LEFT JOIN leads l ON l.id = a.lead_id
+           WHERE a.user_id = ?
+             AND ${DT('a.created_at')} >= datetime(?)
+             AND ${DT('a.created_at')} < datetime(?)
+             AND a.type IN ('call','whatsapp','email','email_sent','note','linkedin','reply','status_change')
+           ORDER BY a.created_at DESC
+           LIMIT 100`,
+        )
+        .all(detailId, from, to);
+
+      leadsCreated = db
+        .prepare(
+          `SELECT id, name, email, company, source, status, import_batch_id, created_at
+           FROM leads
+           WHERE created_by = ?
+             AND ${DT('created_at')} >= datetime(?)
+             AND ${DT('created_at')} < datetime(?)
+           ORDER BY created_at DESC
+           LIMIT 100`,
+        )
+        .all(detailId, from, to)
+        .map((l) => ({
+          ...l,
+          addMethod: l.import_batch_id ? 'csv' : 'manual',
+        }));
+    }
+
+    res.json({
+      ...bounds,
+      canViewTeam,
+      focusUserId: detailId,
+      reps: repRows,
+      totals,
+      feed,
+      leadsCreated,
+    });
+  },
+);
 
 router.post('/revenue', requirePermission('revenue:record'), (req, res) => {
   const { amount, currency = 'USD', label, leadId, occurredAt } = req.body || {};
