@@ -58,7 +58,7 @@ router.get('/templates', authRequired, (req, res) => {
   res.json({ templates: COLD_EMAIL_TEMPLATES });
 });
 
-router.get('/lists', authRequired, requireAnyPermission('leads:assign', 'leads:import'), async (_req, res) => {
+router.get('/lists', authRequired, requireAnyPermission('email:bulk_send', 'leads:assign', 'leads:import'), async (_req, res) => {
   try {
     const data = await getContactLists();
     res.json(data);
@@ -114,7 +114,7 @@ router.post(
 router.post(
   '/sync-bulk',
   authRequired,
-  requirePermission('leads:assign'),
+  requirePermission('email:bulk_send'),
   async (req, res) => {
     try {
       const { leadIds, listIds } = req.body || {};
@@ -123,9 +123,12 @@ router.post(
       }
       const ids = leadIds.slice(0, 100);
       const placeholders = ids.map(() => '?').join(',');
-      const leads = db
+      let leads = db
         .prepare(`SELECT * FROM leads WHERE id IN (${placeholders}) AND email IS NOT NULL AND email != ''`)
         .all(...ids);
+
+      // Telesales may only sync leads they own / created
+      leads = leads.filter((lead) => canAccessLead(req.user, lead));
 
       let synced = 0;
       let failed = 0;
@@ -226,11 +229,11 @@ router.post(
   },
 );
 
-/** Bulk cold email — managers only, max 25 per request. */
+/** Bulk cold email — max 25 per request. Telesales limited to accessible leads. */
 router.post(
   '/bulk-send',
   authRequired,
-  requirePermission('leads:assign'),
+  requirePermission('email:bulk_send'),
   async (req, res) => {
     try {
       const { leadIds, subject, htmlContent, textContent, templateId, syncToBrevo } = req.body || {};
@@ -240,12 +243,16 @@ router.post(
 
       const ids = leadIds.slice(0, 25);
       const placeholders = ids.map(() => '?').join(',');
-      const leads = db
+      let leads = db
         .prepare(`SELECT * FROM leads WHERE id IN (${placeholders}) AND email IS NOT NULL AND email != ''`)
         .all(...ids);
 
+      leads = leads.filter((lead) => canAccessLead(req.user, lead));
+
       if (!leads.length) {
-        return res.status(400).json({ error: 'No leads with email addresses found' });
+        return res.status(400).json({
+          error: 'No accessible leads with email addresses found',
+        });
       }
 
       let sent = 0;

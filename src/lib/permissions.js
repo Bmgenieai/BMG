@@ -38,6 +38,9 @@ export const PERMISSIONS = {
   // Revenue logging
   'revenue:record': ['ceo', 'manager'],
   'revenue:view': ['ceo', 'manager'],
+
+  // Cold email (Brevo)
+  'email:bulk_send': ['ceo', 'manager', 'telesales'],
 };
 
 export function roleHasPermission(role, permission) {
