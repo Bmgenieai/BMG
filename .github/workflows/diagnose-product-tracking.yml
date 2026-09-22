@@ -42,54 +42,45 @@ jobs:
             $ingestKey = Get-DotEnvValue 'CRM_INGEST_API_KEY'
             $bmgenieUrl = Get-DotEnvValue 'BMGENIE_API_URL'
             Write-Host ("CRM_INGEST_API_KEY set: " + (-not [string]::IsNullOrWhiteSpace($ingestKey)))
-            Write-Host ("BMGENIE_API_URL set: " + (-not [string]::IsNullOrWhiteSpace($bmgenieUrl)))
-            if ($bmgenieUrl) { Write-Host ("BMGENIE_API_URL: " + $bmgenieUrl) }
+            Write-Host ("BMGENIE_API_URL: " + $bmgenieUrl)
 
-            $today = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
-            $yesterday = (Get-Date).ToUniversalTime().AddDays(-1).ToString('yyyy-MM-dd')
-            Write-Host "UTC date: $today yesterday: $yesterday"
-
-            if (Test-Path .\scripts\windows\diagnose-product-tracking.ps1) {
-              Write-Host 'Running diagnose-product-tracking.ps1 (local section via node from cwd)...'
-            }
-
-            Write-Host '--- Local CRM leads ---'
             $js = @'
             const Database = require('better-sqlite3');
             const db = new Database('./data/crm.db', { readonly: true });
-            const recent = db.prepare("SELECT email, source, status, created_at FROM leads WHERE source IN ('signup_no_listing','free_credit_no_purchase') ORDER BY created_at DESC LIMIT 15").all();
-            console.log(JSON.stringify({
-              total: db.prepare('SELECT COUNT(*) AS c FROM leads').get().c,
-              signup: db.prepare("SELECT COUNT(*) AS c FROM leads WHERE source='signup_no_listing'").get().c,
-              recent
-            }, null, 2));
+            const recent = db.prepare("SELECT email, source, status, created_at FROM leads ORDER BY created_at DESC LIMIT 20").all();
+            const bySource = db.prepare('SELECT source, COUNT(*) AS c FROM leads GROUP BY source ORDER BY c DESC').all();
+            console.log(JSON.stringify({ total: db.prepare('SELECT COUNT(*) AS c FROM leads').get().c, bySource, recent }, null, 2));
             '@
-            Set-Content -Path .\diag-leads-tmp.js -Value $js -Encoding UTF8
-            node .\diag-leads-tmp.js
-            Remove-Item .\diag-leads-tmp.js -Force -ErrorAction SilentlyContinue
+            Set-Content -Path .\diag-leads-tmp.cjs -Value $js -Encoding UTF8
+            Write-Host '--- Local CRM leads ---'
+            node .\diag-leads-tmp.cjs
+            Remove-Item .\diag-leads-tmp.cjs -Force -ErrorAction SilentlyContinue
 
             if ($bmgenieUrl -and $ingestKey) {
               $base = $bmgenieUrl.TrimEnd('/')
               $headers = @{ 'X-CRM-Ingest-Key' = $ingestKey; 'Accept' = 'application/json' }
-              foreach ($day in @($today, $yesterday)) {
-                foreach ($sub in @('/api/crm-analytics/daily-new-users', '/api/crm-analytics/daily-no-listings')) {
-                  $url = "$base$sub`?date=$day"
-                  Write-Host "--- GET $url ---"
-                  try {
-                    $res = Invoke-RestMethod -Uri $url -Headers $headers -TimeoutSec 20
-                    Write-Host ("count=" + $res.count + " timezone=" + $res.timezone)
-                    if ($res.users -and $res.users.Count -gt 0) {
-                      $emails = @($res.users | Select-Object -First 25 | ForEach-Object { $_.email }) -join ', '
-                      Write-Host ("emails: " + $emails)
-                    }
-                  } catch {
-                    Write-Host ("FAILED: " + $_.Exception.Message)
-                    if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
+              foreach ($sub in @(
+                '/api/crm-analytics/daily-new-users?date=2026-09-22',
+                '/api/crm-analytics/daily-new-users?date=2026-09-21',
+                '/api/crm-analytics/daily-new-users?date=2026-09-20',
+                '/api/crm-analytics/daily-new-users?date=2026-09-19',
+                '/api/crm-analytics/daily-no-listings?date=2026-09-22',
+                '/api/crm-analytics/free-not-paid?date=2026-09-22'
+              )) {
+                $url = "$base$sub"
+                Write-Host "--- GET $url ---"
+                try {
+                  $res = Invoke-RestMethod -Uri $url -Headers $headers -TimeoutSec 25
+                  Write-Host ("count=" + $res.count + " timezone=" + $res.timezone)
+                  if ($res.users -and $res.users.Count -gt 0) {
+                    $emails = @($res.users | Select-Object -First 15 | ForEach-Object { $_.email }) -join ', '
+                    Write-Host ("sample: " + $emails)
                   }
+                } catch {
+                  Write-Host ("FAILED: " + $_.Exception.Message)
+                  if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
                 }
               }
-            } else {
-              Write-Host 'SKIP main analytics pull (BMGENIE_API_URL or key missing on Windows .env)'
             }
 
             Write-Host 'DIAG_DONE'
