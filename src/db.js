@@ -205,6 +205,33 @@ export function migrate() {
     }
   }
 
+  // Cold-email schedule queue (additive — safe on existing DBs)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS scheduled_emails (
+      id TEXT PRIMARY KEY,
+      batch_id TEXT NOT NULL,
+      lead_id TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      subject TEXT,
+      html_content TEXT,
+      text_content TEXT,
+      template_id TEXT,
+      sync_to_brevo INTEGER NOT NULL DEFAULT 1,
+      scheduled_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','sending','sent','failed','cancelled')),
+      error TEXT,
+      sent_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_scheduled_emails_due
+      ON scheduled_emails(status, scheduled_at);
+    CREATE INDEX IF NOT EXISTS idx_scheduled_emails_batch
+      ON scheduled_emails(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_scheduled_emails_user
+      ON scheduled_emails(user_id, status);
+  `);
+
   // One-time: legacy disposition → sales funnel stages
   const statusMigrates = [
     [`UPDATE leads SET status = 'qualified' WHERE status IN ('new','contacted')`, 'qualified'],
