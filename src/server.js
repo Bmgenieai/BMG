@@ -16,6 +16,7 @@ import ingestRoutes from './routes/ingest.js';
 import emailRoutes from './routes/email.js';
 import demosRoutes from './routes/demos.js';
 import chatsRoutes from './routes/chats.js';
+import { startScheduledEmailWorker } from './lib/scheduledEmailWorker.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -62,7 +63,7 @@ app.get('/api/health', (_req, res) => {
     frontendUrl: FRONTEND_URL || null,
     publicApiUrl: PUBLIC_API_URL || null,
     // CI/CD smoke marker — bump when verifying Windows auto-deploy
-    deployMarker: 'bmgenie-api-url-analytics-2026-09-21',
+    deployMarker: 'telesales-email-schedule-2026-09-22',
   });
 });
 
@@ -100,4 +101,5 @@ app.listen(PORT, () => {
   if (fs.existsSync(distPath)) {
     console.log(`Serving frontend from ${distPath}`);
   }
+  startScheduledEmailWorker();
 });
