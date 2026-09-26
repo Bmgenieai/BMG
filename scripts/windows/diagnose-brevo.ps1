@@ -91,14 +91,45 @@ try {
   if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
 }
 
-Write-Host '--- Look up diagnostic message ---'
+Write-Host '--- Look up diagnostic messages ---'
+foreach ($rawMid in @(
+  '<202609261116.55664180455@smtp-relay.mailin.fr>',
+  '<202609261120.20339665512@smtp-relay.mailin.fr>'
+)) {
+  try {
+    $mid = [uri]::EscapeDataString($rawMid)
+    $look = Invoke-RestMethod -Uri "https://api.brevo.com/v3/smtp/emails?messageId=$mid&limit=10" -Headers $headers -TimeoutSec 30
+    Write-Host ("LOOKUP $rawMid => " + ($look | ConvertTo-Json -Depth 6 -Compress))
+  } catch {
+    Write-Host ("LOOKUP FAILED $rawMid : " + $_.Exception.Message)
+    if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
+  }
+}
+
+Write-Host '--- Events for jennyjiah5@gmail.com ---'
 try {
-  $mid = [uri]::EscapeDataString('<202609261116.55664180455@smtp-relay.mailin.fr>')
-  $look = Invoke-RestMethod -Uri "https://api.brevo.com/v3/smtp/emails?messageId=$mid&limit=10" -Headers $headers -TimeoutSec 30
-  Write-Host ($look | ConvertTo-Json -Depth 6 -Compress)
+  $jenny = Invoke-RestMethod -Uri 'https://api.brevo.com/v3/smtp/statistics/events?limit=20&offset=0&sort=desc&email=jennyjiah5@gmail.com' -Headers $headers -TimeoutSec 30
+  foreach ($e in @($jenny.events)) {
+    Write-Host ("jenny evt=$($e.event) date=$($e.date) subject=$($e.subject) reason=$($e.reason) messageId=$($e.messageId)")
+  }
+  if (-not $jenny.events -or @($jenny.events).Count -eq 0) { Write-Host 'jenny: no events returned' }
 } catch {
-  Write-Host ("LOOKUP FAILED: " + $_.Exception.Message)
+  Write-Host ("JENNY EVENTS FAILED: " + $_.Exception.Message)
   if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
+}
+
+Write-Host '--- Bounce/blocked/error events (if any) ---'
+foreach ($ev in @('hardBounces','softBounces','blocks','invalid','error','deferred','spam')) {
+  try {
+    $uri = "https://api.brevo.com/v3/smtp/statistics/events?limit=10&offset=0&sort=desc&event=$ev"
+    $rows = @( (Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30).events )
+    Write-Host ("event=$ev count=$($rows.Count)")
+    foreach ($e in $rows | Select-Object -First 5) {
+      Write-Host ("  email=$($e.email) date=$($e.date) subject=$($e.subject) reason=$($e.reason)")
+    }
+  } catch {
+    Write-Host ("event=$ev FAILED: " + $_.Exception.Message)
+  }
 }
 
 Write-Host '--- CRM email_sent counts (SQLite) ---'

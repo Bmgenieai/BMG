@@ -26,7 +26,6 @@ foreach ($i in 1..8) {
 }
 if (-not $ok) { throw "Health check failed for $url" }
 
-# Temporary: Brevo delivery diagnose (safe to leave; prints status only)
 $brevoDiag = Join-Path $PSScriptRoot 'diagnose-brevo.ps1'
 if (Test-Path $brevoDiag) {
   Write-Host '==> Running Brevo delivery diagnose'
