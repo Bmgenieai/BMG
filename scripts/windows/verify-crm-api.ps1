@@ -26,10 +26,4 @@ foreach ($i in 1..8) {
 }
 if (-not $ok) { throw "Health check failed for $url" }
 
-$brevoDiag = Join-Path $PSScriptRoot 'diagnose-brevo.ps1'
-if (Test-Path $brevoDiag) {
-  Write-Host '==> Running Brevo delivery diagnose'
-  & $brevoDiag
-}
-
 exit 0
