@@ -210,11 +210,21 @@ export function getTemplateById(id) {
 }
 
 /**
- * @param {{ toEmail: string, toName?: string, subject: string, htmlContent?: string, textContent?: string }} opts
+ * @param {{
+ *   toEmail: string,
+ *   toName?: string,
+ *   subject: string,
+ *   htmlContent?: string,
+ *   textContent?: string,
+ *   leadId?: string,
+ *   tags?: string[],
+ * }} opts
  */
 export async function sendTransactionalEmail(opts) {
   assertEnabled();
   const sender = senderConfig();
+  const tags = [...(opts.tags || [])];
+  if (opts.leadId) tags.push(`crm-lead-${opts.leadId}`);
   const body = {
     sender,
     to: [{ email: opts.toEmail, name: opts.toName || undefined }],
@@ -222,6 +232,10 @@ export async function sendTransactionalEmail(opts) {
     htmlContent: opts.htmlContent || undefined,
     textContent: opts.textContent || opts.subject,
   };
+  if (tags.length) body.tags = [...new Set(tags)];
+  if (opts.leadId) {
+    body.params = { CRM_LEAD_ID: opts.leadId };
+  }
   return brevoFetch('/smtp/email', { method: 'POST', body: JSON.stringify(body) });
 }
 

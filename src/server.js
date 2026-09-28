@@ -63,7 +63,7 @@ app.get('/api/health', (_req, res) => {
     frontendUrl: FRONTEND_URL || null,
     publicApiUrl: PUBLIC_API_URL || null,
     // CI/CD smoke marker — bump when verifying Windows auto-deploy
-    deployMarker: 'telesales-email-schedule-2026-09-22',
+    deployMarker: 'email-tracking-date-added-2026-09-28',
   });
 });
 

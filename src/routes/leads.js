@@ -18,6 +18,7 @@ import {
   roleHasPermission,
 } from '../lib/permissions.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
+import { getLeadEmailHistory } from '../lib/emailLog.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const router = Router();
@@ -32,16 +33,21 @@ function leadSelect(extraWhere = '1=1', params = []) {
         u.name AS assigned_name,
         u.email AS assigned_email,
         c.name AS created_by_name,
-        c.email AS created_by_email
+        c.email AS created_by_email,
+        b.filename AS import_batch_filename,
+        b.created_at AS import_batch_at,
+        COALESCE(l.date_added, l.created_at) AS date_added_effective,
+        CASE WHEN l.last_emailed_at IS NOT NULL THEN 1 ELSE 0 END AS has_been_emailed
        FROM leads l
        LEFT JOIN users u ON u.id = l.assigned_to
        LEFT JOIN users c ON c.id = l.created_by
+       LEFT JOIN import_batches b ON b.id = l.import_batch_id
        WHERE ${extraWhere}
        ORDER BY
          CASE WHEN l.next_follow_up_at IS NOT NULL AND l.next_follow_up_at <= datetime('now') THEN 0 ELSE 1 END,
          CASE WHEN l.next_follow_up_at IS NULL THEN 1 ELSE 0 END,
          l.next_follow_up_at ASC,
-         l.created_at DESC`,
+         COALESCE(l.date_added, l.created_at) DESC`,
     )
     .all(...params);
 }
@@ -53,10 +59,15 @@ function getLeadWithJoins(id) {
         u.name AS assigned_name,
         u.email AS assigned_email,
         c.name AS created_by_name,
-        c.email AS created_by_email
+        c.email AS created_by_email,
+        b.filename AS import_batch_filename,
+        b.created_at AS import_batch_at,
+        COALESCE(l.date_added, l.created_at) AS date_added_effective,
+        CASE WHEN l.last_emailed_at IS NOT NULL THEN 1 ELSE 0 END AS has_been_emailed
        FROM leads l
        LEFT JOIN users u ON u.id = l.assigned_to
        LEFT JOIN users c ON c.id = l.created_by
+       LEFT JOIN import_batches b ON b.id = l.import_batch_id
        WHERE l.id = ?`,
     )
     .get(id);
@@ -76,6 +87,17 @@ function requireLeadAccess(req, res) {
 }
 
 router.get('/meta', (_req, res) => {
+  const importBatches = db
+    .prepare(
+      `SELECT b.id, b.filename, b.source_label, b.imported_count, b.created_at,
+              u.name AS uploaded_by_name
+       FROM import_batches b
+       LEFT JOIN users u ON u.id = b.uploaded_by
+       ORDER BY b.created_at DESC
+       LIMIT 50`,
+    )
+    .all();
+
   res.json({
     sources: Object.values(LEAD_SOURCES),
     statuses: LEAD_STATUSES,
@@ -86,6 +108,11 @@ router.get('/meta', (_req, res) => {
     lostReasons: LOST_REASONS,
     activityTypes: ACTIVITY_TYPES,
     replyOutcomes: REPLY_OUTCOMES,
+    importBatches,
+    emailStatuses: [
+      { key: 'sent', label: 'Emailed' },
+      { key: 'not_sent', label: 'Not emailed' },
+    ],
     cohorts: [
       { key: 'all', label: 'All users', definition: COHORT_DEFINITIONS.all },
       { key: 'new', label: 'New users', definition: COHORT_DEFINITIONS.new },
@@ -154,7 +181,19 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
 });
 
 router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
-  const { source, status, assigned_to, q, unassigned, cohort: cohortRaw, date } = req.query;
+  const {
+    source,
+    status,
+    assigned_to,
+    q,
+    unassigned,
+    cohort: cohortRaw,
+    date,
+    emailStatus,
+    importBatchId,
+    dateAddedFrom,
+    dateAddedTo,
+  } = req.query;
   const clauses = [];
   const params = [];
 
@@ -189,6 +228,27 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     );
     const like = `%${q}%`;
     params.push(like, like, like, like, like, like, like, like);
+  }
+
+  const emailFilter = String(emailStatus || '').toLowerCase();
+  if (emailFilter === 'sent' || emailFilter === 'emailed') {
+    clauses.push('l.last_emailed_at IS NOT NULL');
+  } else if (emailFilter === 'not_sent' || emailFilter === 'not_emailed') {
+    clauses.push('l.last_emailed_at IS NULL');
+  }
+
+  if (importBatchId) {
+    clauses.push('l.import_batch_id = ?');
+    params.push(String(importBatchId));
+  }
+
+  if (dateAddedFrom) {
+    clauses.push(`date(COALESCE(l.date_added, l.created_at)) >= date(?)`);
+    params.push(String(dateAddedFrom));
+  }
+  if (dateAddedTo) {
+    clauses.push(`date(COALESCE(l.date_added, l.created_at)) <= date(?)`);
+    params.push(String(dateAddedTo));
   }
 
   const cohortPred = cohortSql(
@@ -232,7 +292,8 @@ router.get('/:id', requireAnyPermission('leads:view_all', 'leads:view_own'), (re
        WHERE e.lead_id = ? ORDER BY e.created_at ASC`,
     )
     .all(lead.id);
-  res.json({ ...lead, activities, followUps, employees });
+  const emailHistory = getLeadEmailHistory(lead.id);
+  res.json({ ...lead, activities, followUps, employees, emailHistory });
 });
 
 router.post('/', requirePermission('leads:create'), (req, res) => {
@@ -280,8 +341,9 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
   db.prepare(
     `INSERT INTO leads (
       id, name, email, phone, company, country, state, job_title, industry, contact_format,
-      source, status, notes, estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'qualified', ?, ?, ?, ?, ?, ?, ?)`,
+      source, status, notes, estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by,
+      date_added
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'qualified', ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     nameTrim,
@@ -301,6 +363,7 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     req.user.id,
     now,
     req.user.id,
+    now,
   );
   db.prepare(
     `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
@@ -579,6 +642,17 @@ router.post(
     const isTelesales = req.user.role === 'telesales';
     const source = isTelesales ? 'telesales' : 'csv_import';
 
+    // Optional batch "Date Added" from upload form (YYYY-MM-DD or ISO). Defaults to now.
+    let dateAdded = new Date().toISOString();
+    const rawDate = String(req.body?.date_added || req.body?.dateAdded || '').trim();
+    if (rawDate) {
+      const parsed = new Date(rawDate.length <= 10 ? `${rawDate}T12:00:00.000Z` : rawDate);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ error: 'Invalid date_added (use YYYY-MM-DD)' });
+      }
+      dateAdded = parsed.toISOString();
+    }
+
     let records;
     try {
       records = parse(req.file.buffer.toString('utf8'), {
@@ -602,8 +676,9 @@ router.post(
     const insert = db.prepare(
       `INSERT INTO leads (
         id, name, email, phone, company, country, state, job_title, industry, contact_format,
-        source, status, notes, estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'qualified', ?, ?, ?, ?, ?, ?, ?)`,
+        source, status, notes, estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by,
+        date_added
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'qualified', ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
     const now = new Date().toISOString();
@@ -664,6 +739,7 @@ router.post(
           req.user.id,
           now,
           req.user.id,
+          dateAdded,
         );
         db.prepare(
           `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
@@ -672,7 +748,7 @@ router.post(
           uuid(),
           id,
           req.user.id,
-          `CSV / Google Sheet import by ${req.user.name} (${sourceLabel})`,
+          `CSV / Google Sheet import by ${req.user.name} (${sourceLabel}) · Date added ${dateAdded.slice(0, 10)}`,
         );
         imported += 1;
       }
@@ -688,6 +764,7 @@ router.post(
       imported,
       skipped,
       source,
+      dateAdded,
     });
   },
 );

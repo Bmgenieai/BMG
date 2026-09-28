@@ -14,6 +14,7 @@ import {
   upsertContact,
 } from '../lib/brevo.js';
 import { canAccessLead, roleHasPermission } from '../lib/permissions.js';
+import { getLeadEmailHistory, ingestBrevoWebhookEvent, recordEmailSend } from '../lib/emailLog.js';
 
 const router = Router();
 
@@ -39,15 +40,44 @@ function resolveEmailContent({ subject, htmlContent, textContent, templateId, le
   };
 }
 
-function logEmailActivity(leadId, userId, subject, extra = 'Brevo cold email') {
-  db.prepare(
-    `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
-     VALUES (?, ?, ?, 'email_sent', ?)`,
-  ).run(uuid(), leadId, userId, `${extra}: ${subject}`);
+function assertWebhookSecret(req, res) {
+  const expected = (process.env.BREVO_WEBHOOK_SECRET || '').trim();
+  if (!expected) return true; // allow when unset (dev); set in prod
+  const provided =
+    req.query.secret ||
+    req.headers['x-brevo-secret'] ||
+    req.headers['x-webhook-secret'] ||
+    '';
+  if (String(provided) !== expected) {
+    res.status(401).json({ error: 'Invalid webhook secret' });
+    return false;
+  }
+  return true;
 }
 
+/** Brevo transactional webhook — open / click / delivered / reply / bounce */
+router.post('/webhooks/brevo', (req, res) => {
+  if (!assertWebhookSecret(req, res)) return;
+
+  const body = req.body;
+  const events = Array.isArray(body) ? body : body ? [body] : [];
+  const results = [];
+  for (const evt of events) {
+    try {
+      results.push(ingestBrevoWebhookEvent(evt));
+    } catch (err) {
+      results.push({ ok: false, skipped: err.message || 'error' });
+    }
+  }
+  res.json({ ok: true, processed: results.length, results: results.slice(0, 50) });
+});
+
 router.get('/status', authRequired, (_req, res) => {
-  res.json(getBrevoPublicConfig());
+  res.json({
+    ...getBrevoPublicConfig(),
+    webhookPath: '/api/email/webhooks/brevo',
+    webhookSecretConfigured: Boolean((process.env.BREVO_WEBHOOK_SECRET || '').trim()),
+  });
 });
 
 router.get('/templates', authRequired, (req, res) => {
@@ -216,9 +246,19 @@ router.post(
         subject: content.subject,
         htmlContent: content.htmlContent,
         textContent: content.textContent,
+        leadId: lead.id,
       });
 
-      logEmailActivity(lead.id, req.user.id, content.subject);
+      recordEmailSend({
+        leadId: lead.id,
+        userId: req.user.id,
+        subject: content.subject,
+        toEmail: lead.email,
+        templateId: templateId || null,
+        brevoMessageId: result?.messageId || result?.message_id || null,
+        source: 'transactional',
+        summaryPrefix: 'Brevo cold email',
+      });
 
       // Outreach stays on qualified — funnel stage only advances on reply/demo/trial/paid
       res.json({ ok: true, brevo: result, subject: content.subject });
@@ -291,9 +331,20 @@ router.post(
             subject: content.subject,
             htmlContent: content.htmlContent,
             textContent: content.textContent,
+            leadId: lead.id,
+          }).then((result) => {
+            recordEmailSend({
+              leadId: lead.id,
+              userId: req.user.id,
+              subject: content.subject,
+              toEmail: lead.email,
+              templateId: templateId || null,
+              brevoMessageId: result?.messageId || result?.message_id || null,
+              source: 'bulk',
+              summaryPrefix: 'Brevo bulk',
+            });
           });
 
-          logEmailActivity(lead.id, req.user.id, content.subject, 'Brevo bulk');
           sent += 1;
           await new Promise((r) => setTimeout(r, 200));
         } catch (e) {
@@ -558,6 +609,21 @@ router.post(
     tx();
 
     res.json({ ok: true, cancelled: pending.length });
+  },
+);
+
+/** Per-lead Brevo email history (sends + open/click/reply events). */
+router.get(
+  '/leads/:id/history',
+  authRequired,
+  requireAnyPermission('leads:view_all', 'leads:view_own'),
+  (req, res) => {
+    const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    if (!canAccessLead(req.user, lead)) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    res.json(getLeadEmailHistory(lead.id));
   },
 );
 

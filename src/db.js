@@ -177,6 +177,13 @@ export function migrate() {
     `ALTER TABLE leads ADD COLUMN contact_format TEXT DEFAULT 'company'`,
     `ALTER TABLE leads ADD COLUMN metadata TEXT`,
     `ALTER TABLE leads ADD COLUMN signed_up_at TEXT`,
+    `ALTER TABLE leads ADD COLUMN date_added TEXT`,
+    `ALTER TABLE leads ADD COLUMN last_emailed_at TEXT`,
+    `ALTER TABLE leads ADD COLUMN email_open_count INTEGER DEFAULT 0`,
+    `ALTER TABLE leads ADD COLUMN email_click_count INTEGER DEFAULT 0`,
+    `ALTER TABLE leads ADD COLUMN email_reply_count INTEGER DEFAULT 0`,
+    `ALTER TABLE leads ADD COLUMN last_email_opened_at TEXT`,
+    `ALTER TABLE leads ADD COLUMN last_email_replied_at TEXT`,
   ];
   for (const sql of leadAlters) {
     try {
@@ -190,6 +197,32 @@ export function migrate() {
     db.exec(
       `UPDATE leads SET signed_up_at = created_at WHERE signed_up_at IS NULL OR TRIM(signed_up_at) = ''`,
     );
+  } catch {
+    /* ignore */
+  }
+
+  try {
+    db.exec(
+      `UPDATE leads SET date_added = created_at WHERE date_added IS NULL OR TRIM(date_added) = ''`,
+    );
+  } catch {
+    /* ignore */
+  }
+
+  // Backfill last_emailed_at from legacy email_sent activities (once)
+  try {
+    db.exec(`
+      UPDATE leads
+      SET last_emailed_at = (
+        SELECT MAX(a.created_at) FROM lead_activities a
+        WHERE a.lead_id = leads.id AND a.type IN ('email_sent', 'email')
+      )
+      WHERE last_emailed_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM lead_activities a
+          WHERE a.lead_id = leads.id AND a.type IN ('email_sent', 'email')
+        )
+    `);
   } catch {
     /* ignore */
   }
@@ -230,6 +263,45 @@ export function migrate() {
       ON scheduled_emails(batch_id);
     CREATE INDEX IF NOT EXISTS idx_scheduled_emails_user
       ON scheduled_emails(user_id, status);
+
+    CREATE TABLE IF NOT EXISTS email_messages (
+      id TEXT PRIMARY KEY,
+      lead_id TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+      user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+      brevo_message_id TEXT,
+      subject TEXT,
+      to_email TEXT,
+      template_id TEXT,
+      source TEXT DEFAULT 'transactional',
+      status TEXT NOT NULL DEFAULT 'sent',
+      open_count INTEGER NOT NULL DEFAULT 0,
+      click_count INTEGER NOT NULL DEFAULT 0,
+      reply_count INTEGER NOT NULL DEFAULT 0,
+      last_opened_at TEXT,
+      last_clicked_at TEXT,
+      last_replied_at TEXT,
+      sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_messages_lead ON email_messages(lead_id, sent_at);
+    CREATE INDEX IF NOT EXISTS idx_email_messages_brevo ON email_messages(brevo_message_id);
+    CREATE INDEX IF NOT EXISTS idx_email_messages_to ON email_messages(to_email);
+
+    CREATE TABLE IF NOT EXISTS email_events (
+      id TEXT PRIMARY KEY,
+      lead_id TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+      email_message_id TEXT REFERENCES email_messages(id) ON DELETE SET NULL,
+      brevo_message_id TEXT,
+      event TEXT NOT NULL,
+      email TEXT,
+      subject TEXT,
+      occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
+      dedupe_key TEXT UNIQUE,
+      raw_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_events_lead ON email_events(lead_id, occurred_at);
+    CREATE INDEX IF NOT EXISTS idx_email_events_event ON email_events(event);
   `);
 
   // One-time: legacy disposition → sales funnel stages

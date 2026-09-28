@@ -1,4 +1,3 @@
-import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
 import {
   applyMergeTags,
@@ -6,6 +5,7 @@ import {
   sendTransactionalEmail,
   upsertContact,
 } from './brevo.js';
+import { recordEmailSend } from './emailLog.js';
 
 const TICK_MS = 30_000;
 const BATCH_LIMIT = 15;
@@ -83,18 +83,25 @@ async function processOne(row) {
       }).catch(() => {});
     }
 
-    await sendTransactionalEmail({
+    const result = await sendTransactionalEmail({
       toEmail: lead.email,
       toName: lead.name || undefined,
       subject: content.subject,
       htmlContent: content.htmlContent,
       textContent: content.textContent,
+      leadId: lead.id,
     });
 
-    db.prepare(
-      `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
-       VALUES (?, ?, ?, 'email_sent', ?)`,
-    ).run(uuid(), lead.id, row.user_id, `Brevo scheduled: ${content.subject}`);
+    recordEmailSend({
+      leadId: lead.id,
+      userId: row.user_id,
+      subject: content.subject,
+      toEmail: lead.email,
+      templateId: row.template_id || null,
+      brevoMessageId: result?.messageId || result?.message_id || null,
+      source: 'scheduled',
+      summaryPrefix: 'Brevo scheduled',
+    });
 
     db.prepare(
       `UPDATE scheduled_emails
