@@ -48,12 +48,12 @@ BREVO_API_KEY=xkeysib-xxxxxxxx
 BREVO_SENDER_EMAIL=magic.retouching@bmgenie.ai
 BREVO_SENDER_NAME=BMGenie Sales
 BREVO_LIST_ID=2
-BREVO_WEBHOOK_SECRET=<set via GitHub secret BREVO_WEBHOOK_SECRET — deploy writes into Windows .env>
+BREVO_WEBHOOK_SECRET=<already on Windows .env — match ?secret= on Brevo outbound webhook URL>
 ```
 
 **Where to add Brevo API key:** only in this Windows `.env` file — never commit it, never put it in Vercel.
 
-**Webhook secret (opens/replies):** set GitHub Actions secret `BREVO_WEBHOOK_SECRET` on `Bmgenieai/BMG`. Deploy upserts it into Windows `.env` automatically (no RDP). Match the `?secret=` on the Brevo outbound webhook URL.
+**Webhook secret (opens/replies):** stored only in Windows `.env` (and in the Brevo webhook URL `?secret=`). Do not put it back in the GitHub Actions deploy pipeline.
 
 Health check: `https://crm-api.bmgenie.ai/api/health`
 
@@ -71,7 +71,6 @@ Pipeline: **Bmgenieai/BMG** → Actions → **Deploy CRM API to Windows**
 | `DEPLOY_USER` | SSH username |
 | `SERVER_PASSWORD` | SSH password |
 | `CRM_DEPLOY_PATH` | `D:\crm-api.bmgenie.ai` |
-| `BREVO_WEBHOOK_SECRET` | Same value as `?secret=` on Brevo webhook URL |
 
 ### Windows requirements
 

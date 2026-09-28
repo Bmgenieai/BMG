@@ -32,35 +32,6 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
             git reset --hard origin/main
             if ($LASTEXITCODE -ne 0) { throw 'git reset --hard failed' }
-
-            # Upsert BREVO_WEBHOOK_SECRET into Windows .env from GitHub Actions secret (no RDP).
-            # After first successful deploy you may delete the GH secret + remove this block;
-            # the value will remain in the server .env (deploy never wipes .env).
-            $webhookSecret = '${{ secrets.BREVO_WEBHOOK_SECRET }}'
-            if (-not [string]::IsNullOrWhiteSpace($webhookSecret)) {
-              $envPath = Join-Path $path '.env'
-              if (-not (Test-Path $envPath)) { throw '.env missing on server' }
-              $lines = Get-Content -Path $envPath -ErrorAction Stop
-              $found = $false
-              $out = New-Object System.Collections.Generic.List[string]
-              foreach ($line in $lines) {
-                if ($line -match '^\s*BREVO_WEBHOOK_SECRET\s*=') {
-                  $out.Add("BREVO_WEBHOOK_SECRET=$webhookSecret") | Out-Null
-                  $found = $true
-                } else {
-                  $out.Add($line) | Out-Null
-                }
-              }
-              if (-not $found) {
-                $out.Add('') | Out-Null
-                $out.Add("BREVO_WEBHOOK_SECRET=$webhookSecret") | Out-Null
-              }
-              Set-Content -Path $envPath -Value $out -Encoding utf8
-              Write-Host 'BREVO_WEBHOOK_SECRET upserted into .env'
-            } else {
-              Write-Host 'BREVO_WEBHOOK_SECRET GitHub secret empty — skipped .env upsert'
-            }
-
             & .\scripts\windows\deploy-crm-api.ps1
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             & .\scripts\windows\verify-crm-api.ps1
