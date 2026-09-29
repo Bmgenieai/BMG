@@ -333,6 +333,18 @@ export function migrate() {
       WHERE read_at IS NULL;
   `);
 
+  const emailMessageAlters = [
+    `ALTER TABLE email_messages ADD COLUMN html_content TEXT`,
+    `ALTER TABLE email_messages ADD COLUMN text_content TEXT`,
+  ];
+  for (const sql of emailMessageAlters) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* column already exists */
+    }
+  }
+
   // One-time: legacy disposition → sales funnel stages
   const statusMigrates = [
     [`UPDATE leads SET status = 'qualified' WHERE status IN ('new','contacted')`, 'qualified'],

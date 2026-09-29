@@ -369,6 +369,8 @@ router.post(
         brevoMessageId: result?.messageId || result?.message_id || null,
         source: 'transactional',
         summaryPrefix: 'Brevo cold email',
+        htmlContent: content.htmlContent || null,
+        textContent: content.textContent || null,
       });
 
       // Outreach stays on qualified — funnel stage only advances on reply/demo/trial/paid
@@ -453,6 +455,8 @@ router.post(
               brevoMessageId: result?.messageId || result?.message_id || null,
               source: 'bulk',
               summaryPrefix: 'Brevo bulk',
+              htmlContent: content.htmlContent || null,
+              textContent: content.textContent || null,
             });
           });
 

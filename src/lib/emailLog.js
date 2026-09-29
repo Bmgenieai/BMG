@@ -47,6 +47,8 @@ export function recordEmailSend({
   brevoMessageId = null,
   source = 'transactional',
   summaryPrefix = 'Brevo cold email',
+  htmlContent = null,
+  textContent = null,
 }) {
   const id = uuid();
   const now = new Date().toISOString();
@@ -54,8 +56,9 @@ export function recordEmailSend({
 
   db.prepare(
     `INSERT INTO email_messages (
-       id, lead_id, user_id, brevo_message_id, subject, to_email, template_id, source, status, sent_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?)`,
+       id, lead_id, user_id, brevo_message_id, subject, to_email, template_id, source, status,
+       html_content, text_content, sent_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?)`,
   ).run(
     id,
     leadId,
@@ -65,6 +68,8 @@ export function recordEmailSend({
     normalizeEmail(toEmail),
     templateId || null,
     source,
+    htmlContent ? String(htmlContent).slice(0, 200_000) : null,
+    textContent ? String(textContent).slice(0, 100_000) : null,
     now,
   );
 
@@ -613,10 +618,10 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
   }
   if (q) {
     clauses.push(
-      `(r.subject LIKE ? OR r.from_email LIKE ? OR r.body_markdown LIKE ? OR r.body_text LIKE ? OR l.name LIKE ? OR l.email LIKE ?)`,
+      `(r.subject LIKE ? OR r.from_email LIKE ? OR r.body_markdown LIKE ? OR r.body_text LIKE ? OR l.name LIKE ? OR l.email LIKE ? OR m.subject LIKE ? OR su.name LIKE ?)`,
     );
     const like = `%${q}%`;
-    params.push(like, like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -628,10 +633,16 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
               l.company AS lead_company,
               l.status AS lead_status,
               l.assigned_to AS lead_assigned_to,
-              u.name AS assigned_to_name
+              u.name AS assigned_to_name,
+              m.subject AS original_subject,
+              m.sent_at AS original_sent_at,
+              m.to_email AS original_to_email,
+              su.name AS sent_by_name
        FROM email_replies r
        LEFT JOIN leads l ON l.id = r.lead_id
        LEFT JOIN users u ON u.id = l.assigned_to
+       LEFT JOIN email_messages m ON m.id = r.email_message_id
+       LEFT JOIN users su ON su.id = m.user_id
        ${where}
        ORDER BY r.received_at DESC
        LIMIT ?`,
@@ -679,8 +690,53 @@ export function countEmailReplies({ user, canViewAll }) {
     .get(user.id, user.id).c;
 }
 
+function findOriginalOutboundMessage(reply) {
+  if (reply?.email_message_id) {
+    const byId = db
+      .prepare(
+        `SELECT m.*, u.name AS sent_by_name
+         FROM email_messages m
+         LEFT JOIN users u ON u.id = m.user_id
+         WHERE m.id = ?`,
+      )
+      .get(reply.email_message_id);
+    if (byId) return byId;
+  }
+
+  if (reply?.in_reply_to) {
+    const mid = normalizeMessageId(reply.in_reply_to);
+    if (mid) {
+      const byMid = db
+        .prepare(
+          `SELECT m.*, u.name AS sent_by_name
+           FROM email_messages m
+           LEFT JOIN users u ON u.id = m.user_id
+           WHERE m.brevo_message_id = ? OR m.brevo_message_id = ?
+           ORDER BY m.sent_at DESC LIMIT 1`,
+        )
+        .get(mid, `<${mid}>`);
+      if (byMid) return byMid;
+    }
+  }
+
+  if (reply?.lead_id) {
+    return db
+      .prepare(
+        `SELECT m.*, u.name AS sent_by_name
+         FROM email_messages m
+         LEFT JOIN users u ON u.id = m.user_id
+         WHERE m.lead_id = ?
+           AND datetime(m.sent_at) <= datetime(REPLACE(REPLACE(?, 'T', ' '), 'Z', ''))
+         ORDER BY m.sent_at DESC
+         LIMIT 1`,
+      )
+      .get(reply.lead_id, reply.received_at || new Date().toISOString());
+  }
+  return null;
+}
+
 export function getEmailReply(id) {
-  return db
+  const row = db
     .prepare(
       `SELECT r.*,
               l.name AS lead_name,
@@ -695,6 +751,28 @@ export function getEmailReply(id) {
        WHERE r.id = ?`,
     )
     .get(id);
+
+  if (!row) return null;
+
+  const original = findOriginalOutboundMessage(row);
+  return {
+    ...row,
+    hasBody: Boolean(row.body_markdown || row.body_text || row.body_html),
+    originalMessage: original
+      ? {
+          id: original.id,
+          subject: original.subject,
+          toEmail: original.to_email,
+          sentAt: original.sent_at,
+          sentByName: original.sent_by_name || null,
+          templateId: original.template_id,
+          source: original.source,
+          htmlContent: original.html_content || null,
+          textContent: original.text_content || null,
+          hasBody: Boolean(original.html_content || original.text_content),
+        }
+      : null,
+  };
 }
 
 export function markEmailReplyRead(id, read = true) {

@@ -101,6 +101,8 @@ async function processOne(row) {
       brevoMessageId: result?.messageId || result?.message_id || null,
       source: 'scheduled',
       summaryPrefix: 'Brevo scheduled',
+      htmlContent: content.htmlContent || null,
+      textContent: content.textContent || null,
     });
 
     db.prepare(
