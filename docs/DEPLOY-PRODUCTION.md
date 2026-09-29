@@ -49,6 +49,11 @@ BREVO_SENDER_EMAIL=magic.retouching@bmgenie.ai
 BREVO_SENDER_NAME=BMGenie Sales
 BREVO_LIST_ID=2
 BREVO_WEBHOOK_SECRET=<already on Windows .env — match ?secret= on Brevo outbound webhook URL>
+# Email replies: deploy-crm-api.ps1 temporarily upserts BREVO_REPLY_DOMAIN=reply.bmgenie.ai.
+# After one successful deploy, remove that upsert block from the script — value stays in .env.
+# BREVO_REPLY_DOMAIN=reply.bmgenie.ai
+# Inbound webhook: https://crm-api.bmgenie.ai/api/email/webhooks/brevo-inbound?secret=...
+
 ```
 
 **Where to add Brevo API key:** only in this Windows `.env` file — never commit it, never put it in Vercel.

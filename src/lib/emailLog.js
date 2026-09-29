@@ -275,6 +275,18 @@ export function ingestBrevoWebhookEvent(payload) {
        WHERE id = ?`,
     ).run(occurredAt, message.id);
   }
+
+  if (REPLY_EVENTS.has(event)) {
+    upsertReplyStubFromEvent({
+      leadId,
+      message,
+      email,
+      subject: subject || message?.subject,
+      occurredAt,
+      brevoMessageId,
+      payload,
+    });
+  }
   if (message && BOUNCE_EVENTS.has(event)) {
     db.prepare(
       `UPDATE email_messages SET status = 'bounced' WHERE id = ?`,
@@ -330,5 +342,363 @@ export function getLeadEmailHistory(leadId) {
     )
     .all(leadId);
 
-  return { messages, events };
+  const replies = db
+    .prepare(
+      `SELECT * FROM email_replies
+       WHERE lead_id = ?
+       ORDER BY received_at DESC
+       LIMIT 100`,
+    )
+    .all(leadId);
+
+  return { messages, events, replies };
+}
+
+function mailboxAddress(mb) {
+  if (!mb) return null;
+  if (typeof mb === 'string') return normalizeEmail(mb);
+  return normalizeEmail(mb.Address || mb.address || mb.email);
+}
+
+function mailboxName(mb) {
+  if (!mb || typeof mb === 'string') return null;
+  return mb.Name || mb.name || null;
+}
+
+function collectAddresses(list) {
+  if (!Array.isArray(list)) return [];
+  return list.map(mailboxAddress).filter(Boolean);
+}
+
+/** Extract lead id from Reply-To / To like lead-<uuid>@reply.domain */
+export function extractLeadIdFromAddress(address) {
+  const em = normalizeEmail(address);
+  if (!em) return null;
+  const local = em.split('@')[0] || '';
+  const m = local.match(/^lead-(.+)$/i);
+  return m?.[1] || null;
+}
+
+function findLeadIdFromInboundAddresses(addresses) {
+  for (const addr of addresses) {
+    const leadId = extractLeadIdFromAddress(addr);
+    if (!leadId) continue;
+    const lead = db.prepare(`SELECT id FROM leads WHERE id = ?`).get(leadId);
+    if (lead) return lead.id;
+  }
+  return null;
+}
+
+function findMessageByInReplyTo(inReplyTo) {
+  const mid = normalizeMessageId(inReplyTo);
+  if (!mid) return null;
+  return db
+    .prepare(
+      `SELECT * FROM email_messages
+       WHERE brevo_message_id = ? OR brevo_message_id = ?
+       ORDER BY sent_at DESC LIMIT 1`,
+    )
+    .get(mid, `<${mid}>`);
+}
+
+/**
+ * Stub row when Brevo fires a transactional "reply" event (no body).
+ * Full body arrives later via inbound parsing when Reply-To routing is enabled.
+ */
+function upsertReplyStubFromEvent({
+  leadId,
+  message,
+  email,
+  subject,
+  occurredAt,
+  brevoMessageId,
+  payload,
+}) {
+  const providerId = normalizeMessageId(brevoMessageId)
+    ? `event:${normalizeMessageId(brevoMessageId)}:${occurredAt.slice(0, 16)}`
+    : `event:${leadId}:${email || ''}:${occurredAt.slice(0, 16)}`;
+
+  const existing = db
+    .prepare(`SELECT id FROM email_replies WHERE provider_message_id = ?`)
+    .get(providerId);
+  if (existing) return existing.id;
+
+  // Prefer not to create a stub if we already have a full inbound reply for this lead recently
+  const recentInbound = db
+    .prepare(
+      `SELECT id FROM email_replies
+       WHERE lead_id = ? AND source = 'brevo_inbound'
+         AND datetime(received_at) >= datetime(?, '-1 day')
+       LIMIT 1`,
+    )
+    .get(leadId, occurredAt.replace('T', ' ').slice(0, 19));
+  if (recentInbound) return recentInbound.id;
+
+  const id = uuid();
+  db.prepare(
+    `INSERT INTO email_replies (
+       id, lead_id, email_message_id, provider_message_id, from_email, subject,
+       source, received_at, raw_json
+     ) VALUES (?, ?, ?, ?, ?, ?, 'brevo_event', ?, ?)`,
+  ).run(
+    id,
+    leadId,
+    message?.id || null,
+    providerId,
+    normalizeEmail(email),
+    subject || null,
+    occurredAt,
+    JSON.stringify(payload).slice(0, 8000),
+  );
+  return id;
+}
+
+/**
+ * Ingest one Brevo inbound-parse item (full reply body).
+ * @returns {{ ok: boolean, skipped?: string, replyId?: string, leadId?: string|null }}
+ */
+export function ingestBrevoInboundEmail(item) {
+  if (!item || typeof item !== 'object') {
+    return { ok: false, skipped: 'empty_item' };
+  }
+
+  const providerMessageId =
+    normalizeMessageId(item.MessageId || item.messageId || item.message_id) ||
+    (Array.isArray(item.Uuid) && item.Uuid[0] ? `uuid:${item.Uuid[0]}` : null) ||
+    null;
+
+  if (providerMessageId) {
+    const dup = db
+      .prepare(`SELECT id, lead_id FROM email_replies WHERE provider_message_id = ?`)
+      .get(providerMessageId);
+    if (dup) {
+      return { ok: true, skipped: 'duplicate', replyId: dup.id, leadId: dup.lead_id };
+    }
+  }
+
+  const fromEmail = mailboxAddress(item.From);
+  const fromName = mailboxName(item.From);
+  const toList = [
+    ...collectAddresses(item.To),
+    ...collectAddresses(
+      Array.isArray(item.Recipients)
+        ? item.Recipients.map((r) => (typeof r === 'string' ? { Address: r } : r))
+        : [],
+    ),
+    ...collectAddresses(item.Cc),
+  ];
+
+  const inReplyTo = item.InReplyTo || item.inReplyTo || null;
+  const message = findMessageByInReplyTo(inReplyTo) || findMessage({ brevoMessageId: null, email: fromEmail });
+  let leadId =
+    findLeadIdFromInboundAddresses(toList) ||
+    message?.lead_id ||
+    findLeadId({ message, email: fromEmail, tags: [] });
+
+  const subject = item.Subject || item.subject || null;
+  const bodyMarkdown = item.ExtractedMarkdownMessage || null;
+  const bodyText = item.RawTextBody || bodyMarkdown || null;
+  const bodyHtml = item.RawHtmlBody || null;
+  const spamScore =
+    typeof item.SpamScore === 'number'
+      ? item.SpamScore
+      : typeof item.Spam?.Score === 'number'
+        ? item.Spam.Score
+        : null;
+
+  let receivedAt = new Date().toISOString();
+  if (item.SentAtDate) {
+    const d = new Date(item.SentAtDate);
+    if (!Number.isNaN(d.getTime())) receivedAt = d.toISOString();
+  }
+
+  const id = uuid();
+  db.prepare(
+    `INSERT INTO email_replies (
+       id, lead_id, email_message_id, provider_message_id, in_reply_to,
+       from_email, from_name, to_emails, subject,
+       body_text, body_html, body_markdown, spam_score,
+       source, received_at, raw_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'brevo_inbound', ?, ?)`,
+  ).run(
+    id,
+    leadId,
+    message?.id || null,
+    providerMessageId,
+    normalizeMessageId(inReplyTo),
+    fromEmail,
+    fromName,
+    JSON.stringify([...new Set(toList)]),
+    subject,
+    bodyText ? String(bodyText).slice(0, 100_000) : null,
+    bodyHtml ? String(bodyHtml).slice(0, 200_000) : null,
+    bodyMarkdown ? String(bodyMarkdown).slice(0, 100_000) : null,
+    spamScore,
+    receivedAt,
+    JSON.stringify(item).slice(0, 16_000),
+  );
+
+  if (leadId) {
+    const now = receivedAt;
+    // Avoid double-counting when transactional "reply" webhook already ran
+    const alreadyCounted = message?.status === 'replied' || Boolean(
+      db
+        .prepare(
+          `SELECT id FROM email_events
+           WHERE lead_id = ? AND event IN ('reply','replied')
+             AND datetime(occurred_at) >= datetime(?, '-2 days')
+           LIMIT 1`,
+        )
+        .get(leadId, now.replace('T', ' ').slice(0, 19)),
+    );
+
+    if (!alreadyCounted) {
+      db.prepare(
+        `UPDATE leads
+         SET email_reply_count = COALESCE(email_reply_count, 0) + 1,
+             last_email_replied_at = ?,
+             updated_at = datetime('now')
+         WHERE id = ?`,
+      ).run(now, leadId);
+
+      if (message) {
+        db.prepare(
+          `UPDATE email_messages
+           SET reply_count = COALESCE(reply_count, 0) + 1,
+               last_replied_at = ?,
+               status = 'replied'
+           WHERE id = ?`,
+        ).run(now, message.id);
+      }
+    } else {
+      db.prepare(
+        `UPDATE leads SET last_email_replied_at = ?, updated_at = datetime('now') WHERE id = ?`,
+      ).run(now, leadId);
+      if (message) {
+        db.prepare(
+          `UPDATE email_messages
+           SET last_replied_at = ?, status = 'replied'
+           WHERE id = ?`,
+        ).run(now, message.id);
+      }
+    }
+
+    const preview = (bodyMarkdown || bodyText || subject || '(empty reply)')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 180);
+    db.prepare(
+      `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, outcome)
+       VALUES (?, ?, NULL, 'reply', ?, 'neutral')`,
+    ).run(uuid(), leadId, `Email reply: ${preview}`);
+  }
+
+  return { ok: true, replyId: id, leadId };
+}
+
+/**
+ * List email replies for CRM inbox tab.
+ * @param {{ user: { id: string, role: string }, q?: string, unreadOnly?: boolean, limit?: number, canViewAll: boolean }} opts
+ */
+export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100, canViewAll }) {
+  const clauses = [];
+  const params = [];
+
+  if (!canViewAll) {
+    clauses.push('(l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)');
+    params.push(user.id, user.id);
+  }
+  if (unreadOnly) {
+    clauses.push('r.read_at IS NULL');
+  }
+  if (q) {
+    clauses.push(
+      `(r.subject LIKE ? OR r.from_email LIKE ? OR r.body_markdown LIKE ? OR r.body_text LIKE ? OR l.name LIKE ? OR l.email LIKE ?)`,
+    );
+    const like = `%${q}%`;
+    params.push(like, like, like, like, like, like);
+  }
+
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const rows = db
+    .prepare(
+      `SELECT r.*,
+              l.name AS lead_name,
+              l.email AS lead_email,
+              l.company AS lead_company,
+              l.status AS lead_status,
+              l.assigned_to AS lead_assigned_to,
+              u.name AS assigned_to_name
+       FROM email_replies r
+       LEFT JOIN leads l ON l.id = r.lead_id
+       LEFT JOIN users u ON u.id = l.assigned_to
+       ${where}
+       ORDER BY r.received_at DESC
+       LIMIT ?`,
+    )
+    .all(...params, Math.min(Math.max(Number(limit) || 100, 1), 300));
+
+  return rows.map((r) => ({
+    ...r,
+    preview: (r.body_markdown || r.body_text || r.subject || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 160),
+    hasBody: Boolean(r.body_markdown || r.body_text || r.body_html),
+  }));
+}
+
+export function countUnreadEmailReplies({ user, canViewAll }) {
+  if (canViewAll) {
+    return db
+      .prepare(`SELECT COUNT(*) AS c FROM email_replies WHERE read_at IS NULL`)
+      .get().c;
+  }
+  return db
+    .prepare(
+      `SELECT COUNT(*) AS c
+       FROM email_replies r
+       LEFT JOIN leads l ON l.id = r.lead_id
+       WHERE r.read_at IS NULL
+         AND (l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)`,
+    )
+    .get(user.id, user.id).c;
+}
+
+export function countEmailReplies({ user, canViewAll }) {
+  if (canViewAll) {
+    return db.prepare(`SELECT COUNT(*) AS c FROM email_replies`).get().c;
+  }
+  return db
+    .prepare(
+      `SELECT COUNT(*) AS c
+       FROM email_replies r
+       LEFT JOIN leads l ON l.id = r.lead_id
+       WHERE (l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)`,
+    )
+    .get(user.id, user.id).c;
+}
+
+export function getEmailReply(id) {
+  return db
+    .prepare(
+      `SELECT r.*,
+              l.name AS lead_name,
+              l.email AS lead_email,
+              l.company AS lead_company,
+              l.status AS lead_status,
+              l.assigned_to AS lead_assigned_to,
+              u.name AS assigned_to_name
+       FROM email_replies r
+       LEFT JOIN leads l ON l.id = r.lead_id
+       LEFT JOIN users u ON u.id = l.assigned_to
+       WHERE r.id = ?`,
+    )
+    .get(id);
+}
+
+export function markEmailReplyRead(id, read = true) {
+  const readAt = read ? new Date().toISOString() : null;
+  db.prepare(`UPDATE email_replies SET read_at = ? WHERE id = ?`).run(readAt, id);
+  return getEmailReply(id);
 }

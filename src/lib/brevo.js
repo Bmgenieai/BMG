@@ -209,6 +209,21 @@ export function getTemplateById(id) {
   return COLD_EMAIL_TEMPLATES.find((t) => t.id === id) || null;
 }
 
+/** Subdomain that receives reply mail via Brevo Inbound Parsing (e.g. reply.bmgenie.ai). */
+export function replyDomain() {
+  return (process.env.BREVO_REPLY_DOMAIN || '').trim().toLowerCase() || null;
+}
+
+/** Reply-To address that encodes the CRM lead id for inbound matching. */
+export function replyToForLead(leadId) {
+  const domain = replyDomain();
+  if (!domain || !leadId) return null;
+  return {
+    email: `lead-${leadId}@${domain}`,
+    name: process.env.BREVO_SENDER_NAME || 'BMGenie Sales',
+  };
+}
+
 /**
  * @param {{
  *   toEmail: string,
@@ -236,6 +251,8 @@ export async function sendTransactionalEmail(opts) {
   if (opts.leadId) {
     body.params = { CRM_LEAD_ID: opts.leadId };
   }
+  const replyTo = replyToForLead(opts.leadId);
+  if (replyTo) body.replyTo = replyTo;
   return brevoFetch('/smtp/email', { method: 'POST', body: JSON.stringify(body) });
 }
 
@@ -285,5 +302,7 @@ export function getBrevoPublicConfig() {
     sender: process.env.BREVO_SENDER_EMAIL || null,
     senderName: process.env.BREVO_SENDER_NAME || null,
     defaultListId: defaultListId(),
+    replyDomain: replyDomain(),
+    inboundRepliesEnabled: Boolean(replyDomain()),
   };
 }

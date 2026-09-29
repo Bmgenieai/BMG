@@ -169,12 +169,30 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     .prepare(`SELECT COUNT(*) AS c FROM chat_threads WHERE status = 'open'`)
     .get().c;
 
+  let emailRepliesUnread;
+  if (roleHasPermission(req.user.role, 'leads:view_all')) {
+    emailRepliesUnread = db
+      .prepare(`SELECT COUNT(*) AS c FROM email_replies WHERE read_at IS NULL`)
+      .get().c;
+  } else {
+    emailRepliesUnread = db
+      .prepare(
+        `SELECT COUNT(*) AS c
+         FROM email_replies r
+         LEFT JOIN leads l ON l.id = r.lead_id
+         WHERE r.read_at IS NULL
+           AND (l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)`,
+      )
+      .get(req.user.id, req.user.id).c;
+  }
+
   res.json({
     total,
     statusCounts,
     productCounts,
     demosCount,
     chatsOpen,
+    emailRepliesUnread,
     cohort,
     cohortDate: refDate,
   });

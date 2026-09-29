@@ -302,6 +302,35 @@ export function migrate() {
     );
     CREATE INDEX IF NOT EXISTS idx_email_events_lead ON email_events(lead_id, occurred_at);
     CREATE INDEX IF NOT EXISTS idx_email_events_event ON email_events(event);
+
+    CREATE TABLE IF NOT EXISTS email_replies (
+      id TEXT PRIMARY KEY,
+      lead_id TEXT REFERENCES leads(id) ON DELETE SET NULL,
+      email_message_id TEXT REFERENCES email_messages(id) ON DELETE SET NULL,
+      provider_message_id TEXT,
+      in_reply_to TEXT,
+      from_email TEXT,
+      from_name TEXT,
+      to_emails TEXT,
+      subject TEXT,
+      body_text TEXT,
+      body_html TEXT,
+      body_markdown TEXT,
+      spam_score REAL,
+      source TEXT NOT NULL DEFAULT 'brevo_inbound'
+        CHECK(source IN ('brevo_inbound','brevo_event')),
+      read_at TEXT,
+      received_at TEXT NOT NULL DEFAULT (datetime('now')),
+      raw_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_email_replies_provider
+      ON email_replies(provider_message_id)
+      WHERE provider_message_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_email_replies_lead ON email_replies(lead_id, received_at);
+    CREATE INDEX IF NOT EXISTS idx_email_replies_unread
+      ON email_replies(read_at, received_at)
+      WHERE read_at IS NULL;
   `);
 
   // One-time: legacy disposition → sales funnel stages

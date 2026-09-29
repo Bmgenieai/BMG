@@ -14,7 +14,17 @@ import {
   upsertContact,
 } from '../lib/brevo.js';
 import { canAccessLead, roleHasPermission } from '../lib/permissions.js';
-import { getLeadEmailHistory, ingestBrevoWebhookEvent, recordEmailSend } from '../lib/emailLog.js';
+import {
+  countEmailReplies,
+  countUnreadEmailReplies,
+  getEmailReply,
+  getLeadEmailHistory,
+  ingestBrevoInboundEmail,
+  ingestBrevoWebhookEvent,
+  listEmailReplies,
+  markEmailReplyRead,
+  recordEmailSend,
+} from '../lib/emailLog.js';
 
 const router = Router();
 
@@ -72,13 +82,114 @@ router.post('/webhooks/brevo', (req, res) => {
   res.json({ ok: true, processed: results.length, results: results.slice(0, 50) });
 });
 
+/**
+ * Brevo Inbound Parsing webhook — full reply bodies.
+ * Configure in Brevo: type=inbound, events=[inboundEmailProcessed], domain=BREVO_REPLY_DOMAIN
+ * URL: https://crm-api.bmgenie.ai/api/email/webhooks/brevo-inbound?secret=...
+ */
+router.post('/webhooks/brevo-inbound', (req, res) => {
+  if (!assertWebhookSecret(req, res)) return;
+
+  const body = req.body || {};
+  const items = Array.isArray(body.items)
+    ? body.items
+    : Array.isArray(body)
+      ? body
+      : body.MessageId || body.From
+        ? [body]
+        : [];
+
+  const results = [];
+  for (const item of items) {
+    try {
+      results.push(ingestBrevoInboundEmail(item));
+    } catch (err) {
+      results.push({ ok: false, skipped: err.message || 'error' });
+    }
+  }
+  res.json({ ok: true, processed: results.length, results: results.slice(0, 50) });
+});
+
 router.get('/status', authRequired, (_req, res) => {
   res.json({
     ...getBrevoPublicConfig(),
     webhookPath: '/api/email/webhooks/brevo',
+    inboundWebhookPath: '/api/email/webhooks/brevo-inbound',
     webhookSecretConfigured: Boolean((process.env.BREVO_WEBHOOK_SECRET || '').trim()),
   });
 });
+
+/** Email replies inbox for BD / telesales */
+router.get(
+  '/replies',
+  authRequired,
+  requireAnyPermission('leads:view_all', 'leads:view_own'),
+  (req, res) => {
+    const canViewAll = roleHasPermission(req.user.role, 'leads:view_all');
+    const unreadOnly =
+      req.query.unread === '1' ||
+      req.query.unread === 'true' ||
+      req.query.status === 'unread';
+    const rows = listEmailReplies({
+      user: req.user,
+      q: String(req.query.q || '').trim(),
+      unreadOnly,
+      limit: Number(req.query.limit) || 100,
+      canViewAll,
+    });
+    res.json(rows);
+  },
+);
+
+router.get(
+  '/replies/counts',
+  authRequired,
+  requireAnyPermission('leads:view_all', 'leads:view_own'),
+  (req, res) => {
+    const canViewAll = roleHasPermission(req.user.role, 'leads:view_all');
+    res.json({
+      unread: countUnreadEmailReplies({ user: req.user, canViewAll }),
+      total: countEmailReplies({ user: req.user, canViewAll }),
+    });
+  },
+);
+
+router.get(
+  '/replies/:id',
+  authRequired,
+  requireAnyPermission('leads:view_all', 'leads:view_own'),
+  (req, res) => {
+    const row = getEmailReply(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Reply not found' });
+    if (row.lead_id) {
+      const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(row.lead_id);
+      if (lead && !canAccessLead(req.user, lead)) {
+        return res.status(403).json({ error: 'Permission denied' });
+      }
+    } else if (!roleHasPermission(req.user.role, 'leads:view_all')) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    res.json(row);
+  },
+);
+
+router.post(
+  '/replies/:id/read',
+  authRequired,
+  requireAnyPermission('leads:view_all', 'leads:view_own'),
+  (req, res) => {
+    const row = getEmailReply(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Reply not found' });
+    if (row.lead_id) {
+      const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(row.lead_id);
+      if (lead && !canAccessLead(req.user, lead)) {
+        return res.status(403).json({ error: 'Permission denied' });
+      }
+    }
+    const read = req.body?.read !== false;
+    res.json(markEmailReplyRead(req.params.id, read));
+  },
+);
 
 router.get('/templates', authRequired, (req, res) => {
   const { source } = req.query;
