@@ -21,35 +21,6 @@ if (-not (Test-Path .env)) {
   throw '.env missing — copy .env.example to .env once on the server'
 }
 
-# TEMP: upsert BREVO_REPLY_DOMAIN into Windows .env (email replies inbox).
-# After one successful deploy, remove this block — value stays in server .env.
-function Upsert-DotEnvValue {
-  param(
-    [Parameter(Mandatory = $true)][string]$Path,
-    [Parameter(Mandatory = $true)][string]$Key,
-    [Parameter(Mandatory = $true)][string]$Value
-  )
-  $lines = Get-Content -Path $Path -ErrorAction Stop
-  $found = $false
-  $out = New-Object System.Collections.Generic.List[string]
-  foreach ($line in $lines) {
-    if ($line -match ("^\s*" + [regex]::Escape($Key) + "\s*=")) {
-      $out.Add("$Key=$Value") | Out-Null
-      $found = $true
-    } else {
-      $out.Add($line) | Out-Null
-    }
-  }
-  if (-not $found) {
-    $out.Add('') | Out-Null
-    $out.Add("$Key=$Value") | Out-Null
-  }
-  Set-Content -Path $Path -Value $out -Encoding utf8
-}
-
-Upsert-DotEnvValue -Path (Join-Path $Root '.env') -Key 'BREVO_REPLY_DOMAIN' -Value 'reply.bmgenie.ai'
-Write-Host 'BREVO_REPLY_DOMAIN=reply.bmgenie.ai upserted into .env'
-
 function Stop-PortListener {
   param([int]$Port = 4050)
 
