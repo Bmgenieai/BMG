@@ -49,6 +49,7 @@ export function recordEmailSend({
   summaryPrefix = 'Brevo cold email',
   htmlContent = null,
   textContent = null,
+  parentReplyId = null,
 }) {
   const id = uuid();
   const now = new Date().toISOString();
@@ -57,8 +58,8 @@ export function recordEmailSend({
   db.prepare(
     `INSERT INTO email_messages (
        id, lead_id, user_id, brevo_message_id, subject, to_email, template_id, source, status,
-       html_content, text_content, sent_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?)`,
+       html_content, text_content, parent_reply_id, sent_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?)`,
   ).run(
     id,
     leadId,
@@ -70,6 +71,7 @@ export function recordEmailSend({
     source,
     htmlContent ? String(htmlContent).slice(0, 200_000) : null,
     textContent ? String(textContent).slice(0, 100_000) : null,
+    parentReplyId || null,
     now,
   );
 
@@ -755,6 +757,26 @@ export function getEmailReply(id) {
   if (!row) return null;
 
   const original = findOriginalOutboundMessage(row);
+  const crmReplies = db
+    .prepare(
+      `SELECT m.*, u.name AS sent_by_name
+       FROM email_messages m
+       LEFT JOIN users u ON u.id = m.user_id
+       WHERE m.parent_reply_id = ?
+       ORDER BY m.sent_at ASC`,
+    )
+    .all(id)
+    .map((m) => ({
+      id: m.id,
+      subject: m.subject,
+      toEmail: m.to_email,
+      sentAt: m.sent_at,
+      sentByName: m.sent_by_name || null,
+      htmlContent: m.html_content || null,
+      textContent: m.text_content || null,
+      hasBody: Boolean(m.html_content || m.text_content),
+    }));
+
   return {
     ...row,
     hasBody: Boolean(row.body_markdown || row.body_text || row.body_html),
@@ -770,9 +792,110 @@ export function getEmailReply(id) {
           htmlContent: original.html_content || null,
           textContent: original.text_content || null,
           hasBody: Boolean(original.html_content || original.text_content),
+          brevoMessageId: original.brevo_message_id || null,
         }
       : null,
+    crmReplies,
   };
+}
+
+function wrapAngle(messageId) {
+  const mid = normalizeMessageId(messageId);
+  if (!mid) return null;
+  return mid.startsWith('<') ? mid : `<${mid}>`;
+}
+
+function textToSimpleHtml(text) {
+  const escaped = String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+  return `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap">${escaped}</div>`;
+}
+
+function replySubject(subject) {
+  const s = String(subject || '').trim() || '(no subject)';
+  return /^re\s*:/i.test(s) ? s : `Re: ${s}`;
+}
+
+/**
+ * Send a CRM follow-up reply to an inbound prospect message via Brevo.
+ * @returns {{ ok: true, reply: object, brevo: object }}
+ */
+export async function sendCrmReplyToInbound({
+  replyId,
+  user,
+  bodyText,
+  subject: subjectOverride = null,
+  sendTransactionalEmail,
+}) {
+  const reply = getEmailReply(replyId);
+  if (!reply) {
+    const err = new Error('Reply not found');
+    err.status = 404;
+    throw err;
+  }
+
+  const toEmail = normalizeEmail(reply.from_email) || normalizeEmail(reply.lead_email);
+  if (!toEmail) {
+    const err = new Error('No recipient email on this reply');
+    err.status = 400;
+    throw err;
+  }
+
+  const text = String(bodyText || '').trim();
+  if (!text) {
+    const err = new Error('Reply message is required');
+    err.status = 400;
+    throw err;
+  }
+
+  const leadId = reply.lead_id;
+  if (!leadId) {
+    const err = new Error('Reply is not linked to a CRM lead');
+    err.status = 400;
+    throw err;
+  }
+
+  const subject = replySubject(subjectOverride || reply.subject || reply.originalMessage?.subject);
+  const htmlContent = textToSimpleHtml(text);
+
+  const inboundMid = wrapAngle(reply.provider_message_id);
+  const originalMid = wrapAngle(reply.originalMessage?.brevoMessageId);
+  const references = [originalMid, inboundMid].filter(Boolean).join(' ');
+  const headers = {};
+  if (inboundMid) headers['In-Reply-To'] = inboundMid;
+  if (references) headers.References = references;
+
+  const brevo = await sendTransactionalEmail({
+    toEmail,
+    toName: reply.from_name || reply.lead_name || undefined,
+    subject,
+    htmlContent,
+    textContent: text,
+    leadId,
+    tags: ['crm-reply'],
+    headers,
+  });
+
+  recordEmailSend({
+    leadId,
+    userId: user.id,
+    subject,
+    toEmail,
+    brevoMessageId: brevo?.messageId || brevo?.message_id || null,
+    source: 'crm_reply',
+    summaryPrefix: 'CRM reply',
+    htmlContent,
+    textContent: text,
+    parentReplyId: replyId,
+  });
+
+  // Mark inbound as read after BD responds
+  markEmailReplyRead(replyId, true);
+
+  return { ok: true, reply: getEmailReply(replyId), brevo };
 }
 
 export function markEmailReplyRead(id, read = true) {

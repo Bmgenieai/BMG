@@ -336,6 +336,7 @@ export function migrate() {
   const emailMessageAlters = [
     `ALTER TABLE email_messages ADD COLUMN html_content TEXT`,
     `ALTER TABLE email_messages ADD COLUMN text_content TEXT`,
+    `ALTER TABLE email_messages ADD COLUMN parent_reply_id TEXT`,
   ];
   for (const sql of emailMessageAlters) {
     try {

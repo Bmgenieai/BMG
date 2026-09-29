@@ -62,6 +62,8 @@ Keep the existing **transactional** webhook for open/click/reply events:
 
 When CRM sends cold email and `BREVO_REPLY_DOMAIN` is set, Brevo `replyTo` is set to `lead-<leadId>@reply.bmgenie.ai`. Prospect replies go to Brevo → inbound webhook → CRM stores subject + body and links the lead.
 
+BD / CEO can **reply from CRM** on Email replies → thread → “Send via Brevo”. That send uses the Brevo mailbox (`BREVO_SENDER_EMAIL`), sets `In-Reply-To` / `References` for threading, and keeps `Reply-To` as `lead-<id>@reply…` so their next reply still lands in CRM.
+
 Without inbound DNS, the Replies tab still lists **reply notifications** from the transactional `reply` event (no body until inbound is live).
 
 ## CRM features (implemented)
@@ -91,6 +93,7 @@ Without inbound DNS, the Replies tab still lists **reply notifications** from th
 - `POST /api/email/replies/:id/read` — mark read/unread
 - `POST /api/email/webhooks/brevo` — transactional events
 - `POST /api/email/webhooks/brevo-inbound` — inbound parse bodies
+- `POST /api/email/replies/:id/reply` — BD/CEO reply from CRM via Brevo (threaded)
 
 ## Templates (by lead source)
 
@@ -104,4 +107,3 @@ Sending auto-marks `new` leads as `contacted` and logs `email_sent` activity.
 
 ## Phase 3 (future)
 Brevo Marketing Campaigns / automations for multi-step sequences — use list sync today, campaigns in Brevo UI.
-Compose-reply-from-CRM (threading) can be added once inbound is live in production.

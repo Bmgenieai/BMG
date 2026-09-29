@@ -24,6 +24,7 @@ import {
   listEmailReplies,
   markEmailReplyRead,
   recordEmailSend,
+  sendCrmReplyToInbound,
 } from '../lib/emailLog.js';
 
 const router = Router();
@@ -188,6 +189,39 @@ router.post(
     }
     const read = req.body?.read !== false;
     res.json(markEmailReplyRead(req.params.id, read));
+  },
+);
+
+/** Reply to an inbound prospect message from CRM via Brevo mailbox (threaded). */
+router.post(
+  '/replies/:id/reply',
+  authRequired,
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  async (req, res) => {
+    try {
+      const row = getEmailReply(req.params.id);
+      if (!row) return res.status(404).json({ error: 'Reply not found' });
+      if (row.lead_id) {
+        const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(row.lead_id);
+        if (!lead) return res.status(404).json({ error: 'Lead not found' });
+        if (!canAccessLead(req.user, lead) && !roleHasPermission(req.user.role, 'leads:update_any')) {
+          return res.status(403).json({ error: 'Permission denied' });
+        }
+      }
+
+      const message = req.body?.message || req.body?.text || req.body?.body || '';
+      const result = await sendCrmReplyToInbound({
+        replyId: req.params.id,
+        user: req.user,
+        bodyText: message,
+        subject: req.body?.subject || null,
+        sendTransactionalEmail,
+      });
+      res.json(result);
+    } catch (err) {
+      const status = err.code === 'BREVO_DISABLED' ? 503 : err.status || 500;
+      res.status(status).json({ error: err.message || 'Failed to send reply' });
+    }
   },
 );
 

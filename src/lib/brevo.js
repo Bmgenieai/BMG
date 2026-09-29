@@ -233,6 +233,8 @@ export function replyToForLead(leadId) {
  *   textContent?: string,
  *   leadId?: string,
  *   tags?: string[],
+ *   headers?: Record<string, string>,
+ *   replyTo?: { email: string, name?: string } | null,
  * }} opts
  */
 export async function sendTransactionalEmail(opts) {
@@ -251,8 +253,16 @@ export async function sendTransactionalEmail(opts) {
   if (opts.leadId) {
     body.params = { CRM_LEAD_ID: opts.leadId };
   }
-  const replyTo = replyToForLead(opts.leadId);
+  const replyTo =
+    opts.replyTo === null ? null : opts.replyTo || replyToForLead(opts.leadId);
   if (replyTo) body.replyTo = replyTo;
+  if (opts.headers && typeof opts.headers === 'object') {
+    const headers = {};
+    for (const [k, v] of Object.entries(opts.headers)) {
+      if (v != null && String(v).trim()) headers[k] = String(v);
+    }
+    if (Object.keys(headers).length) body.headers = headers;
+  }
   return brevoFetch('/smtp/email', { method: 'POST', body: JSON.stringify(body) });
 }
 
