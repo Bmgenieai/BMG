@@ -133,7 +133,7 @@ router.get('/:id', requireAnyPermission('leads:view_all', 'leads:view_own'), (re
  * Also logs activity on the linked lead when present.
  * Live delivery to the website visitor still requires pasting/sending in Tawk.
  */
-router.post('/:id/reply', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
+router.post('/:id/reply', requireAnyPermission('leads:update_any', 'leads:update_own'), (req, res) => {
   const message = String(req.body?.message || '').trim();
   if (!message || message.length < 1) {
     return res.status(400).json({ error: 'message is required' });
