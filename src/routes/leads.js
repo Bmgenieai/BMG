@@ -111,6 +111,7 @@ router.get('/meta', (_req, res) => {
     importBatches,
     emailStatuses: [
       { key: 'sent', label: 'Emailed' },
+      { key: 'opened', label: 'Opened email' },
       { key: 'not_sent', label: 'Not emailed' },
     ],
     cohorts: [
@@ -251,6 +252,8 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   const emailFilter = String(emailStatus || '').toLowerCase();
   if (emailFilter === 'sent' || emailFilter === 'emailed') {
     clauses.push('l.last_emailed_at IS NOT NULL');
+  } else if (emailFilter === 'opened' || emailFilter === 'opened_email') {
+    clauses.push('COALESCE(l.email_open_count, 0) > 0');
   } else if (emailFilter === 'not_sent' || emailFilter === 'not_emailed') {
     clauses.push('l.last_emailed_at IS NULL');
   }
