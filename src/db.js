@@ -184,6 +184,7 @@ export function migrate() {
     `ALTER TABLE leads ADD COLUMN email_reply_count INTEGER DEFAULT 0`,
     `ALTER TABLE leads ADD COLUMN last_email_opened_at TEXT`,
     `ALTER TABLE leads ADD COLUMN last_email_replied_at TEXT`,
+    `ALTER TABLE leads ADD COLUMN archived_at TEXT`,
   ];
   for (const sql of leadAlters) {
     try {
@@ -339,17 +340,6 @@ export function migrate() {
     `ALTER TABLE email_messages ADD COLUMN parent_reply_id TEXT`,
   ];
   for (const sql of emailMessageAlters) {
-    try {
-      db.exec(sql);
-    } catch {
-      /* column already exists */
-    }
-  }
-
-  const leadAlters = [
-    `ALTER TABLE leads ADD COLUMN archived_at TEXT`,
-  ];
-  for (const sql of leadAlters) {
     try {
       db.exec(sql);
     } catch {
