@@ -112,6 +112,7 @@ router.get('/meta', (_req, res) => {
     emailStatuses: [
       { key: 'sent', label: 'Emailed' },
       { key: 'opened', label: 'Opened email' },
+      { key: 'replied', label: 'Replied email' },
       { key: 'not_sent', label: 'Not emailed' },
     ],
     cohorts: [
@@ -133,15 +134,18 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     : '';
   const assigneeParam = assigneeClause ? [req.user.id, req.user.id] : [];
   const cohortClause = cohortPred.sql === '1=1' ? '' : `AND ${cohortPred.sql}`;
+  const activeClause = `AND (archived_at IS NULL OR archived_at = '')`;
   const baseParams = [...assigneeParam, ...cohortPred.params];
 
   const total = db
-    .prepare(`SELECT COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause}`)
+    .prepare(
+      `SELECT COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} ${activeClause}`,
+    )
     .get(...baseParams).c;
 
   const byStatus = db
     .prepare(
-      `SELECT status, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} GROUP BY status`,
+      `SELECT status, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} ${activeClause} GROUP BY status`,
     )
     .all(...baseParams);
   const statusMap = Object.fromEntries(byStatus.map((r) => [r.status, r.c]));
@@ -157,7 +161,7 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
 
   const bySource = db
     .prepare(
-      `SELECT source, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} GROUP BY source`,
+      `SELECT source, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} ${activeClause} GROUP BY source`,
     )
     .all(...baseParams);
   const sourceMap = Object.fromEntries(bySource.map((r) => [r.source, r.c]));
@@ -254,8 +258,20 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     clauses.push('l.last_emailed_at IS NOT NULL');
   } else if (emailFilter === 'opened' || emailFilter === 'opened_email') {
     clauses.push('COALESCE(l.email_open_count, 0) > 0');
+  } else if (emailFilter === 'replied' || emailFilter === 'replied_email') {
+    clauses.push('COALESCE(l.email_reply_count, 0) > 0');
   } else if (emailFilter === 'not_sent' || emailFilter === 'not_emailed') {
     clauses.push('l.last_emailed_at IS NULL');
+  }
+
+  const includeArchived =
+    req.query.archived === '1' ||
+    req.query.archived === 'true' ||
+    req.query.includeArchived === '1';
+  if (!includeArchived) {
+    clauses.push('(l.archived_at IS NULL OR l.archived_at = \'\')');
+  } else if (req.query.archivedOnly === '1' || req.query.archivedOnly === 'true') {
+    clauses.push('(l.archived_at IS NOT NULL AND l.archived_at != \'\')');
   }
 
   if (importBatchId) {
@@ -789,5 +805,64 @@ router.post(
     });
   },
 );
+
+/** Soft-archive a lead (hides from active lists). BD own / CEO any. */
+router.post(
+  '/:id/archive',
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    const lead = requireLeadAccess(req, res);
+    if (!lead) return;
+    if (
+      !roleHasPermission(req.user.role, 'leads:update_any') &&
+      lead.assigned_to !== req.user.id &&
+      lead.created_by !== req.user.id
+    ) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    const now = new Date().toISOString();
+    db.prepare(
+      `UPDATE leads SET archived_at = ?, updated_at = datetime('now') WHERE id = ?`,
+    ).run(now, lead.id);
+    db.prepare(
+      `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
+       VALUES (?, ?, ?, 'note', ?)`,
+    ).run(uuid(), lead.id, req.user.id, `Lead archived by ${req.user.name}`);
+    res.json(getLeadWithJoins(lead.id));
+  },
+);
+
+/** Restore an archived lead. */
+router.post(
+  '/:id/unarchive',
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    const lead = requireLeadAccess(req, res);
+    if (!lead) return;
+    if (
+      !roleHasPermission(req.user.role, 'leads:update_any') &&
+      lead.assigned_to !== req.user.id &&
+      lead.created_by !== req.user.id
+    ) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    db.prepare(
+      `UPDATE leads SET archived_at = NULL, updated_at = datetime('now') WHERE id = ?`,
+    ).run(lead.id);
+    db.prepare(
+      `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
+       VALUES (?, ?, ?, 'note', ?)`,
+    ).run(uuid(), lead.id, req.user.id, `Lead restored by ${req.user.name}`);
+    res.json(getLeadWithJoins(lead.id));
+  },
+);
+
+/** Permanently delete a lead (CEO only). */
+router.delete('/:id', requirePermission('leads:delete'), (req, res) => {
+  const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(req.params.id);
+  if (!lead) return res.status(404).json({ error: 'Lead not found' });
+  db.prepare(`DELETE FROM leads WHERE id = ?`).run(lead.id);
+  res.json({ ok: true, id: lead.id });
+});
 
 export default router;

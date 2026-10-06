@@ -35,6 +35,7 @@ export const PERMISSIONS = {
   'leads:update_own': ['ceo', 'telesales'],
   'leads:import': ['ceo', 'telesales'],
   'leads:assign': ['ceo', 'manager'],
+  'leads:delete': ['ceo'],
 
   // Follow-ups — manager view-only
   'followups:view_all': ['ceo', 'manager'],

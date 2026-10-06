@@ -346,6 +346,17 @@ export function migrate() {
     }
   }
 
+  const leadAlters = [
+    `ALTER TABLE leads ADD COLUMN archived_at TEXT`,
+  ];
+  for (const sql of leadAlters) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* column already exists */
+    }
+  }
+
   // One-time: legacy disposition → sales funnel stages
   const statusMigrates = [
     [`UPDATE leads SET status = 'qualified' WHERE status IN ('new','contacted')`, 'qualified'],

@@ -329,16 +329,41 @@ export function ingestBrevoWebhookEvent(payload) {
 }
 
 export function getLeadEmailHistory(leadId) {
-  const messages = db
+  const rawMessages = db
     .prepare(
       `SELECT m.*, u.name AS sent_by_name
        FROM email_messages m
        LEFT JOIN users u ON u.id = m.user_id
        WHERE m.lead_id = ?
-       ORDER BY m.sent_at DESC
+       ORDER BY m.sent_at ASC
        LIMIT 100`,
     )
     .all(leadId);
+
+  const messages = rawMessages.map((m, idx) => ({
+    id: m.id,
+    sequence: idx + 1,
+    subject: m.subject,
+    toEmail: m.to_email,
+    sentAt: m.sent_at,
+    sentByName: m.sent_by_name || null,
+    status: m.status,
+    source: m.source,
+    openCount: Number(m.open_count) || 0,
+    clickCount: Number(m.click_count) || 0,
+    replyCount: Number(m.reply_count) || 0,
+    htmlContent: m.html_content || null,
+    textContent: m.text_content || null,
+    hasBody: Boolean(m.html_content || m.text_content),
+    // legacy snake_case for older UI bindings
+    open_count: Number(m.open_count) || 0,
+    click_count: Number(m.click_count) || 0,
+    reply_count: Number(m.reply_count) || 0,
+    sent_at: m.sent_at,
+    sent_by_name: m.sent_by_name || null,
+    html_content: m.html_content || null,
+    text_content: m.text_content || null,
+  }));
 
   const events = db
     .prepare(
