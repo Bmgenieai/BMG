@@ -3,6 +3,7 @@
  */
 import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
+import { touchLeadContacted, onLeadReply } from './leadAutomation.js';
 
 const OPEN_EVENTS = new Set(['opened', 'unique_opened', 'uniqueOpened']);
 const CLICK_EVENTS = new Set(['click', 'clicks']);
@@ -81,10 +82,19 @@ export function recordEmailSend({
      WHERE id = ?`,
   ).run(now, leadId);
 
+  const isFollowup = /follow.?up/i.test(summaryPrefix) || source === 'followup';
   db.prepare(
     `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
-     VALUES (?, ?, ?, 'email_sent', ?)`,
-  ).run(uuid(), leadId, userId, `${summaryPrefix}: ${subject || '(no subject)'}`);
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(
+    uuid(),
+    leadId,
+    userId,
+    isFollowup ? 'email_followup' : 'email_sent',
+    `${summaryPrefix}: ${subject || '(no subject)'}`,
+  );
+
+  touchLeadContacted(leadId, { userId });
 
   return { messageId: id, brevoMessageId: mid };
 }
@@ -169,6 +179,7 @@ function bumpLeadCounters(leadId, event) {
            updated_at = datetime('now')
        WHERE id = ?`,
     ).run(now, leadId);
+    onLeadReply(leadId);
   }
 }
 
@@ -623,6 +634,7 @@ export function ingestBrevoInboundEmail(item) {
       `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, outcome)
        VALUES (?, ?, NULL, 'reply', ?, 'neutral')`,
     ).run(uuid(), leadId, `Email reply: ${preview}`);
+    onLeadReply(leadId);
   }
 
   return { ok: true, replyId: id, leadId };

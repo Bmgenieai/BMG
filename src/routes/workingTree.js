@@ -1,16 +1,32 @@
 import { Router } from 'express';
 import { db } from '../db.js';
 import { authRequired, requireAnyPermission } from '../middleware/auth.js';
-import { OPEN_STATUSES, END_STATUSES, roleHasPermission } from '../lib/permissions.js';
+import {
+  OPEN_STATUSES,
+  END_STATUSES,
+  STATUS_LABELS,
+  normalizeStatus,
+  roleHasPermission,
+} from '../lib/permissions.js';
 
 const router = Router();
 router.use(authRequired);
 
 function toneFor(status, overdueCount) {
-  if (status === 'paid' || status === 'converted') return 'green';
-  if (status === 'lost' || status === 'not_interested') return 'grey';
+  if (status === 'paid' || status === 'repeat' || status === 'converted') return 'green';
+  if (status === 'nurture' || status === 'lost' || status === 'not_interested') return 'grey';
   if (overdueCount > 0) return 'red';
-  if (status === 'demo_booked' || status === 'trial' || status === 'conversation') return 'amber';
+  if (
+    status === 'demo_scheduled' ||
+    status === 'demo_booked' ||
+    status === 'trial' ||
+    status === 'engaged' ||
+    status === 'conversation' ||
+    status === 'challenge_offered' ||
+    status === 'challenge_accepted'
+  ) {
+    return 'amber';
+  }
   return 'blue';
 }
 
@@ -87,14 +103,14 @@ router.get('/', requireAnyPermission(
     const buckets = [
       ...OPEN_STATUSES.map((st) => ({
         key: st,
-        label: st.replace(/_/g, ' '),
+        label: STATUS_LABELS[st] || st.replace(/_/g, ' '),
         count: byStatus[st] || 0,
         kind: 'open',
         tone: toneFor(st, overdue),
       })),
       ...END_STATUSES.map((st) => ({
         key: st,
-        label: st.replace(/_/g, ' '),
+        label: STATUS_LABELS[st] || st.replace(/_/g, ' '),
         count: byStatus[st] || 0,
         kind: 'ended',
         tone: toneFor(st, 0),
@@ -215,14 +231,21 @@ router.get('/leads', requireAnyPermission(
     title = 'Open leads';
   } else if (
     [
+      'uncontacted',
+      'contacted',
+      'engaged',
       'qualified',
-      'conversation',
-      'demo_booked',
+      'demo_scheduled',
+      'challenge_offered',
+      'challenge_accepted',
       'trial',
       'paid',
+      'repeat',
+      'nurture',
+      'conversation',
+      'demo_booked',
       'lost',
       'new',
-      'contacted',
       'interested',
       'neutral',
       'follow_up_scheduled',
@@ -231,7 +254,7 @@ router.get('/leads', requireAnyPermission(
     ].includes(bucket)
   ) {
     const clauses = ['l.status = ?'];
-    const params = [bucket];
+    const params = [normalizeStatus(bucket) || bucket];
     if (assigneeFilter) {
       clauses.push('l.assigned_to = ?');
       params.push(assigneeFilter);

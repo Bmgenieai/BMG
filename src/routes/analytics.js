@@ -34,15 +34,20 @@ router.get(
         `SELECT
           COUNT(*) AS total_leads,
           SUM(CASE WHEN status IN (${OPEN_LIST}) THEN 1 ELSE 0 END) AS open_leads,
-          SUM(CASE WHEN status = 'qualified' THEN 1 ELSE 0 END) AS new_leads,
+          SUM(CASE WHEN status = 'uncontacted' THEN 1 ELSE 0 END) AS new_leads,
+          SUM(CASE WHEN status = 'uncontacted' THEN 1 ELSE 0 END) AS uncontacted,
+          SUM(CASE WHEN status = 'contacted' THEN 1 ELSE 0 END) AS contacted,
+          SUM(CASE WHEN status = 'engaged' THEN 1 ELSE 0 END) AS engaged,
           SUM(CASE WHEN status = 'qualified' THEN 1 ELSE 0 END) AS qualified,
-          SUM(CASE WHEN status = 'conversation' THEN 1 ELSE 0 END) AS interested,
-          SUM(CASE WHEN status = 'conversation' THEN 1 ELSE 0 END) AS conversation,
-          SUM(CASE WHEN status = 'demo_booked' THEN 1 ELSE 0 END) AS demo_booked,
+          SUM(CASE WHEN status = 'demo_scheduled' THEN 1 ELSE 0 END) AS demo_scheduled,
+          SUM(CASE WHEN status = 'challenge_offered' THEN 1 ELSE 0 END) AS challenge_offered,
+          SUM(CASE WHEN status = 'challenge_accepted' THEN 1 ELSE 0 END) AS challenge_accepted,
           SUM(CASE WHEN status = 'trial' THEN 1 ELSE 0 END) AS trial,
           SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS converted,
           SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS paid,
-          SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) AS lost,
+          SUM(CASE WHEN status = 'repeat' THEN 1 ELSE 0 END) AS repeat_customers,
+          SUM(CASE WHEN status = 'nurture' THEN 1 ELSE 0 END) AS lost,
+          SUM(CASE WHEN status = 'nurture' THEN 1 ELSE 0 END) AS nurture,
           SUM(CASE WHEN assigned_to IS NULL AND status IN (${OPEN_LIST}) THEN 1 ELSE 0 END) AS unassigned
          FROM leads WHERE 1=1 ${leadFilter}`,
       )
@@ -182,13 +187,18 @@ router.get(
     const stages = db
       .prepare(
         `SELECT
-          COUNT(*) AS qualified_prospects,
+          COUNT(*) AS total_leads,
+          SUM(CASE WHEN status = 'uncontacted' THEN 1 ELSE 0 END) AS uncontacted,
+          SUM(CASE WHEN status = 'contacted' THEN 1 ELSE 0 END) AS contacted,
+          SUM(CASE WHEN status = 'engaged' THEN 1 ELSE 0 END) AS engaged,
           SUM(CASE WHEN status = 'qualified' THEN 1 ELSE 0 END) AS qualified,
-          SUM(CASE WHEN status = 'conversation' THEN 1 ELSE 0 END) AS conversations,
-          SUM(CASE WHEN status = 'demo_booked' THEN 1 ELSE 0 END) AS demos_booked,
+          SUM(CASE WHEN status = 'demo_scheduled' THEN 1 ELSE 0 END) AS demo_scheduled,
+          SUM(CASE WHEN status = 'challenge_offered' THEN 1 ELSE 0 END) AS challenge_offered,
+          SUM(CASE WHEN status = 'challenge_accepted' THEN 1 ELSE 0 END) AS challenge_accepted,
           SUM(CASE WHEN status = 'trial' THEN 1 ELSE 0 END) AS trials,
           SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS paid,
-          SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) AS lost
+          SUM(CASE WHEN status = 'repeat' THEN 1 ELSE 0 END) AS repeat_customers,
+          SUM(CASE WHEN status = 'nurture' THEN 1 ELSE 0 END) AS nurture
          FROM leads l WHERE 1=1 ${leadFilter}`,
       )
       .get(...params);
@@ -201,29 +211,51 @@ router.get(
       .prepare(
         `SELECT
           SUM(CASE WHEN a.type IN ('email','email_sent') THEN 1 ELSE 0 END) AS emails,
-          SUM(CASE WHEN a.type = 'linkedin' THEN 1 ELSE 0 END) AS linkedin_touches,
-          SUM(CASE WHEN a.type = 'call' THEN 1 ELSE 0 END) AS calls,
-          SUM(CASE WHEN a.type = 'reply' THEN 1 ELSE 0 END) AS replies,
+          SUM(CASE WHEN a.type = 'email_followup' THEN 1 ELSE 0 END) AS email_followups,
+          SUM(CASE WHEN a.type IN ('email_opened') THEN 1 ELSE 0 END) AS email_opens,
+          SUM(CASE WHEN a.type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply') THEN 1 ELSE 0 END) AS linkedin_touches,
+          SUM(CASE WHEN a.type = 'linkedin_connection_sent' THEN 1 ELSE 0 END) AS linkedin_connection_sent,
+          SUM(CASE WHEN a.type = 'linkedin_connection_accepted' THEN 1 ELSE 0 END) AS linkedin_connection_accepted,
+          SUM(CASE WHEN a.type IN ('linkedin_message','linkedin') THEN 1 ELSE 0 END) AS linkedin_messages,
+          SUM(CASE WHEN a.type = 'linkedin_reply' THEN 1 ELSE 0 END) AS linkedin_replies,
+          SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected') THEN 1 ELSE 0 END) AS calls,
+          SUM(CASE WHEN a.type = 'call_attempted' THEN 1 ELSE 0 END) AS calls_attempted,
+          SUM(CASE WHEN a.type IN ('call','call_connected') THEN 1 ELSE 0 END) AS calls_connected,
+          SUM(CASE WHEN a.type IN ('reply','linkedin_reply') THEN 1 ELSE 0 END) AS replies,
           SUM(CASE WHEN a.type = 'reply' AND a.outcome = 'positive' THEN 1 ELSE 0 END) AS positive_replies,
+          SUM(CASE WHEN a.type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings_requested,
           SUM(CASE WHEN a.type = 'demo_shown' THEN 1 ELSE 0 END) AS demos_shown,
-          COUNT(DISTINCT CASE WHEN a.type IN ('email','email_sent','linkedin','call') THEN a.lead_id END) AS leads_touched,
-          COUNT(DISTINCT CASE WHEN a.type = 'reply' THEN a.lead_id END) AS leads_replied,
+          COUNT(DISTINCT CASE WHEN a.type IN ('email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','call','call_attempted','call_connected') THEN a.lead_id END) AS leads_touched,
+          COUNT(DISTINCT CASE WHEN a.type IN ('reply','linkedin_reply') THEN a.lead_id END) AS leads_replied,
           COUNT(DISTINCT CASE WHEN a.type = 'reply' AND a.outcome = 'positive' THEN a.lead_id END) AS leads_positive_reply
          FROM lead_activities a
          WHERE 1=1 ${actFilter}`,
       )
       .get(...params);
 
+    const leadsAdded = db
+      .prepare(`SELECT COUNT(*) AS c FROM leads l WHERE 1=1 ${leadFilter}`)
+      .get(...params).c;
+
+    const leadsVerified = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM leads l
+         WHERE (l.email IS NOT NULL AND TRIM(l.email) != '') ${leadFilter}`,
+      )
+      .get(...params).c;
+
     const demosBookedLeads = db
       .prepare(
         `SELECT COUNT(DISTINCT l.id) AS c
          FROM leads l
          WHERE (
-           l.status IN ('demo_booked','trial','paid')
+           l.status IN ('demo_scheduled','challenge_offered','challenge_accepted','trial','paid','repeat')
            OR EXISTS (
              SELECT 1 FROM lead_activities a
-             WHERE a.lead_id = l.id AND a.type = 'status_change' AND a.outcome = 'demo_booked'
+             WHERE a.lead_id = l.id AND a.type = 'status_change'
+               AND a.outcome IN ('demo_scheduled','demo_booked')
            )
+           OR EXISTS (SELECT 1 FROM demo_bookings d WHERE d.lead_id = l.id)
          ) ${leadFilter}`,
       )
       .get(...params).c;
@@ -242,28 +274,66 @@ router.get(
       .prepare(
         `SELECT COALESCE(NULLIF(TRIM(lost_reason), ''), 'Unspecified') AS reason, COUNT(*) AS count
          FROM leads l
-         WHERE status = 'lost' ${leadFilter}
+         WHERE status IN ('nurture','lost') ${leadFilter}
          GROUP BY reason
          ORDER BY count DESC`,
       )
       .all(...params);
 
     res.json({
+      // Unique leads in each lifecycle stage (one lead = one stage)
       stages: {
-        qualifiedProspects: stages.qualified_prospects,
+        totalLeads: stages.total_leads,
+        uncontacted: stages.uncontacted,
+        contacted: stages.contacted,
+        engaged: stages.engaged,
         qualified: stages.qualified,
-        conversations: stages.conversations,
-        demosBooked: stages.demos_booked,
+        demoScheduled: stages.demo_scheduled,
+        challengeOffered: stages.challenge_offered,
+        challengeAccepted: stages.challenge_accepted,
         trials: stages.trials,
         paid: stages.paid,
-        lost: stages.lost,
+        repeat: stages.repeat_customers,
+        nurture: stages.nurture,
+        // Back-compat aliases for older UI
+        qualifiedProspects: stages.total_leads,
+        conversations: stages.engaged,
+        demosBooked: stages.demo_scheduled,
+        lost: stages.nurture,
+      },
+      // Activity dashboard — work volume (not unique opportunities)
+      activities: {
+        leadsAdded: leadsAdded || 0,
+        leadsVerified: leadsVerified || 0,
+        emailsSent: outreach.emails || 0,
+        emailOpens: outreach.email_opens || 0,
+        emailReplies: outreach.replies || 0,
+        followupsSent: outreach.email_followups || 0,
+        linkedinConnectionSent: outreach.linkedin_connection_sent || 0,
+        linkedinConnectionAccepted: outreach.linkedin_connection_accepted || 0,
+        linkedinMessages: outreach.linkedin_messages || 0,
+        linkedinReplies: outreach.linkedin_replies || 0,
+        callsAttempted: outreach.calls_attempted || outreach.calls || 0,
+        callsConnected: outreach.calls_connected || 0,
+        positiveReplies: outreach.positive_replies || 0,
+        meetingsRequested: outreach.meetings_requested || 0,
+        demosBooked: demosBookedLeads || 0,
       },
       outreach: {
         emails: outreach.emails || 0,
+        emailFollowups: outreach.email_followups || 0,
+        emailOpens: outreach.email_opens || 0,
         linkedinTouches: outreach.linkedin_touches || 0,
+        linkedinConnectionSent: outreach.linkedin_connection_sent || 0,
+        linkedinConnectionAccepted: outreach.linkedin_connection_accepted || 0,
+        linkedinMessages: outreach.linkedin_messages || 0,
+        linkedinReplies: outreach.linkedin_replies || 0,
         calls: outreach.calls || 0,
+        callsAttempted: outreach.calls_attempted || 0,
+        callsConnected: outreach.calls_connected || 0,
         replies: outreach.replies || 0,
         positiveReplies: outreach.positive_replies || 0,
+        meetingsRequested: outreach.meetings_requested || 0,
         demosShown: outreach.demos_shown || 0,
         leadsTouched: outreach.leads_touched || 0,
         leadsReplied: outreach.leads_replied || 0,
@@ -273,7 +343,7 @@ router.get(
         replyRate: pct(outreach.leads_replied || 0, outreach.leads_touched || 0),
         positiveReplyRate: pct(outreach.leads_positive_reply || 0, outreach.leads_replied || 0),
         showRate: pct(demosShownLeads || 0, demosBookedLeads || 0),
-        conversionRate: pct(stages.paid || 0, stages.qualified_prospects || 0),
+        conversionRate: pct(stages.paid || 0, stages.total_leads || 0),
       },
       lostReasons,
     });
@@ -537,13 +607,21 @@ router.get(
     const activityAgg = db
       .prepare(
         `SELECT user_id,
-           SUM(CASE WHEN type = 'call' THEN 1 ELSE 0 END) AS calls,
+           SUM(CASE WHEN type IN ('call','call_attempted','call_connected') THEN 1 ELSE 0 END) AS calls,
+           SUM(CASE WHEN type = 'call_attempted' THEN 1 ELSE 0 END) AS calls_attempted,
+           SUM(CASE WHEN type IN ('call','call_connected') THEN 1 ELSE 0 END) AS calls_connected,
            SUM(CASE WHEN type = 'whatsapp' THEN 1 ELSE 0 END) AS messages,
            SUM(CASE WHEN type IN ('email', 'email_sent') THEN 1 ELSE 0 END) AS emails,
+           SUM(CASE WHEN type = 'email_followup' THEN 1 ELSE 0 END) AS email_followups,
            SUM(CASE WHEN type = 'note' THEN 1 ELSE 0 END) AS notes,
-           SUM(CASE WHEN type = 'linkedin' THEN 1 ELSE 0 END) AS linkedin,
-           SUM(CASE WHEN type IN ('call','whatsapp','email','email_sent','linkedin','note') THEN 1 ELSE 0 END) AS total_outreach,
-           COUNT(DISTINCT CASE WHEN type IN ('call','whatsapp','email','email_sent','linkedin','note','reply') THEN lead_id END) AS leads_touched
+           SUM(CASE WHEN type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply') THEN 1 ELSE 0 END) AS linkedin,
+           SUM(CASE WHEN type = 'linkedin_connection_sent' THEN 1 ELSE 0 END) AS linkedin_connection_sent,
+           SUM(CASE WHEN type = 'linkedin_message' THEN 1 ELSE 0 END) AS linkedin_messages,
+           SUM(CASE WHEN type = 'linkedin_reply' THEN 1 ELSE 0 END) AS linkedin_replies,
+           SUM(CASE WHEN type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings,
+           SUM(CASE WHEN type IN ('reply','linkedin_reply') THEN 1 ELSE 0 END) AS replies,
+           SUM(CASE WHEN type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','note') THEN 1 ELSE 0 END) AS total_outreach,
+           COUNT(DISTINCT CASE WHEN type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','note','reply','linkedin_reply') THEN lead_id END) AS leads_touched
          FROM lead_activities
          WHERE user_id IS NOT NULL
            AND ${DT('created_at')} >= datetime(?)
@@ -555,10 +633,11 @@ router.get(
     const statusMoves = db
       .prepare(
         `SELECT user_id,
-           SUM(CASE WHEN outcome = 'conversation' OR summary LIKE '%→ conversation%' OR summary LIKE '%to conversation%' THEN 1 ELSE 0 END) AS to_conversation,
-           SUM(CASE WHEN outcome = 'demo_booked' OR summary LIKE '%→ demo_booked%' OR summary LIKE '%to demo_booked%' THEN 1 ELSE 0 END) AS to_demo,
-           SUM(CASE WHEN outcome = 'trial' OR summary LIKE '%→ trial%' OR summary LIKE '%to trial%' THEN 1 ELSE 0 END) AS to_trial,
-           SUM(CASE WHEN outcome = 'paid' OR summary LIKE '%→ paid%' OR summary LIKE '%to paid%' THEN 1 ELSE 0 END) AS to_paid,
+           SUM(CASE WHEN outcome IN ('engaged','conversation') OR summary LIKE '%→ engaged%' OR summary LIKE '%→ conversation%' THEN 1 ELSE 0 END) AS to_engaged,
+           SUM(CASE WHEN outcome = 'contacted' OR summary LIKE '%→ contacted%' THEN 1 ELSE 0 END) AS to_contacted,
+           SUM(CASE WHEN outcome IN ('demo_scheduled','demo_booked') OR summary LIKE '%→ demo_scheduled%' OR summary LIKE '%→ demo_booked%' THEN 1 ELSE 0 END) AS to_demo,
+           SUM(CASE WHEN outcome = 'trial' OR summary LIKE '%→ trial%' THEN 1 ELSE 0 END) AS to_trial,
+           SUM(CASE WHEN outcome IN ('paid','repeat') OR summary LIKE '%→ paid%' THEN 1 ELSE 0 END) AS to_paid,
            SUM(CASE WHEN type = 'status_change' THEN 1 ELSE 0 END) AS status_changes
          FROM lead_activities
          WHERE user_id IS NOT NULL
@@ -638,13 +717,23 @@ router.get(
         leadsCsv: num(a.leads_csv),
         leadsAdded,
         calls: num(act.calls),
+        callsAttempted: num(act.calls_attempted),
+        callsConnected: num(act.calls_connected),
         messages: num(act.messages),
         emails: num(act.emails),
+        emailFollowups: num(act.email_followups),
         notes: num(act.notes),
         linkedin: num(act.linkedin),
+        linkedinConnectionSent: num(act.linkedin_connection_sent),
+        linkedinMessages: num(act.linkedin_messages),
+        linkedinReplies: num(act.linkedin_replies),
+        meetings: num(act.meetings),
+        replies: num(act.replies),
         totalOutreach: num(act.total_outreach),
         leadsTouched,
-        toConversation: num(mv.to_conversation),
+        toContacted: num(mv.to_contacted),
+        toEngaged: num(mv.to_engaged),
+        toConversation: num(mv.to_engaged),
         toDemo: num(mv.to_demo),
         toTrial: num(mv.to_trial),
         toPaid: num(mv.to_paid),
@@ -672,13 +761,23 @@ router.get(
       leadsCsv: sumField('leadsCsv'),
       leadsAdded: sumField('leadsAdded'),
       calls: sumField('calls'),
+      callsAttempted: sumField('callsAttempted'),
+      callsConnected: sumField('callsConnected'),
       messages: sumField('messages'),
       emails: sumField('emails'),
+      emailFollowups: sumField('emailFollowups'),
       notes: sumField('notes'),
       linkedin: sumField('linkedin'),
+      linkedinConnectionSent: sumField('linkedinConnectionSent'),
+      linkedinMessages: sumField('linkedinMessages'),
+      linkedinReplies: sumField('linkedinReplies'),
+      meetings: sumField('meetings'),
+      replies: sumField('replies'),
       totalOutreach: sumField('totalOutreach'),
       leadsTouched: sumField('leadsTouched'),
-      toConversation: sumField('toConversation'),
+      toContacted: sumField('toContacted'),
+      toEngaged: sumField('toEngaged'),
+      toConversation: sumField('toEngaged'),
       toDemo: sumField('toDemo'),
       toTrial: sumField('toTrial'),
       paid: sumField('paid'),

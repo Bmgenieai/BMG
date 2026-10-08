@@ -36,7 +36,7 @@ export function migrate() {
       company TEXT,
       country TEXT,
       source TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'qualified',
+      status TEXT NOT NULL DEFAULT 'uncontacted',
       assigned_to TEXT REFERENCES users(id) ON DELETE SET NULL,
       assigned_at TEXT,
       assigned_by TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -185,6 +185,13 @@ export function migrate() {
     `ALTER TABLE leads ADD COLUMN last_email_opened_at TEXT`,
     `ALTER TABLE leads ADD COLUMN last_email_replied_at TEXT`,
     `ALTER TABLE leads ADD COLUMN archived_at TEXT`,
+    `ALTER TABLE leads ADD COLUMN last_contacted_at TEXT`,
+    `ALTER TABLE leads ADD COLUMN linkedin_connection_sent INTEGER DEFAULT 0`,
+    `ALTER TABLE leads ADD COLUMN linkedin_connection_accepted INTEGER DEFAULT 0`,
+    `ALTER TABLE leads ADD COLUMN linkedin_messages_sent INTEGER DEFAULT 0`,
+    `ALTER TABLE leads ADD COLUMN linkedin_replies INTEGER DEFAULT 0`,
+    `ALTER TABLE leads ADD COLUMN linkedin_followups_sent INTEGER DEFAULT 0`,
+    `ALTER TABLE leads ADD COLUMN linkedin_meetings INTEGER DEFAULT 0`,
   ];
   for (const sql of leadAlters) {
     try {
@@ -347,22 +354,56 @@ export function migrate() {
     }
   }
 
-  // One-time: legacy disposition → sales funnel stages
-  const statusMigrates = [
-    [`UPDATE leads SET status = 'qualified' WHERE status IN ('new','contacted')`, 'qualified'],
-    [
+  // Schema meta for one-time data migrations
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  const metaGet = db.prepare(`SELECT value FROM schema_meta WHERE key = ?`);
+  const metaSet = db.prepare(
+    `INSERT INTO schema_meta (key, value, updated_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+  );
+
+  // One-time: oldest dispositions → prior funnel stages
+  if (!metaGet.get('status_funnel_v1')?.value) {
+    const v1 = [
+      `UPDATE leads SET status = 'qualified' WHERE status IN ('new')`,
       `UPDATE leads SET status = 'conversation' WHERE status IN ('interested','neutral','follow_up_scheduled')`,
-      'conversation',
-    ],
-    [`UPDATE leads SET status = 'lost' WHERE status = 'not_interested'`, 'lost'],
-    [`UPDATE leads SET status = 'paid' WHERE status = 'converted'`, 'paid'],
-  ];
-  for (const [sql] of statusMigrates) {
-    try {
-      db.exec(sql);
-    } catch {
-      /* ignore */
+      `UPDATE leads SET status = 'lost' WHERE status = 'not_interested'`,
+      `UPDATE leads SET status = 'paid' WHERE status = 'converted'`,
+    ];
+    for (const sql of v1) {
+      try {
+        db.exec(sql);
+      } catch {
+        /* ignore */
+      }
     }
+    metaSet.run('status_funnel_v1', '1');
+  }
+
+  // One-time: prior funnel → conversion funnel (unique-lead stages)
+  // Must NOT re-run: new mid-funnel "qualified" must stay qualified.
+  if (!metaGet.get('status_funnel_v2')?.value) {
+    const v2 = [
+      `UPDATE leads SET status = 'uncontacted' WHERE status = 'qualified'`,
+      `UPDATE leads SET status = 'engaged' WHERE status = 'conversation'`,
+      `UPDATE leads SET status = 'demo_scheduled' WHERE status = 'demo_booked'`,
+      `UPDATE leads SET status = 'nurture' WHERE status = 'lost'`,
+    ];
+    for (const sql of v2) {
+      try {
+        db.exec(sql);
+      } catch {
+        /* ignore */
+      }
+    }
+    metaSet.run('status_funnel_v2', '1');
   }
 }
 

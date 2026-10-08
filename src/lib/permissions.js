@@ -126,54 +126,84 @@ export const LEAD_SOURCES = {
 };
 
 /**
- * Sales funnel stages (queues).
- * Outreach (email / LinkedIn / call / reply) is logged as activities; rates live on Funnel dashboard.
+ * Conversion funnel — unique leads, one current stage each.
+ * Activities (emails, LinkedIn, calls) are counted separately.
  */
 export const LEAD_STATUSES = [
+  'uncontacted',
+  'contacted',
+  'engaged',
   'qualified',
-  'conversation',
-  'demo_booked',
+  'demo_scheduled',
+  'challenge_offered',
+  'challenge_accepted',
   'trial',
   'paid',
-  'lost',
+  'repeat',
+  'nurture',
 ];
 
-/** Map legacy disposition statuses → funnel stages (read + one-time migrate). */
+/** Map legacy / previous funnel labels → current stages. */
 export const LEGACY_STATUS_MAP = {
-  new: 'qualified',
-  contacted: 'qualified',
-  interested: 'conversation',
-  neutral: 'conversation',
-  follow_up_scheduled: 'conversation',
-  not_interested: 'lost',
+  // Previous CRM funnel
+  conversation: 'engaged',
+  demo_booked: 'demo_scheduled',
+  lost: 'nurture',
+  // Older dispositions
+  new: 'uncontacted',
+  interested: 'engaged',
+  neutral: 'engaged',
+  follow_up_scheduled: 'contacted',
+  not_interested: 'nurture',
   converted: 'paid',
+  // Email-style labels (UI filters)
+  not_contacted: 'uncontacted',
+  email_sent: 'contacted',
+  replied: 'engaged',
+  bounced: 'nurture',
 };
 
 export const STATUS_LABELS = {
+  uncontacted: 'New / Uncontacted',
+  contacted: 'Contacted',
+  engaged: 'Engaged / Replied',
   qualified: 'Qualified',
-  conversation: 'Conversation',
-  demo_booked: 'Demo booked',
-  trial: 'Trial',
-  paid: 'Paid',
-  lost: 'Lost',
-  // legacy labels (pre-migration reads)
-  new: 'Qualified',
-  contacted: 'Qualified',
-  interested: 'Conversation',
-  neutral: 'Conversation',
-  follow_up_scheduled: 'Conversation',
-  not_interested: 'Lost',
-  converted: 'Paid',
+  demo_scheduled: 'Demo scheduled',
+  challenge_offered: 'Shoot Challenge offered',
+  challenge_accepted: 'Shoot Challenge accepted',
+  trial: 'Test completed',
+  paid: 'Paid customer',
+  repeat: 'Repeat / expanded',
+  nurture: 'Nurture / Disqualified',
+  // legacy display
+  conversation: 'Engaged / Replied',
+  demo_booked: 'Demo scheduled',
+  lost: 'Nurture / Disqualified',
+  new: 'New / Uncontacted',
+  interested: 'Engaged / Replied',
+  converted: 'Paid customer',
 };
 
 /** Sidebar status tabs → URL slug under /leads/:filter */
 export const LEAD_STATUS_TABS = [
+  { slug: 'uncontacted', status: 'uncontacted', label: 'Uncontacted' },
+  { slug: 'contacted', status: 'contacted', label: 'Contacted' },
+  { slug: 'engaged', status: 'engaged', label: 'Engaged' },
   { slug: 'qualified', status: 'qualified', label: 'Qualified' },
-  { slug: 'conversation', status: 'conversation', label: 'Conversation' },
-  { slug: 'demo-booked', status: 'demo_booked', label: 'Demo booked' },
-  { slug: 'trial', status: 'trial', label: 'Trial' },
+  { slug: 'demo-scheduled', status: 'demo_scheduled', label: 'Demo scheduled' },
+  { slug: 'challenge-offered', status: 'challenge_offered', label: 'Challenge offered' },
+  { slug: 'challenge-accepted', status: 'challenge_accepted', label: 'Challenge accepted' },
+  { slug: 'trial', status: 'trial', label: 'Test completed' },
   { slug: 'paid', status: 'paid', label: 'Paid' },
-  { slug: 'lost', status: 'lost', label: 'Lost' },
+  { slug: 'repeat', status: 'repeat', label: 'Repeat' },
+  { slug: 'nurture', status: 'nurture', label: 'Nurture / DQ' },
+];
+
+/** Legacy URL slugs still resolve via resolveLeadFilter. */
+export const LEGACY_STATUS_TABS = [
+  { slug: 'conversation', status: 'engaged', label: 'Engaged' },
+  { slug: 'demo-booked', status: 'demo_scheduled', label: 'Demo scheduled' },
+  { slug: 'lost', status: 'nurture', label: 'Nurture / DQ' },
 ];
 
 export const LOST_REASONS = [
@@ -187,14 +217,34 @@ export const LOST_REASONS = [
   'Other',
 ];
 
+/** Activity types — counts as work done, not unique funnel opportunities. */
 export const ACTIVITY_TYPES = [
   'call',
+  'call_attempted',
+  'call_connected',
   'email',
+  'email_sent',
+  'email_followup',
   'linkedin',
+  'linkedin_connection_sent',
+  'linkedin_connection_accepted',
+  'linkedin_message',
+  'linkedin_reply',
+  'linkedin_followup',
+  'meeting_scheduled',
   'reply',
   'demo_shown',
   'note',
   'whatsapp',
+];
+
+export const LINKEDIN_ACTIVITY_TYPES = [
+  'linkedin_connection_sent',
+  'linkedin_connection_accepted',
+  'linkedin_message',
+  'linkedin_reply',
+  'linkedin_followup',
+  'meeting_scheduled',
 ];
 
 export const REPLY_OUTCOMES = ['positive', 'negative', 'neutral', 'no_reply'];
@@ -208,11 +258,35 @@ export const PRODUCT_LEAD_TABS = [
   { slug: 'revisions', source: 'revision_requested', label: 'Asked for revisions' },
 ];
 
-export const OPEN_STATUSES = ['qualified', 'conversation', 'demo_booked', 'trial'];
-export const END_STATUSES = ['paid', 'lost'];
+export const OPEN_STATUSES = [
+  'uncontacted',
+  'contacted',
+  'engaged',
+  'qualified',
+  'demo_scheduled',
+  'challenge_offered',
+  'challenge_accepted',
+  'trial',
+];
+
+export const END_STATUSES = ['paid', 'repeat', 'nurture'];
+
+/** Stages that should stop automated email sequences. */
+export const STOP_OUTREACH_STATUSES = [
+  'engaged',
+  'qualified',
+  'demo_scheduled',
+  'challenge_offered',
+  'challenge_accepted',
+  'trial',
+  'paid',
+  'repeat',
+  'nurture',
+];
 
 export function normalizeStatus(status) {
   if (!status) return status;
+  if (LEAD_STATUSES.includes(status)) return status;
   return LEGACY_STATUS_MAP[status] || status;
 }
 
@@ -223,7 +297,9 @@ export function statusLabel(status) {
 
 export function resolveLeadFilter(slug) {
   if (!slug) return {};
-  const statusTab = LEAD_STATUS_TABS.find((t) => t.slug === slug);
+  const statusTab =
+    LEAD_STATUS_TABS.find((t) => t.slug === slug) ||
+    LEGACY_STATUS_TABS.find((t) => t.slug === slug);
   if (statusTab) {
     if (statusTab.statuses) return { statuses: statusTab.statuses };
     return { status: statusTab.status };

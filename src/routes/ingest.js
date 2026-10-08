@@ -103,7 +103,7 @@ function insertLead({
   bmgenieUserId,
   estimatedValue,
   notes,
-  status = 'qualified',
+  status = 'uncontacted',
   metadata,
 }) {
   const id = uuid();
@@ -354,7 +354,13 @@ function upsertDemoBooking({
         country: country ?? existing.country,
         bmgenie_user_id: bmgenieUserId || existing.bmgenie_user_id,
         source: existing.source === 'demo_booking' ? existing.source : existing.source,
-        status: existing.status === 'paid' || existing.status === 'lost' ? existing.status : 'demo_booked',
+        status:
+          existing.status === 'paid' ||
+          existing.status === 'repeat' ||
+          existing.status === 'nurture' ||
+          existing.status === 'lost'
+            ? existing.status
+            : 'demo_scheduled',
         notes: notes || `Demo booked for ${meta.scheduledAt || 'scheduled time'}`,
         estimated_value: estimatedValue ?? existing.estimated_value ?? 65,
         metadata: meta,
@@ -362,7 +368,7 @@ function upsertDemoBooking({
       `Demo booked — ${meta.scheduledAt || 'Calendly'}`,
     );
     // Prefer demo_booking source when moving into demo queue
-    if (lead.status === 'demo_booked') {
+    if (lead.status === 'demo_scheduled' || lead.status === 'demo_booked') {
       lead = updateLead(lead.id, { source: 'demo_booking' }, null);
     }
     action = 'updated';
@@ -377,7 +383,7 @@ function upsertDemoBooking({
       bmgenieUserId,
       estimatedValue: estimatedValue ?? 65,
       notes: notes || `Demo booked for ${meta.scheduledAt || 'scheduled time'}`,
-      status: 'demo_booked',
+      status: 'demo_scheduled',
       metadata: meta,
     });
     action = 'created';

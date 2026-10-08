@@ -12,6 +12,7 @@ import {
   STATUS_LABELS,
   LOST_REASONS,
   ACTIVITY_TYPES,
+  LINKEDIN_ACTIVITY_TYPES,
   REPLY_OUTCOMES,
   normalizeStatus,
   canAccessLead,
@@ -19,6 +20,11 @@ import {
 } from '../lib/permissions.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
 import { getLeadEmailHistory } from '../lib/emailLog.js';
+import {
+  touchLeadContacted,
+  onLeadReply,
+  advanceLeadStage,
+} from '../lib/leadAutomation.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const router = Router();
@@ -216,6 +222,9 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     importBatchId,
     dateAddedFrom,
     dateAddedTo,
+    followUpDue,
+    followUpFrom,
+    followUpTo,
   } = req.query;
   const clauses = [];
   const params = [];
@@ -288,6 +297,27 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     params.push(String(dateAddedTo));
   }
 
+  const fuDue = String(followUpDue || '').toLowerCase();
+  if (fuDue === 'today') {
+    clauses.push(`l.next_follow_up_at IS NOT NULL AND date(l.next_follow_up_at) = date('now')`);
+  } else if (fuDue === 'overdue') {
+    clauses.push(
+      `l.next_follow_up_at IS NOT NULL AND datetime(REPLACE(REPLACE(l.next_follow_up_at,'T',' '),'Z','')) < datetime('now')`,
+    );
+  } else if (fuDue === 'upcoming') {
+    clauses.push(
+      `l.next_follow_up_at IS NOT NULL AND datetime(REPLACE(REPLACE(l.next_follow_up_at,'T',' '),'Z','')) >= datetime('now')`,
+    );
+  }
+  if (followUpFrom) {
+    clauses.push(`l.next_follow_up_at IS NOT NULL AND date(l.next_follow_up_at) >= date(?)`);
+    params.push(String(followUpFrom));
+  }
+  if (followUpTo) {
+    clauses.push(`l.next_follow_up_at IS NOT NULL AND date(l.next_follow_up_at) <= date(?)`);
+    params.push(String(followUpTo));
+  }
+
   const cohortPred = cohortSql(
     'COALESCE(l.signed_up_at, l.created_at)',
     cohortRaw,
@@ -301,6 +331,84 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   const where = clauses.length ? clauses.join(' AND ') : '1=1';
   res.json(leadSelect(where, params));
 });
+
+/** Bulk update status and/or next follow-up for many leads. */
+router.post(
+  '/bulk',
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    const { ids, status: rawStatus, next_follow_up_at, lost_reason } = req.body || {};
+    const idList = Array.isArray(ids) ? ids.map(String).filter(Boolean) : [];
+    if (!idList.length) return res.status(400).json({ error: 'ids required' });
+    if (idList.length > 200) return res.status(400).json({ error: 'Max 200 leads per bulk update' });
+
+    const status = rawStatus ? normalizeStatus(rawStatus) : undefined;
+    if (status && !LEAD_STATUSES.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status', allowed: LEAD_STATUSES });
+    }
+    if (status === 'nurture' || status === 'lost') {
+      if (!lost_reason || !String(lost_reason).trim()) {
+        return res.status(400).json({
+          error: 'lost_reason required when marking nurture / disqualified',
+          allowed: LOST_REASONS,
+        });
+      }
+    }
+    if (status == null && next_follow_up_at === undefined) {
+      return res.status(400).json({ error: 'Provide status and/or next_follow_up_at' });
+    }
+
+    const canAny = roleHasPermission(req.user.role, 'leads:update_any');
+    let updated = 0;
+    const skipped = [];
+
+    const tx = db.transaction(() => {
+      for (const id of idList) {
+        const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(id);
+        if (!lead) {
+          skipped.push({ id, reason: 'not_found' });
+          continue;
+        }
+        if (!canAny && lead.assigned_to !== req.user.id && lead.created_by !== req.user.id) {
+          skipped.push({ id, reason: 'permission' });
+          continue;
+        }
+
+        const nextStatus = status === 'lost' ? 'nurture' : status;
+        if (nextStatus && nextStatus !== lead.status) {
+          advanceLeadStage(id, nextStatus, { userId: req.user.id, force: true });
+          if ((nextStatus === 'nurture' || status === 'lost') && lost_reason) {
+            db.prepare(`UPDATE leads SET lost_reason = ? WHERE id = ?`).run(
+              String(lost_reason).trim(),
+              id,
+            );
+          }
+        }
+        if (next_follow_up_at !== undefined) {
+          db.prepare(
+            `UPDATE leads SET next_follow_up_at = ?, updated_at = datetime('now') WHERE id = ?`,
+          ).run(next_follow_up_at || null, id);
+          if (next_follow_up_at) {
+            db.prepare(
+              `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, next_follow_up_at)
+               VALUES (?, ?, ?, 'note', ?, ?)`,
+            ).run(
+              uuid(),
+              id,
+              req.user.id,
+              `Next follow-up set (bulk)`,
+              next_follow_up_at,
+            );
+          }
+        }
+        updated += 1;
+      }
+    });
+    tx();
+
+    res.json({ updated, skipped, total: idList.length });
+  },
+);
 
 router.get('/:id', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
   const lead = getLeadWithJoins(req.params.id);
@@ -380,7 +488,7 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
       id, name, email, phone, company, country, state, job_title, industry, contact_format,
       source, status, notes, estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by,
       date_added
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'qualified', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     nameTrim,
@@ -435,13 +543,17 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     next_follow_up_at,
   } = req.body || {};
 
-  if (status && !LEAD_STATUSES.includes(status)) {
+  const nextStatus = status ? normalizeStatus(status) : undefined;
+  if (nextStatus && !LEAD_STATUSES.includes(nextStatus)) {
     return res.status(400).json({ error: 'Invalid status', allowed: LEAD_STATUSES });
   }
-  if (status === 'lost') {
+  if (nextStatus === 'nurture' || status === 'lost') {
     const reason = lost_reason !== undefined ? lost_reason : lead.lost_reason;
     if (!reason || !String(reason).trim()) {
-      return res.status(400).json({ error: 'lost_reason required when marking lost', allowed: LOST_REASONS });
+      return res.status(400).json({
+        error: 'lost_reason required when marking nurture / disqualified',
+        allowed: LOST_REASONS,
+      });
     }
   }
   if (contact_format != null && !CONTACT_FORMATS.includes(contact_format)) {
@@ -452,7 +564,9 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
   }
 
   const convertedAt =
-    status === 'paid' && lead.status !== 'paid'
+    (nextStatus === 'paid' || nextStatus === 'repeat') &&
+    lead.status !== 'paid' &&
+    lead.status !== 'repeat'
       ? new Date().toISOString()
       : lead.converted_at;
 
@@ -485,7 +599,7 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     job_title !== undefined ? job_title : null,
     industry !== undefined ? String(industry).trim() : null,
     contact_format ?? null,
-    status ?? null,
+    nextStatus ?? null,
     notes !== undefined ? notes : null,
     estimated_value !== undefined ? Number(estimated_value) : null,
     lost_reason !== undefined ? lost_reason : null,
@@ -494,11 +608,11 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     lead.id,
   );
 
-  if (status && status !== lead.status) {
+  if (nextStatus && nextStatus !== lead.status) {
     db.prepare(
       `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, outcome)
        VALUES (?, ?, ?, 'status_change', ?, ?)`,
-    ).run(uuid(), lead.id, req.user.id, `Status: ${lead.status} → ${status}`, status);
+    ).run(uuid(), lead.id, req.user.id, `Status: ${lead.status} → ${nextStatus}`, nextStatus);
   }
 
   res.json(getLeadWithJoins(lead.id));
@@ -513,19 +627,14 @@ router.post(
     const { type = 'note', summary, outcome, next_follow_up_at, status: rawStatus } = req.body || {};
     if (!summary) return res.status(400).json({ error: 'summary required' });
 
+    const allowedTypes = new Set([...ACTIVITY_TYPES, 'created', 'status_change', ...LINKEDIN_ACTIVITY_TYPES]);
+    if (!allowedTypes.has(type)) {
+      return res.status(400).json({ error: 'Invalid activity type', allowed: [...allowedTypes] });
+    }
+
     let status = rawStatus ? normalizeStatus(rawStatus) : undefined;
     if (status && !LEAD_STATUSES.includes(status)) {
       return res.status(400).json({ error: 'Invalid status', allowed: LEAD_STATUSES });
-    }
-
-    // Auto-advance: positive reply → conversation (if still qualified)
-    if (
-      !status &&
-      type === 'reply' &&
-      outcome === 'positive' &&
-      (lead.status === 'qualified' || lead.status === 'new' || lead.status === 'contacted')
-    ) {
-      status = 'conversation';
     }
 
     const actId = uuid();
@@ -534,29 +643,56 @@ router.post(
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(actId, lead.id, req.user.id, type, summary, outcome || null, next_follow_up_at || null);
 
-    if (next_follow_up_at || status) {
-      const paidAt =
-        status === 'paid' && lead.status !== 'paid' ? new Date().toISOString() : lead.converted_at;
+    // LinkedIn metric counters on the lead
+    const liBump = {
+      linkedin_connection_sent: 'linkedin_connection_sent',
+      linkedin_connection_accepted: 'linkedin_connection_accepted',
+      linkedin_message: 'linkedin_messages_sent',
+      linkedin_reply: 'linkedin_replies',
+      linkedin_followup: 'linkedin_followups_sent',
+      meeting_scheduled: 'linkedin_meetings',
+    };
+    if (liBump[type]) {
       db.prepare(
-        `UPDATE leads SET
-          next_follow_up_at = COALESCE(?, next_follow_up_at),
-          status = COALESCE(?, status),
-          converted_at = COALESCE(?, converted_at),
-          updated_at = datetime('now')
-         WHERE id = ?`,
-      ).run(next_follow_up_at || null, status || null, paidAt || null, lead.id);
+        `UPDATE leads SET ${liBump[type]} = COALESCE(${liBump[type]}, 0) + 1, updated_at = datetime('now') WHERE id = ?`,
+      ).run(lead.id);
+    }
 
-      if (status && status !== lead.status) {
-        db.prepare(
-          `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, outcome)
-           VALUES (?, ?, ?, 'status_change', ?, ?)`,
-        ).run(uuid(), lead.id, req.user.id, `Status: ${lead.status} → ${status}`, status);
-      }
+    const outreachTypes = new Set([
+      'call',
+      'call_attempted',
+      'call_connected',
+      'email',
+      'email_sent',
+      'email_followup',
+      'linkedin',
+      'linkedin_connection_sent',
+      'linkedin_message',
+      'linkedin_followup',
+      'whatsapp',
+    ]);
+    if (outreachTypes.has(type)) {
+      touchLeadContacted(lead.id, { userId: req.user.id });
+    }
+
+    if (type === 'reply' || type === 'linkedin_reply') {
+      onLeadReply(lead.id, { userId: req.user.id });
+    } else if (type === 'meeting_scheduled' && !status) {
+      advanceLeadStage(lead.id, 'demo_scheduled', { userId: req.user.id });
+    } else if (status && status !== lead.status) {
+      advanceLeadStage(lead.id, status, { userId: req.user.id, force: true });
+    }
+
+    if (next_follow_up_at) {
+      db.prepare(
+        `UPDATE leads SET next_follow_up_at = ?, updated_at = datetime('now') WHERE id = ?`,
+      ).run(next_follow_up_at, lead.id);
     }
 
     res.status(201).json(db.prepare(`SELECT * FROM lead_activities WHERE id = ?`).get(actId));
   },
 );
+
 
 /** Company contacts (employees) under a lead */
 router.get(
@@ -715,7 +851,7 @@ router.post(
         id, name, email, phone, company, country, state, job_title, industry, contact_format,
         source, status, notes, estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by,
         date_added
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'qualified', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
     const now = new Date().toISOString();
