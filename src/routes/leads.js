@@ -22,7 +22,11 @@ import {
   roleHasPermission,
 } from '../lib/permissions.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
-import { getLeadEmailHistory } from '../lib/emailLog.js';
+import {
+  getLeadEmailHistory,
+  countEmailReplies,
+  countUnreadEmailReplies,
+} from '../lib/emailLog.js';
 import {
   touchLeadContacted,
   onLeadReply,
@@ -107,6 +111,17 @@ router.get('/meta', (_req, res) => {
     )
     .all();
 
+  const states = db
+    .prepare(
+      `SELECT TRIM(state) AS state, COUNT(*) AS count
+       FROM leads
+       WHERE state IS NOT NULL AND TRIM(state) != ''
+       GROUP BY TRIM(state)
+       ORDER BY count DESC, state COLLATE NOCASE
+       LIMIT 100`,
+    )
+    .all();
+
   res.json({
     sources: Object.values(LEAD_SOURCES),
     statuses: LEAD_STATUSES,
@@ -118,6 +133,7 @@ router.get('/meta', (_req, res) => {
     activityTypes: ACTIVITY_TYPES,
     replyOutcomes: REPLY_OUTCOMES,
     businessTypes: BUSINESS_TYPES,
+    states,
     importBatches,
     emailStatuses: [
       { key: 'sent', label: 'Emailed' },
@@ -187,22 +203,15 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     .prepare(`SELECT COUNT(*) AS c FROM chat_threads WHERE status = 'open'`)
     .get().c;
 
-  let emailRepliesUnread;
-  if (roleHasPermission(req.user.role, 'leads:view_all')) {
-    emailRepliesUnread = db
-      .prepare(`SELECT COUNT(*) AS c FROM email_replies WHERE read_at IS NULL`)
-      .get().c;
-  } else {
-    emailRepliesUnread = db
-      .prepare(
-        `SELECT COUNT(*) AS c
-         FROM email_replies r
-         LEFT JOIN leads l ON l.id = r.lead_id
-         WHERE r.read_at IS NULL
-           AND (l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)`,
-      )
-      .get(req.user.id, req.user.id).c;
-  }
+  const canViewAllReplies = roleHasPermission(req.user.role, 'leads:view_all');
+  const emailRepliesCount = countEmailReplies({
+    user: req.user,
+    canViewAll: canViewAllReplies,
+  });
+  const emailRepliesUnread = countUnreadEmailReplies({
+    user: req.user,
+    canViewAll: canViewAllReplies,
+  });
 
   res.json({
     total,
@@ -211,6 +220,7 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     productCounts,
     demosCount,
     chatsOpen,
+    emailRepliesCount,
     emailRepliesUnread,
     cohort,
     cohortDate: refDate,
@@ -255,6 +265,15 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   if (req.query.business_type) {
     clauses.push('l.business_type = ?');
     params.push(String(req.query.business_type));
+  }
+  if (req.query.state) {
+    const st = String(req.query.state).trim();
+    if (st.toLowerCase() === 'unspecified' || st === '__none__') {
+      clauses.push(`(l.state IS NULL OR TRIM(l.state) = '')`);
+    } else {
+      clauses.push('TRIM(l.state) = ?');
+      params.push(st);
+    }
   }
   if (status) {
     const statuses = String(status).split(',').map((s) => s.trim()).filter(Boolean);

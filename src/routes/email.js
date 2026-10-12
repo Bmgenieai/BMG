@@ -18,6 +18,7 @@ import {
   countEmailReplies,
   countUnreadEmailReplies,
   getEmailReply,
+  getLeadConversation,
   getLeadEmailHistory,
   ingestBrevoInboundEmail,
   ingestBrevoWebhookEvent,
@@ -773,6 +774,23 @@ router.get(
       return res.status(403).json({ error: 'Permission denied' });
     }
     res.json(getLeadEmailHistory(lead.id));
+  },
+);
+
+/** Full chronological conversation for a lead (same as Email replies thread modal). */
+router.get(
+  '/leads/:id/conversation',
+  authRequired,
+  requireAnyPermission('leads:view_all', 'leads:view_own'),
+  (req, res) => {
+    const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(req.params.id);
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    if (!canAccessLead(req.user, lead)) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    const conversation = getLeadConversation(lead.id);
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+    res.json(conversation);
   },
 );
 

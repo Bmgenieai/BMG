@@ -110,6 +110,48 @@ router.get(
       });
     }
 
+    const stateExpr = `CASE WHEN l.state IS NULL OR TRIM(l.state) = '' THEN 'Unspecified' ELSE TRIM(l.state) END`;
+    const leadStateRows = db
+      .prepare(
+        `SELECT ${stateExpr} AS state,
+                COUNT(*) AS leads_count,
+                SUM(CASE WHEN l.status IN ('paid', 'repeat') THEN 1 ELSE 0 END) AS converted
+         FROM leads l
+         WHERE 1=1 ${leadFilter.replace(/\bassigned_to\b/g, 'l.assigned_to')}
+         GROUP BY 1
+         ORDER BY leads_count DESC
+         LIMIT 40`,
+      )
+      .all(...params);
+    const emailStateRows = db
+      .prepare(
+        `SELECT ${stateExpr} AS state, COUNT(*) AS emails_sent
+         FROM email_messages em
+         JOIN leads l ON l.id = em.lead_id
+         WHERE 1=1 ${leadFilter.replace(/\bassigned_to\b/g, 'l.assigned_to')}
+         GROUP BY 1`,
+      )
+      .all(...params);
+    const replyStateRows = db
+      .prepare(
+        `SELECT ${stateExpr} AS state, COUNT(*) AS replies_count
+         FROM email_replies er
+         JOIN leads l ON l.id = er.lead_id
+         WHERE 1=1 ${leadFilter.replace(/\bassigned_to\b/g, 'l.assigned_to')}
+         GROUP BY 1`,
+      )
+      .all(...params);
+    const emailByState = Object.fromEntries(emailStateRows.map((r) => [r.state, r.emails_sent]));
+    const replyByState = Object.fromEntries(replyStateRows.map((r) => [r.state, r.replies_count]));
+    const byState = leadStateRows.map((r) => ({
+      key: r.state === 'Unspecified' ? 'unspecified' : r.state,
+      label: r.state,
+      leadsCount: r.leads_count || 0,
+      emailsSent: emailByState[r.state] || 0,
+      repliesCount: replyByState[r.state] || 0,
+      converted: r.converted || 0,
+    }));
+
     const revenue = db
       .prepare(
         `SELECT
@@ -174,7 +216,7 @@ router.get(
 
     const recentLeads = db
       .prepare(
-        `SELECT id, name, email, source, status, country, created_at, assigned_to
+        `SELECT id, name, email, source, status, country, state, created_at, assigned_to
          FROM leads WHERE 1=1 ${leadFilter}
          ORDER BY created_at DESC LIMIT 8`,
       )
@@ -200,6 +242,7 @@ router.get(
       totals,
       bySource,
       byBusinessType,
+      byState,
       revenue: {
         recorded: revenue.total,
         last30Days: revenue.last_30_days,
@@ -638,6 +681,15 @@ router.get(
       focusUserId = req.user.id;
     }
 
+    const rawState = req.query.state ? String(req.query.state).trim() : '';
+    const stateFilter =
+      !rawState
+        ? ''
+        : rawState.toLowerCase() === 'unspecified'
+          ? ` AND (l.state IS NULL OR TRIM(l.state) = '')`
+          : ` AND TRIM(l.state) = '${rawState.replace(/'/g, "''").slice(0, 64)}'`;
+    const stateLabel = rawState || null;
+
     const reps = canViewTeam
       ? db
           .prepare(
@@ -652,77 +704,83 @@ router.get(
 
     const leadAdds = db
       .prepare(
-        `SELECT created_by AS user_id,
-           SUM(CASE WHEN import_batch_id IS NULL OR import_batch_id = '' THEN 1 ELSE 0 END) AS leads_manual,
-           SUM(CASE WHEN import_batch_id IS NOT NULL AND import_batch_id != '' THEN 1 ELSE 0 END) AS leads_csv,
+        `SELECT l.created_by AS user_id,
+           SUM(CASE WHEN l.import_batch_id IS NULL OR l.import_batch_id = '' THEN 1 ELSE 0 END) AS leads_manual,
+           SUM(CASE WHEN l.import_batch_id IS NOT NULL AND l.import_batch_id != '' THEN 1 ELSE 0 END) AS leads_csv,
            COUNT(*) AS leads_added
-         FROM leads
-         WHERE created_by IS NOT NULL
-           AND ${DT('created_at')} >= datetime(?)
-           AND ${DT('created_at')} < datetime(?)
-         GROUP BY created_by`,
+         FROM leads l
+         WHERE l.created_by IS NOT NULL
+           AND ${DT('l.created_at')} >= datetime(?)
+           AND ${DT('l.created_at')} < datetime(?)
+           ${stateFilter}
+         GROUP BY l.created_by`,
       )
       .all(from, to);
 
     const activityAgg = db
       .prepare(
-        `SELECT user_id,
-           SUM(CASE WHEN type IN ('call','call_attempted','call_connected') THEN 1 ELSE 0 END) AS calls,
-           SUM(CASE WHEN type = 'call_attempted' THEN 1 ELSE 0 END) AS calls_attempted,
-           SUM(CASE WHEN type IN ('call','call_connected') THEN 1 ELSE 0 END) AS calls_connected,
-           SUM(CASE WHEN type = 'whatsapp' THEN 1 ELSE 0 END) AS messages,
-           SUM(CASE WHEN type IN ('email', 'email_sent') THEN 1 ELSE 0 END) AS emails,
-           SUM(CASE WHEN type = 'email_followup' THEN 1 ELSE 0 END) AS email_followups,
-           SUM(CASE WHEN type = 'note' THEN 1 ELSE 0 END) AS notes,
-           SUM(CASE WHEN type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply') THEN 1 ELSE 0 END) AS linkedin,
-           SUM(CASE WHEN type = 'linkedin_connection_sent' THEN 1 ELSE 0 END) AS linkedin_connection_sent,
-           SUM(CASE WHEN type = 'linkedin_message' THEN 1 ELSE 0 END) AS linkedin_messages,
-           SUM(CASE WHEN type = 'linkedin_reply' THEN 1 ELSE 0 END) AS linkedin_replies,
-           SUM(CASE WHEN type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings,
-           SUM(CASE WHEN type IN ('reply','linkedin_reply') THEN 1 ELSE 0 END) AS replies,
-           SUM(CASE WHEN type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','note') THEN 1 ELSE 0 END) AS total_outreach,
-           COUNT(DISTINCT CASE WHEN type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','note','reply','linkedin_reply') THEN lead_id END) AS leads_touched
-         FROM lead_activities
-         WHERE user_id IS NOT NULL
-           AND ${DT('created_at')} >= datetime(?)
-           AND ${DT('created_at')} < datetime(?)
-         GROUP BY user_id`,
+        `SELECT a.user_id,
+           SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected') THEN 1 ELSE 0 END) AS calls,
+           SUM(CASE WHEN a.type = 'call_attempted' THEN 1 ELSE 0 END) AS calls_attempted,
+           SUM(CASE WHEN a.type IN ('call','call_connected') THEN 1 ELSE 0 END) AS calls_connected,
+           SUM(CASE WHEN a.type = 'whatsapp' THEN 1 ELSE 0 END) AS messages,
+           SUM(CASE WHEN a.type IN ('email', 'email_sent') THEN 1 ELSE 0 END) AS emails,
+           SUM(CASE WHEN a.type = 'email_followup' THEN 1 ELSE 0 END) AS email_followups,
+           SUM(CASE WHEN a.type = 'note' THEN 1 ELSE 0 END) AS notes,
+           SUM(CASE WHEN a.type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply') THEN 1 ELSE 0 END) AS linkedin,
+           SUM(CASE WHEN a.type = 'linkedin_connection_sent' THEN 1 ELSE 0 END) AS linkedin_connection_sent,
+           SUM(CASE WHEN a.type = 'linkedin_message' THEN 1 ELSE 0 END) AS linkedin_messages,
+           SUM(CASE WHEN a.type = 'linkedin_reply' THEN 1 ELSE 0 END) AS linkedin_replies,
+           SUM(CASE WHEN a.type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings,
+           SUM(CASE WHEN a.type IN ('reply','linkedin_reply') THEN 1 ELSE 0 END) AS replies,
+           SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','note') THEN 1 ELSE 0 END) AS total_outreach,
+           COUNT(DISTINCT CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','note','reply','linkedin_reply') THEN a.lead_id END) AS leads_touched
+         FROM lead_activities a
+         LEFT JOIN leads l ON l.id = a.lead_id
+         WHERE a.user_id IS NOT NULL
+           AND ${DT('a.created_at')} >= datetime(?)
+           AND ${DT('a.created_at')} < datetime(?)
+           ${stateFilter}
+         GROUP BY a.user_id`,
       )
       .all(from, to);
 
     const statusMoves = db
       .prepare(
-        `SELECT user_id,
-           SUM(CASE WHEN outcome IN ('engaged','conversation') OR summary LIKE '%→ engaged%' OR summary LIKE '%→ conversation%' THEN 1 ELSE 0 END) AS to_engaged,
-           SUM(CASE WHEN outcome = 'contacted' OR summary LIKE '%→ contacted%' THEN 1 ELSE 0 END) AS to_contacted,
-           SUM(CASE WHEN outcome IN ('demo_scheduled','demo_booked') OR summary LIKE '%→ demo_scheduled%' OR summary LIKE '%→ demo_booked%' THEN 1 ELSE 0 END) AS to_demo,
-           SUM(CASE WHEN outcome = 'trial' OR summary LIKE '%→ trial%' THEN 1 ELSE 0 END) AS to_trial,
-           SUM(CASE WHEN outcome IN ('paid','repeat') OR summary LIKE '%→ paid%' THEN 1 ELSE 0 END) AS to_paid,
-           SUM(CASE WHEN type = 'status_change' THEN 1 ELSE 0 END) AS status_changes
-         FROM lead_activities
-         WHERE user_id IS NOT NULL
-           AND type = 'status_change'
-           AND ${DT('created_at')} >= datetime(?)
-           AND ${DT('created_at')} < datetime(?)
-         GROUP BY user_id`,
+        `SELECT a.user_id,
+           SUM(CASE WHEN a.outcome IN ('engaged','conversation') OR a.summary LIKE '%→ engaged%' OR a.summary LIKE '%→ conversation%' THEN 1 ELSE 0 END) AS to_engaged,
+           SUM(CASE WHEN a.outcome = 'contacted' OR a.summary LIKE '%→ contacted%' THEN 1 ELSE 0 END) AS to_contacted,
+           SUM(CASE WHEN a.outcome IN ('demo_scheduled','demo_booked') OR a.summary LIKE '%→ demo_scheduled%' OR a.summary LIKE '%→ demo_booked%' THEN 1 ELSE 0 END) AS to_demo,
+           SUM(CASE WHEN a.outcome = 'trial' OR a.summary LIKE '%→ trial%' THEN 1 ELSE 0 END) AS to_trial,
+           SUM(CASE WHEN a.outcome IN ('paid','repeat') OR a.summary LIKE '%→ paid%' THEN 1 ELSE 0 END) AS to_paid,
+           SUM(CASE WHEN a.type = 'status_change' THEN 1 ELSE 0 END) AS status_changes
+         FROM lead_activities a
+         LEFT JOIN leads l ON l.id = a.lead_id
+         WHERE a.user_id IS NOT NULL
+           AND a.type = 'status_change'
+           AND ${DT('a.created_at')} >= datetime(?)
+           AND ${DT('a.created_at')} < datetime(?)
+           ${stateFilter}
+         GROUP BY a.user_id`,
       )
       .all(from, to);
 
     const paidInPeriod = db
       .prepare(
-        `SELECT assigned_to AS user_id, COUNT(*) AS paid
-         FROM leads
-         WHERE assigned_to IS NOT NULL
-           AND status = 'paid'
+        `SELECT l.assigned_to AS user_id, COUNT(*) AS paid
+         FROM leads l
+         WHERE l.assigned_to IS NOT NULL
+           AND l.status = 'paid'
+           ${stateFilter}
            AND (
-             (${DT('converted_at')} >= datetime(?) AND ${DT('converted_at')} < datetime(?))
+             (${DT('l.converted_at')} >= datetime(?) AND ${DT('l.converted_at')} < datetime(?))
              OR (
-               (converted_at IS NULL OR converted_at = '')
-               AND ${DT('updated_at')} >= datetime(?)
-               AND ${DT('updated_at')} < datetime(?)
+               (l.converted_at IS NULL OR l.converted_at = '')
+               AND ${DT('l.updated_at')} >= datetime(?)
+               AND ${DT('l.updated_at')} < datetime(?)
              )
            )
-         GROUP BY assigned_to`,
+         GROUP BY l.assigned_to`,
       )
       .all(from, to, from, to);
 
@@ -852,13 +910,15 @@ router.get(
       feed = db
         .prepare(
           `SELECT a.id, a.type, a.summary, a.outcome, a.created_at,
-                  a.lead_id, l.name AS lead_name, l.email AS lead_email, l.status AS lead_status
+                  a.lead_id, l.name AS lead_name, l.email AS lead_email, l.status AS lead_status,
+                  l.state AS lead_state
            FROM lead_activities a
            LEFT JOIN leads l ON l.id = a.lead_id
            WHERE a.user_id = ?
              AND ${DT('a.created_at')} >= datetime(?)
              AND ${DT('a.created_at')} < datetime(?)
              AND a.type IN ('call','whatsapp','email','email_sent','note','linkedin','reply','status_change')
+             ${stateFilter}
            ORDER BY a.created_at DESC
            LIMIT 100`,
         )
@@ -866,12 +926,13 @@ router.get(
 
       leadsCreated = db
         .prepare(
-          `SELECT id, name, email, company, source, status, import_batch_id, created_at
-           FROM leads
-           WHERE created_by = ?
-             AND ${DT('created_at')} >= datetime(?)
-             AND ${DT('created_at')} < datetime(?)
-           ORDER BY created_at DESC
+          `SELECT l.id, l.name, l.email, l.company, l.source, l.status, l.state, l.import_batch_id, l.created_at
+           FROM leads l
+           WHERE l.created_by = ?
+             AND ${DT('l.created_at')} >= datetime(?)
+             AND ${DT('l.created_at')} < datetime(?)
+             ${stateFilter}
+           ORDER BY l.created_at DESC
            LIMIT 100`,
         )
         .all(detailId, from, to)
@@ -881,12 +942,48 @@ router.get(
         }));
     }
 
+    // byState is always unfiltered so CEO can pick any state from the dropdown
+    const stateKeyExpr = `CASE WHEN l.state IS NULL OR TRIM(l.state) = '' THEN 'Unspecified' ELSE TRIM(l.state) END`;
+    const byState = canViewTeam
+      ? db
+          .prepare(
+            `SELECT ${stateKeyExpr} AS state,
+                    COUNT(DISTINCT a.lead_id) AS leads_touched,
+                    SUM(CASE WHEN a.type IN ('email','email_sent','email_followup') THEN 1 ELSE 0 END) AS emails,
+                    SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected') THEN 1 ELSE 0 END) AS calls,
+                    SUM(CASE WHEN a.type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply') THEN 1 ELSE 0 END) AS linkedin,
+                    SUM(CASE WHEN a.type IN ('reply','linkedin_reply') THEN 1 ELSE 0 END) AS replies,
+                    COUNT(*) AS activities
+             FROM lead_activities a
+             JOIN leads l ON l.id = a.lead_id
+             WHERE a.user_id IS NOT NULL
+               AND ${DT('a.created_at')} >= datetime(?)
+               AND ${DT('a.created_at')} < datetime(?)
+             GROUP BY 1
+             ORDER BY emails DESC, leads_touched DESC, activities DESC
+             LIMIT 50`,
+          )
+          .all(from, to)
+          .map((r) => ({
+            key: r.state === 'Unspecified' ? 'unspecified' : r.state,
+            label: r.state,
+            leadsTouched: Number(r.leads_touched) || 0,
+            emails: Number(r.emails) || 0,
+            calls: Number(r.calls) || 0,
+            linkedin: Number(r.linkedin) || 0,
+            replies: Number(r.replies) || 0,
+            activities: Number(r.activities) || 0,
+          }))
+      : [];
+
     res.json({
       ...bounds,
       canViewTeam,
       focusUserId: detailId,
+      state: stateLabel,
       reps: repRows,
       totals,
+      byState,
       feed,
       leadsCreated,
     });
@@ -943,6 +1040,12 @@ router.get(
     const stage = req.query.stage ? String(req.query.stage).trim() : null;
     const businessType = req.query.businessType ? String(req.query.businessType).trim() : null;
     const reason = req.query.reason ? String(req.query.reason).trim() : null;
+    const stateQ = req.query.state ? String(req.query.state).trim() : null;
+    const stateClause = !stateQ
+      ? ''
+      : stateQ.toLowerCase() === 'unspecified'
+        ? " AND (l.state IS NULL OR TRIM(l.state) = '')"
+        : ` AND TRIM(l.state) = '${stateQ.replace(/'/g, "''").slice(0, 64)}'`;
     const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 500);
 
     const win = (col) =>
@@ -953,7 +1056,50 @@ router.get(
     let items = [];
     let title = 'Records';
 
-    if (
+    if (metric === 'by_state' || metric === 'state') {
+      const st = stateQ || req.query.type;
+      title = `Leads in ${st || 'state'}`;
+      const typeFilter =
+        !st || st.toLowerCase() === 'unspecified'
+          ? " AND (l.state IS NULL OR TRIM(l.state) = '')"
+          : ` AND TRIM(l.state) = '${String(st).replace(/'/g, "''").slice(0, 64)}'`;
+      const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type, l.state,
+                  l.created_at AS date, l.notes,
+                  u.name AS assigned_to_name,
+                  u.name AS user_name
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.assigned_to
+           WHERE 1=1 ${typeFilter} ${uClause}
+           ORDER BY l.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'emails_by_state') {
+      const st = stateQ || req.query.type;
+      title = `Emails to ${st || 'state'}`;
+      const typeFilter =
+        !st || st.toLowerCase() === 'unspecified'
+          ? " AND (l.state IS NULL OR TRIM(l.state) = '')"
+          : ` AND TRIM(l.state) = '${String(st).replace(/'/g, "''").slice(0, 64)}'`;
+      items = db
+        .prepare(
+          `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
+                  m.open_count, m.reply_count,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type, l.state,
+                  u.name AS user_name
+           FROM email_messages m
+           JOIN leads l ON l.id = m.lead_id
+           LEFT JOIN users u ON u.id = m.user_id
+           WHERE 1=1 ${typeFilter} ${win('m.sent_at')}
+           ORDER BY m.sent_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (
       metric === 'leads_added' ||
       metric === 'leads' ||
       metric === 'leads_manual' ||
@@ -978,7 +1124,7 @@ router.get(
 
       items = db
         .prepare(
-          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type, l.state,
                   COALESCE(l.date_added, l.created_at) AS date,
                   l.created_at, l.notes,
                   u.name AS assigned_to_name,
@@ -988,7 +1134,7 @@ router.get(
            LEFT JOIN users u ON u.id = l.assigned_to
            LEFT JOIN users c ON c.id = l.created_by
            LEFT JOIN import_batches b ON b.id = l.import_batch_id
-           WHERE 1=1 ${win('l.created_at')} ${uClause} ${filter}
+           WHERE 1=1 ${win('l.created_at')} ${uClause} ${filter} ${stateClause}
            ORDER BY l.created_at DESC
            LIMIT ?`,
         )
@@ -999,7 +1145,7 @@ router.get(
       const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
       items = db
         .prepare(
-          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type, l.state,
                   l.created_at AS date, l.notes,
                   u.name AS assigned_to_name,
                   u.name AS user_name
@@ -1015,7 +1161,7 @@ router.get(
       const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
       items = db
         .prepare(
-          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type, l.state,
                   l.created_at AS date, l.notes,
                   u.name AS assigned_to_name,
                   u.name AS user_name
@@ -1031,7 +1177,7 @@ router.get(
       const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
       items = db
         .prepare(
-          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type, l.state,
                   COALESCE(l.converted_at, l.updated_at, l.created_at) AS date, l.notes,
                   u.name AS assigned_to_name,
                   u.name AS user_name
@@ -1053,7 +1199,7 @@ router.get(
       const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
       items = db
         .prepare(
-          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type, l.state,
                   l.created_at AS date, l.notes,
                   u.name AS assigned_to_name,
                   u.name AS user_name
@@ -1076,7 +1222,7 @@ router.get(
           `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
                   m.open_count, m.reply_count,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM email_messages m
            JOIN leads l ON l.id = m.lead_id
@@ -1094,12 +1240,12 @@ router.get(
           `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
                   m.open_count, m.reply_count,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM email_messages m
            LEFT JOIN leads l ON l.id = m.lead_id
            LEFT JOIN users u ON u.id = m.user_id
-           WHERE 1=1 ${win('m.sent_at')} ${uClause}
+           WHERE 1=1 ${win('m.sent_at')} ${uClause} ${stateClause}
            ORDER BY m.sent_at DESC
            LIMIT ?`,
         )
@@ -1111,12 +1257,12 @@ router.get(
           .prepare(
             `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
                     l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                    l.status AS lead_status, l.business_type,
+                    l.status AS lead_status, l.business_type, l.state,
                     u.name AS user_name
              FROM lead_activities a
              LEFT JOIN leads l ON l.id = a.lead_id
              LEFT JOIN users u ON u.id = a.user_id
-             WHERE a.type IN ('email', 'email_sent') ${win('a.created_at')} ${actUClause}
+             WHERE a.type IN ('email', 'email_sent') ${win('a.created_at')} ${actUClause} ${stateClause}
              ORDER BY a.created_at DESC
              LIMIT ?`,
           )
@@ -1129,7 +1275,7 @@ router.get(
         .prepare(
           `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM lead_activities a
            LEFT JOIN leads l ON l.id = a.lead_id
@@ -1145,7 +1291,7 @@ router.get(
         .prepare(
           `SELECT e.id, e.subject, e.email AS to_email, e.occurred_at AS date,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM email_events e
            LEFT JOIN leads l ON l.id = e.lead_id
@@ -1163,12 +1309,12 @@ router.get(
           `SELECT r.id, r.from_name, r.from_email, r.subject, r.received_at AS date,
                   COALESCE(r.body_text, r.body_markdown, r.subject) AS preview,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM email_replies r
            LEFT JOIN leads l ON l.id = r.lead_id
            LEFT JOIN users u ON u.id = l.assigned_to
-           WHERE 1=1 ${win('r.received_at')}
+           WHERE 1=1 ${win('r.received_at')} ${stateClause}
            ORDER BY r.received_at DESC
            LIMIT ?`,
         )
@@ -1178,7 +1324,7 @@ router.get(
           .prepare(
             `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
                     l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                    l.status AS lead_status, l.business_type,
+                    l.status AS lead_status, l.business_type, l.state,
                     u.name AS user_name
              FROM lead_activities a
              LEFT JOIN leads l ON l.id = a.lead_id
@@ -1195,7 +1341,7 @@ router.get(
         .prepare(
           `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM lead_activities a
            LEFT JOIN leads l ON l.id = a.lead_id
@@ -1221,7 +1367,7 @@ router.get(
         .prepare(
           `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM lead_activities a
            LEFT JOIN leads l ON l.id = a.lead_id
@@ -1245,7 +1391,7 @@ router.get(
         .prepare(
           `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM lead_activities a
            LEFT JOIN leads l ON l.id = a.lead_id
@@ -1263,7 +1409,7 @@ router.get(
           `SELECT f.id, f.note AS summary, f.due_at,
                   COALESCE(f.completed_at, f.updated_at) AS date,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM follow_ups f
            LEFT JOIN leads l ON l.id = f.lead_id
@@ -1284,7 +1430,7 @@ router.get(
         .prepare(
           `SELECT f.id, f.note AS summary, f.due_at AS date,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM follow_ups f
            LEFT JOIN leads l ON l.id = f.lead_id
@@ -1319,7 +1465,7 @@ router.get(
         .prepare(
           `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type,
+                  l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
            FROM lead_activities a
            LEFT JOIN leads l ON l.id = a.lead_id
@@ -1334,14 +1480,14 @@ router.get(
       const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
       items = db
         .prepare(
-          `SELECT DISTINCT l.id, l.name, l.email, l.company, l.phone, l.status, l.source, l.business_type,
+          `SELECT DISTINCT l.id, l.name, l.email, l.company, l.phone, l.status, l.source, l.business_type, l.state,
                   a.created_at AS date, a.summary,
                   u.name AS user_name
            FROM lead_activities a
            JOIN leads l ON l.id = a.lead_id
            LEFT JOIN users u ON u.id = a.user_id
            WHERE a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','note','reply','linkedin_reply')
-             ${win('a.created_at')} ${uClause}
+             ${win('a.created_at')} ${uClause} ${stateClause}
            ORDER BY a.created_at DESC
            LIMIT ?`,
         )
@@ -1351,7 +1497,7 @@ router.get(
       title = `Nurture / DQ: ${r || 'Reason'}`;
       items = db
         .prepare(
-          `SELECT l.id, l.name, l.email, l.company, l.status, l.source, l.business_type,
+          `SELECT l.id, l.name, l.email, l.company, l.status, l.source, l.business_type, l.state,
                   l.lost_reason, l.updated_at AS date,
                   u.name AS user_name
            FROM leads l
@@ -1366,7 +1512,7 @@ router.get(
       title = String(metric || 'Drilldown').replace(/_/g, ' ');
       items = db
         .prepare(
-          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type, l.state,
                   l.created_at AS date, l.notes,
                   u.name AS user_name
            FROM leads l

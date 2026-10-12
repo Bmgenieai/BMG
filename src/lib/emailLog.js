@@ -672,6 +672,7 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
                 l.email AS lead_email,
                 l.company AS lead_company,
                 l.status AS lead_status,
+                l.state AS lead_state,
                 l.business_type AS lead_business_type,
                 l.assigned_to AS lead_assigned_to,
                 u.name AS assigned_to_name,
@@ -799,29 +800,9 @@ function findOriginalOutboundMessage(reply) {
   return null;
 }
 
-export function getEmailReply(id) {
-  const row = db
-    .prepare(
-      `SELECT r.*,
-              l.name AS lead_name,
-              l.email AS lead_email,
-              l.company AS lead_company,
-              l.status AS lead_status,
-              l.business_type AS lead_business_type,
-              l.assigned_to AS lead_assigned_to,
-              u.name AS assigned_to_name
-       FROM email_replies r
-       LEFT JOIN leads l ON l.id = r.lead_id
-       LEFT JOIN users u ON u.id = l.assigned_to
-       WHERE r.id = ?`,
-    )
-    .get(id);
-
-  if (!row) return null;
-
-  // Find all replies in this conversation
-  const convKeyLead = row.lead_id;
-  const convKeyEmail = row.from_email ? row.from_email.toLowerCase().trim() : null;
+function buildConversationThread({ leadId, fromEmail, leadName }) {
+  const convKeyLead = leadId || null;
+  const convKeyEmail = fromEmail ? String(fromEmail).toLowerCase().trim() : null;
 
   let allReplies = [];
   if (convKeyLead && convKeyEmail) {
@@ -842,11 +823,8 @@ export function getEmailReply(id) {
         `SELECT * FROM email_replies WHERE LOWER(TRIM(from_email)) = ? ORDER BY received_at ASC`,
       )
       .all(convKeyEmail);
-  } else {
-    allReplies = [row];
   }
 
-  // Find all outbound messages to this lead / email
   let outboundMessages = [];
   if (convKeyLead && convKeyEmail) {
     outboundMessages = db
@@ -880,9 +858,6 @@ export function getEmailReply(id) {
       .all(convKeyEmail);
   }
 
-  const original = findOriginalOutboundMessage(row);
-
-  // Build unified chronological thread
   const thread = [];
   for (const m of outboundMessages) {
     thread.push({
@@ -901,7 +876,7 @@ export function getEmailReply(id) {
     thread.push({
       id: r.id,
       direction: 'reply',
-      senderName: r.from_name || r.from_email || row.lead_name || 'Prospect',
+      senderName: r.from_name || r.from_email || leadName || 'Prospect',
       fromEmail: r.from_email,
       date: r.received_at,
       subject: r.subject,
@@ -913,6 +888,121 @@ export function getEmailReply(id) {
   }
 
   thread.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  return { thread, allReplies, outboundMessages };
+}
+
+/** Full conversation for a lead (outbound + inbound), same shape as Email replies modal. */
+export function getLeadConversation(leadId) {
+  const lead = db
+    .prepare(
+      `SELECT l.*, u.name AS assigned_to_name
+       FROM leads l
+       LEFT JOIN users u ON u.id = l.assigned_to
+       WHERE l.id = ?`,
+    )
+    .get(leadId);
+  if (!lead) return null;
+
+  const fromEmail = lead.email ? String(lead.email).toLowerCase().trim() : null;
+  const { thread, allReplies, outboundMessages } = buildConversationThread({
+    leadId: lead.id,
+    fromEmail,
+    leadName: lead.name,
+  });
+
+  const latestReply = allReplies.length ? allReplies[allReplies.length - 1] : null;
+  const latestOutbound = outboundMessages.length
+    ? outboundMessages[outboundMessages.length - 1]
+    : null;
+
+  return {
+    id: latestReply?.id || null,
+    lead_id: lead.id,
+    lead_name: lead.name,
+    lead_email: lead.email,
+    lead_company: lead.company,
+    lead_status: lead.status,
+    lead_state: lead.state || null,
+    lead_business_type: lead.business_type || null,
+    assigned_to_name: lead.assigned_to_name || null,
+    from_email: latestReply?.from_email || lead.email || null,
+    from_name: latestReply?.from_name || lead.name || null,
+    subject: latestReply?.subject || latestOutbound?.subject || null,
+    received_at: latestReply?.received_at || null,
+    read_at: latestReply?.read_at || null,
+    hasBody: Boolean(
+      latestReply?.body_markdown || latestReply?.body_text || latestReply?.body_html,
+    ),
+    thread,
+    allReplyIds: allReplies.map((r) => r.id),
+    messageCount: thread.length,
+    replyCount: allReplies.length,
+    originalMessage: latestOutbound
+      ? {
+          id: latestOutbound.id,
+          subject: latestOutbound.subject,
+          toEmail: latestOutbound.to_email,
+          sentAt: latestOutbound.sent_at,
+          sentByName: latestOutbound.sent_by_name || null,
+          templateId: latestOutbound.template_id,
+          source: latestOutbound.source,
+          htmlContent: latestOutbound.html_content || null,
+          textContent: latestOutbound.text_content || null,
+          hasBody: Boolean(latestOutbound.html_content || latestOutbound.text_content),
+          brevoMessageId: latestOutbound.brevo_message_id || null,
+        }
+      : null,
+    crmReplies: [],
+  };
+}
+
+export function getEmailReply(id) {
+  const row = db
+    .prepare(
+      `SELECT r.*,
+              l.name AS lead_name,
+              l.email AS lead_email,
+              l.company AS lead_company,
+              l.status AS lead_status,
+              l.state AS lead_state,
+              l.business_type AS lead_business_type,
+              l.assigned_to AS lead_assigned_to,
+              u.name AS assigned_to_name
+       FROM email_replies r
+       LEFT JOIN leads l ON l.id = r.lead_id
+       LEFT JOIN users u ON u.id = l.assigned_to
+       WHERE r.id = ?`,
+    )
+    .get(id);
+
+  if (!row) return null;
+
+  const convKeyLead = row.lead_id;
+  const convKeyEmail = row.from_email ? row.from_email.toLowerCase().trim() : null;
+  const { thread, allReplies } = buildConversationThread({
+    leadId: convKeyLead,
+    fromEmail: convKeyEmail,
+    leadName: row.lead_name,
+  });
+
+  // If this reply isn't already in the thread set (edge), still include at least itself
+  if (!allReplies.length) {
+    thread.push({
+      id: row.id,
+      direction: 'reply',
+      senderName: row.from_name || row.from_email || row.lead_name || 'Prospect',
+      fromEmail: row.from_email,
+      date: row.received_at,
+      subject: row.subject,
+      htmlContent: row.body_html || null,
+      textContent: row.body_text || null,
+      markdownContent: row.body_markdown || null,
+      hasBody: Boolean(row.body_html || row.body_text || row.body_markdown),
+    });
+    thread.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  }
+
+  const original = findOriginalOutboundMessage(row);
 
   return {
     ...row,
