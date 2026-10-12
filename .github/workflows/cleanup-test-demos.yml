@@ -1,0 +1,39 @@
+name: Cleanup test demos
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cleanup-test-demos
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Remove test demo leads (Windows)
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH cleanup on Windows PC
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          command_timeout: 10m
+          script: |
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+            $path = '${{ secrets.CRM_DEPLOY_PATH }}'
+            if ([string]::IsNullOrWhiteSpace($path)) { $path = 'D:\crm-api.bmgenie.ai' }
+            if (-not (Test-Path $path)) { throw "CRM path not found: $path" }
+            Set-Location $path
+            git fetch origin main
+            if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+            git reset --hard origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'git reset --hard failed' }
+            if (-not (Test-Path .\scripts\windows\cleanup-test-demos.cjs)) {
+              throw 'cleanup-test-demos.cjs missing after pull'
+            }
+            Write-Host '--- Cleanup test demos ---'
+            node .\scripts\windows\cleanup-test-demos.cjs
+            if ($LASTEXITCODE -ne 0) { throw 'cleanup script failed' }
+            Write-Host 'CLEANUP_DONE'
+            exit 0
