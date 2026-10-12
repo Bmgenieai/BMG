@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
 import { authRequired, requirePermission, requireAnyPermission } from '../middleware/auth.js';
-import { LEAD_SOURCES, OPEN_STATUSES, roleHasPermission } from '../lib/permissions.js';
+import { LEAD_SOURCES, OPEN_STATUSES, BUSINESS_TYPES, roleHasPermission } from '../lib/permissions.js';
 import { fetchBmgenieCrmAnalytics, normalizeUserRows } from '../lib/bmgenieApi.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
 import { resolveWorkingPeriod } from '../lib/periodBounds.js';
@@ -66,6 +66,49 @@ router.get(
         label: LEAD_SOURCES[r.source]?.label || r.source,
         conversionRate: r.count ? Math.round((r.converted / r.count) * 1000) / 10 : 0,
       }));
+
+    const byBusinessType = BUSINESS_TYPES.map((bt) => {
+      const row = db
+        .prepare(
+          `SELECT
+             COUNT(DISTINCT l.id) AS leads_count,
+             SUM(CASE WHEN l.status IN ('paid', 'repeat') THEN 1 ELSE 0 END) AS converted,
+             (SELECT COUNT(*) FROM email_messages em JOIN leads l2 ON l2.id = em.lead_id WHERE l2.business_type = ? ${leadFilter ? leadFilter.replace(/\bl\b/g, 'l2') : ''}) AS emails_sent,
+             (SELECT COUNT(*) FROM email_replies er JOIN leads l3 ON l3.id = er.lead_id WHERE l3.business_type = ? ${leadFilter ? leadFilter.replace(/\bl\b/g, 'l3') : ''}) AS replies_count
+           FROM leads l
+           WHERE l.business_type = ? ${leadFilter}`,
+        )
+        .get(bt.key, ...params, bt.key, ...params, bt.key, ...params);
+      return {
+        key: bt.key,
+        label: bt.label,
+        leadsCount: row?.leads_count || 0,
+        emailsSent: row?.emails_sent || 0,
+        repliesCount: row?.replies_count || 0,
+        converted: row?.converted || 0,
+      };
+    });
+    const unspec = db
+      .prepare(
+        `SELECT
+           COUNT(DISTINCT l.id) AS leads_count,
+           SUM(CASE WHEN l.status IN ('paid', 'repeat') THEN 1 ELSE 0 END) AS converted,
+           (SELECT COUNT(*) FROM email_messages em JOIN leads l2 ON l2.id = em.lead_id WHERE (l2.business_type IS NULL OR TRIM(l2.business_type) = '') ${leadFilter ? leadFilter.replace(/\bl\b/g, 'l2') : ''}) AS emails_sent,
+           (SELECT COUNT(*) FROM email_replies er JOIN leads l3 ON l3.id = er.lead_id WHERE (l3.business_type IS NULL OR TRIM(l3.business_type) = '') ${leadFilter ? leadFilter.replace(/\bl\b/g, 'l3') : ''}) AS replies_count
+         FROM leads l
+         WHERE (l.business_type IS NULL OR TRIM(l.business_type) = '') ${leadFilter}`,
+      )
+      .get(...params, ...params, ...params);
+    if (unspec && (unspec.leads_count > 0 || unspec.emails_sent > 0)) {
+      byBusinessType.push({
+        key: 'unspecified',
+        label: 'Unspecified',
+        leadsCount: unspec.leads_count || 0,
+        emailsSent: unspec.emails_sent || 0,
+        repliesCount: unspec.replies_count || 0,
+        converted: unspec.converted || 0,
+      });
+    }
 
     const revenue = db
       .prepare(
@@ -156,6 +199,7 @@ router.get(
     res.json({
       totals,
       bySource,
+      byBusinessType,
       revenue: {
         recorded: revenue.total,
         last30Days: revenue.last_30_days,
@@ -207,6 +251,13 @@ router.get(
       ? `AND a.lead_id IN (SELECT id FROM leads l WHERE 1=1 ${leadFilter})`
       : '';
 
+    // Period window for activity counts (stages stay a live snapshot).
+    const pb = resolveWorkingPeriod(req.query.period || 'overall');
+    const win = (col) =>
+      pb.period === 'overall'
+        ? ''
+        : ` AND ${DT(col)} >= datetime('${pb.from}') AND ${DT(col)} < datetime('${pb.to}')`;
+
     const outreach = db
       .prepare(
         `SELECT
@@ -229,18 +280,18 @@ router.get(
           COUNT(DISTINCT CASE WHEN a.type IN ('reply','linkedin_reply') THEN a.lead_id END) AS leads_replied,
           COUNT(DISTINCT CASE WHEN a.type = 'reply' AND a.outcome = 'positive' THEN a.lead_id END) AS leads_positive_reply
          FROM lead_activities a
-         WHERE 1=1 ${actFilter}`,
+         WHERE 1=1 ${actFilter} ${win('a.created_at')}`,
       )
       .get(...params);
 
     const leadsAdded = db
-      .prepare(`SELECT COUNT(*) AS c FROM leads l WHERE 1=1 ${leadFilter}`)
+      .prepare(`SELECT COUNT(*) AS c FROM leads l WHERE 1=1 ${leadFilter} ${win('l.created_at')}`)
       .get(...params).c;
 
     const leadsVerified = db
       .prepare(
         `SELECT COUNT(*) AS c FROM leads l
-         WHERE (l.email IS NOT NULL AND TRIM(l.email) != '') ${leadFilter}`,
+         WHERE (l.email IS NOT NULL AND TRIM(l.email) != '') ${leadFilter} ${win('l.created_at')}`,
       )
       .get(...params).c;
 
@@ -269,6 +320,13 @@ router.get(
       .get(...params).c;
 
     const pct = (num, den) => (den ? Math.round((num / den) * 1000) / 10 : 0);
+
+    const followupsCompletedCount = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM follow_ups f
+         WHERE f.status = 'completed' ${win('COALESCE(f.completed_at, f.updated_at)')} ${leadFilter ? `AND f.lead_id IN (SELECT id FROM leads l WHERE 1=1 ${leadFilter})` : ''}`,
+      )
+      .get(...params).c;
 
     const lostReasons = db
       .prepare(
@@ -309,6 +367,8 @@ router.get(
         emailOpens: outreach.email_opens || 0,
         emailReplies: outreach.replies || 0,
         followupsSent: outreach.email_followups || 0,
+        emailFollowupsSent: outreach.email_followups || 0,
+        followupsCompleted: followupsCompletedCount || 0,
         linkedinConnectionSent: outreach.linkedin_connection_sent || 0,
         linkedinConnectionAccepted: outreach.linkedin_connection_accepted || 0,
         linkedinMessages: outreach.linkedin_messages || 0,
@@ -858,5 +918,476 @@ router.get('/revenue', requirePermission('revenue:view'), (_req, res) => {
     .all();
   res.json(rows);
 });
+
+/**
+ * Detailed drill-down records for any metric clicked on Dashboard or BD Working page.
+ */
+router.get(
+  '/drilldown',
+  requireAnyPermission('analytics:view_all', 'analytics:view_team', 'analytics:view_own'),
+  (req, res) => {
+    const isCeo = roleHasPermission(req.user.role, 'analytics:view_all');
+    const isManager = roleHasPermission(req.user.role, 'analytics:view_team');
+    const canViewAll = isCeo || isManager;
+
+    const metric = String(req.query.metric || '').trim();
+    const bounds = resolveWorkingPeriod(req.query.period || 'overall');
+    const { from, to } = bounds;
+    const isOverall = bounds.period === 'overall';
+
+    const userId = req.query.userId
+      ? String(req.query.userId)
+      : canViewAll
+        ? null
+        : req.user.id;
+    const stage = req.query.stage ? String(req.query.stage).trim() : null;
+    const businessType = req.query.businessType ? String(req.query.businessType).trim() : null;
+    const reason = req.query.reason ? String(req.query.reason).trim() : null;
+    const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 500);
+
+    const win = (col) =>
+      isOverall
+        ? ''
+        : ` AND ${DT(col)} >= datetime('${from}') AND ${DT(col)} < datetime('${to}')`;
+
+    let items = [];
+    let title = 'Records';
+
+    if (
+      metric === 'leads_added' ||
+      metric === 'leads' ||
+      metric === 'leads_manual' ||
+      metric === 'leads_csv' ||
+      metric === 'leads_verified'
+    ) {
+      let filter = '';
+      if (metric === 'leads_manual') {
+        filter = " AND (l.import_batch_id IS NULL OR l.import_batch_id = '')";
+        title = 'Manual leads added';
+      } else if (metric === 'leads_csv') {
+        filter = " AND (l.import_batch_id IS NOT NULL AND l.import_batch_id != '')";
+        title = 'CSV imported leads';
+      } else if (metric === 'leads_verified') {
+        filter = " AND (l.email IS NOT NULL AND TRIM(l.email) != '')";
+        title = 'Verified leads (with email)';
+      } else {
+        title = 'Leads added';
+      }
+
+      const uClause = userId ? ` AND (l.created_by = '${userId}' OR l.assigned_to = '${userId}')` : '';
+
+      items = db
+        .prepare(
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+                  COALESCE(l.date_added, l.created_at) AS date,
+                  l.created_at, l.notes,
+                  u.name AS assigned_to_name,
+                  c.name AS user_name,
+                  b.filename AS import_batch_filename
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.assigned_to
+           LEFT JOIN users c ON c.id = l.created_by
+           LEFT JOIN import_batches b ON b.id = l.import_batch_id
+           WHERE 1=1 ${win('l.created_at')} ${uClause} ${filter}
+           ORDER BY l.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'funnel_stage' || metric === 'stage' || stage) {
+      const targetStage = stage || req.query.metric;
+      title = `${String(targetStage || 'Stage').replace(/_/g, ' ')} leads`;
+      const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+                  l.created_at AS date, l.notes,
+                  u.name AS assigned_to_name,
+                  u.name AS user_name
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.assigned_to
+           WHERE l.status = ? ${uClause}
+           ORDER BY l.created_at DESC
+           LIMIT ?`,
+        )
+        .all(targetStage, limit);
+    } else if (metric === 'open_pipeline') {
+      title = 'Open pipeline leads';
+      const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+                  l.created_at AS date, l.notes,
+                  u.name AS assigned_to_name,
+                  u.name AS user_name
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.assigned_to
+           WHERE l.status IN (${OPEN_LIST}) ${uClause}
+           ORDER BY l.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'paid') {
+      title = 'Paid leads';
+      const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+                  COALESCE(l.converted_at, l.updated_at, l.created_at) AS date, l.notes,
+                  u.name AS assigned_to_name,
+                  u.name AS user_name
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.assigned_to
+           WHERE l.status IN ('paid', 'repeat')
+             ${win('COALESCE(l.converted_at, l.updated_at)')} ${uClause}
+           ORDER BY COALESCE(l.converted_at, l.updated_at) DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'business_type') {
+      const bType = businessType || req.query.type;
+      title = `Leads: ${bType || 'Business type'}`;
+      const typeFilter =
+        bType === 'unspecified'
+          ? " AND (l.business_type IS NULL OR TRIM(l.business_type) = '')"
+          : ` AND l.business_type = '${bType}'`;
+      const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+                  l.created_at AS date, l.notes,
+                  u.name AS assigned_to_name,
+                  u.name AS user_name
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.assigned_to
+           WHERE 1=1 ${typeFilter} ${uClause}
+           ORDER BY l.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'emails_by_business_type') {
+      const bType = businessType || req.query.type;
+      title = `Emails sent: ${bType || 'Business type'}`;
+      const typeFilter =
+        bType === 'unspecified'
+          ? " AND (l.business_type IS NULL OR TRIM(l.business_type) = '')"
+          : ` AND l.business_type = '${bType}'`;
+      items = db
+        .prepare(
+          `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
+                  m.open_count, m.reply_count,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM email_messages m
+           JOIN leads l ON l.id = m.lead_id
+           LEFT JOIN users u ON u.id = m.user_id
+           WHERE 1=1 ${typeFilter} ${win('m.sent_at')}
+           ORDER BY m.sent_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'emails_sent' || metric === 'emails') {
+      title = 'Emails sent';
+      const uClause = userId ? ` AND m.user_id = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
+                  m.open_count, m.reply_count,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM email_messages m
+           LEFT JOIN leads l ON l.id = m.lead_id
+           LEFT JOIN users u ON u.id = m.user_id
+           WHERE 1=1 ${win('m.sent_at')} ${uClause}
+           ORDER BY m.sent_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+      if (items.length === 0) {
+        // Fallback to lead_activities for email
+        const actUClause = userId ? ` AND a.user_id = '${userId}'` : '';
+        items = db
+          .prepare(
+            `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
+                    l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                    l.status AS lead_status, l.business_type,
+                    u.name AS user_name
+             FROM lead_activities a
+             LEFT JOIN leads l ON l.id = a.lead_id
+             LEFT JOIN users u ON u.id = a.user_id
+             WHERE a.type IN ('email', 'email_sent') ${win('a.created_at')} ${actUClause}
+             ORDER BY a.created_at DESC
+             LIMIT ?`,
+          )
+          .all(limit);
+      }
+    } else if (metric === 'email_followups') {
+      title = 'Email follow-ups sent';
+      const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM lead_activities a
+           LEFT JOIN leads l ON l.id = a.lead_id
+           LEFT JOIN users u ON u.id = a.user_id
+           WHERE a.type = 'email_followup' ${win('a.created_at')} ${uClause}
+           ORDER BY a.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'email_opens') {
+      title = 'Email opens';
+      items = db
+        .prepare(
+          `SELECT e.id, e.subject, e.email AS to_email, e.occurred_at AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM email_events e
+           LEFT JOIN leads l ON l.id = e.lead_id
+           LEFT JOIN email_messages m ON m.id = e.email_message_id
+           LEFT JOIN users u ON u.id = m.user_id
+           WHERE e.event = 'opened' ${win('e.occurred_at')}
+           ORDER BY e.occurred_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'email_replies' || metric === 'replies') {
+      title = 'Replies received';
+      items = db
+        .prepare(
+          `SELECT r.id, r.from_name, r.from_email, r.subject, r.received_at AS date,
+                  COALESCE(r.body_text, r.body_markdown, r.subject) AS preview,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM email_replies r
+           LEFT JOIN leads l ON l.id = r.lead_id
+           LEFT JOIN users u ON u.id = l.assigned_to
+           WHERE 1=1 ${win('r.received_at')}
+           ORDER BY r.received_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+      if (items.length === 0) {
+        items = db
+          .prepare(
+            `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
+                    l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                    l.status AS lead_status, l.business_type,
+                    u.name AS user_name
+             FROM lead_activities a
+             LEFT JOIN leads l ON l.id = a.lead_id
+             LEFT JOIN users u ON u.id = a.user_id
+             WHERE a.type IN ('reply', 'linkedin_reply') ${win('a.created_at')}
+             ORDER BY a.created_at DESC
+             LIMIT ?`,
+          )
+          .all(limit);
+      }
+    } else if (metric === 'positive_replies') {
+      title = 'Positive replies';
+      items = db
+        .prepare(
+          `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM lead_activities a
+           LEFT JOIN leads l ON l.id = a.lead_id
+           LEFT JOIN users u ON u.id = a.user_id
+           WHERE (a.outcome = 'positive' OR a.type = 'reply') ${win('a.created_at')}
+           ORDER BY a.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric.startsWith('linkedin')) {
+      const typeMap = {
+        linkedin: "a.type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply')",
+        linkedin_connection_sent: "a.type = 'linkedin_connection_sent'",
+        linkedin_connection_accepted: "a.type = 'linkedin_connection_accepted'",
+        linkedin_messages: "a.type = 'linkedin_message'",
+        linkedin_replies: "a.type = 'linkedin_reply'",
+        linkedin_followup: "a.type = 'linkedin_followup'",
+      };
+      const typeClause = typeMap[metric] || "a.type LIKE 'linkedin%'";
+      title = String(metric).replace(/_/g, ' ');
+      const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM lead_activities a
+           LEFT JOIN leads l ON l.id = a.lead_id
+           LEFT JOIN users u ON u.id = a.user_id
+           WHERE ${typeClause} ${win('a.created_at')} ${uClause}
+           ORDER BY a.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric.startsWith('call') || metric === 'whatsapp') {
+      const typeMap = {
+        calls: "a.type IN ('call','call_attempted','call_connected')",
+        calls_attempted: "a.type = 'call_attempted'",
+        calls_connected: "a.type IN ('call','call_connected')",
+        whatsapp: "a.type = 'whatsapp'",
+      };
+      const typeClause = typeMap[metric] || "a.type IN ('call','call_attempted','call_connected')";
+      title = String(metric).replace(/_/g, ' ');
+      const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM lead_activities a
+           LEFT JOIN leads l ON l.id = a.lead_id
+           LEFT JOIN users u ON u.id = a.user_id
+           WHERE ${typeClause} ${win('a.created_at')} ${uClause}
+           ORDER BY a.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'followups_completed' || metric === 'followups_done') {
+      title = 'Follow-ups completed';
+      const uClause = userId ? ` AND f.assigned_to = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT f.id, f.note AS summary, f.due_at,
+                  COALESCE(f.completed_at, f.updated_at) AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM follow_ups f
+           LEFT JOIN leads l ON l.id = f.lead_id
+           LEFT JOIN users u ON u.id = f.assigned_to
+           WHERE f.status = 'completed' ${win('COALESCE(f.completed_at, f.updated_at)')} ${uClause}
+           ORDER BY COALESCE(f.completed_at, f.updated_at) DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'followups_overdue' || metric === 'followups_pending') {
+      title = metric === 'followups_overdue' ? 'Overdue follow-ups' : 'Pending follow-ups';
+      const statusClause =
+        metric === 'followups_overdue'
+          ? `f.status IN ('pending', 'overdue') AND ${DT('f.due_at')} < datetime('now')`
+          : "f.status = 'pending'";
+      const uClause = userId ? ` AND f.assigned_to = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT f.id, f.note AS summary, f.due_at AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM follow_ups f
+           LEFT JOIN leads l ON l.id = f.lead_id
+           LEFT JOIN users u ON u.id = f.assigned_to
+           WHERE ${statusClause} ${uClause}
+           ORDER BY f.due_at ASC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (
+      metric === 'to_engaged' ||
+      metric === 'to_contacted' ||
+      metric === 'to_demo' ||
+      metric === 'demos_booked' ||
+      metric === 'to_trial' ||
+      metric === 'meetings' ||
+      metric === 'meetings_requested'
+    ) {
+      const map = {
+        to_engaged: "(a.outcome IN ('engaged','conversation') OR a.summary LIKE '%→ engaged%' OR a.summary LIKE '%→ conversation%')",
+        to_contacted: "(a.outcome = 'contacted' OR a.summary LIKE '%→ contacted%')",
+        to_demo: "(a.outcome IN ('demo_scheduled','demo_booked') OR a.summary LIKE '%→ demo_scheduled%' OR a.summary LIKE '%→ demo_booked%')",
+        demos_booked: "(a.outcome IN ('demo_scheduled','demo_booked') OR a.summary LIKE '%→ demo_scheduled%' OR a.summary LIKE '%→ demo_booked%')",
+        to_trial: "(a.outcome = 'trial' OR a.summary LIKE '%→ trial%')",
+        meetings: "a.type = 'meeting_scheduled'",
+        meetings_requested: "(a.type = 'meeting_scheduled' OR a.summary LIKE '%meeting%')",
+      };
+      const clause = map[metric] || "a.type = 'status_change'";
+      title = String(metric).replace(/_/g, ' ');
+      const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type,
+                  u.name AS user_name
+           FROM lead_activities a
+           LEFT JOIN leads l ON l.id = a.lead_id
+           LEFT JOIN users u ON u.id = a.user_id
+           WHERE ${clause} ${win('a.created_at')} ${uClause}
+           ORDER BY a.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'leads_touched' || metric === 'touched') {
+      title = 'Unique leads touched';
+      const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT DISTINCT l.id, l.name, l.email, l.company, l.phone, l.status, l.source, l.business_type,
+                  a.created_at AS date, a.summary,
+                  u.name AS user_name
+           FROM lead_activities a
+           JOIN leads l ON l.id = a.lead_id
+           LEFT JOIN users u ON u.id = a.user_id
+           WHERE a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','note','reply','linkedin_reply')
+             ${win('a.created_at')} ${uClause}
+           ORDER BY a.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'lost_reason' || reason) {
+      const r = reason || req.query.reason;
+      title = `Nurture / DQ: ${r || 'Reason'}`;
+      items = db
+        .prepare(
+          `SELECT l.id, l.name, l.email, l.company, l.status, l.source, l.business_type,
+                  l.lost_reason, l.updated_at AS date,
+                  u.name AS user_name
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.assigned_to
+           WHERE l.status IN ('nurture', 'lost') AND COALESCE(NULLIF(TRIM(l.lost_reason), ''), 'Unspecified') = ?
+           ORDER BY l.updated_at DESC
+           LIMIT ?`,
+        )
+        .all(r, limit);
+    } else {
+      // General fallback query on lead_activities or leads
+      title = String(metric || 'Drilldown').replace(/_/g, ' ');
+      items = db
+        .prepare(
+          `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type,
+                  l.created_at AS date, l.notes,
+                  u.name AS user_name
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.assigned_to
+           WHERE 1=1 ${win('l.created_at')}
+           ORDER BY l.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    }
+
+    res.json({
+      metric,
+      title,
+      period: bounds.period,
+      periodLabel: bounds.label,
+      dateRange: `${bounds.fromYmd} to ${bounds.toYmd}`,
+      total: items.length,
+      items,
+    });
+  },
+);
 
 export default router;

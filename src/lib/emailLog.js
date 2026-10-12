@@ -648,7 +648,7 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
   const clauses = [];
   const params = [];
 
-  if (!canViewAll) {
+  if (!canViewAll && user?.id) {
     clauses.push('(l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)');
     params.push(user.id, user.id);
   }
@@ -666,24 +666,40 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const rows = db
     .prepare(
-      `SELECT r.*,
-              l.name AS lead_name,
-              l.email AS lead_email,
-              l.company AS lead_company,
-              l.status AS lead_status,
-              l.assigned_to AS lead_assigned_to,
-              u.name AS assigned_to_name,
-              m.subject AS original_subject,
-              m.sent_at AS original_sent_at,
-              m.to_email AS original_to_email,
-              su.name AS sent_by_name
-       FROM email_replies r
-       LEFT JOIN leads l ON l.id = r.lead_id
-       LEFT JOIN users u ON u.id = l.assigned_to
-       LEFT JOIN email_messages m ON m.id = r.email_message_id
-       LEFT JOIN users su ON su.id = m.user_id
-       ${where}
-       ORDER BY r.received_at DESC
+      `WITH ranked AS (
+         SELECT r.*,
+                l.name AS lead_name,
+                l.email AS lead_email,
+                l.company AS lead_company,
+                l.status AS lead_status,
+                l.business_type AS lead_business_type,
+                l.assigned_to AS lead_assigned_to,
+                u.name AS assigned_to_name,
+                m.subject AS original_subject,
+                m.sent_at AS original_sent_at,
+                m.to_email AS original_to_email,
+                su.name AS sent_by_name,
+                COALESCE(r.lead_id, LOWER(TRIM(r.from_email))) AS conv_key,
+                ROW_NUMBER() OVER (
+                  PARTITION BY COALESCE(r.lead_id, LOWER(TRIM(r.from_email)))
+                  ORDER BY r.received_at DESC
+                ) AS rn,
+                COUNT(*) OVER (
+                  PARTITION BY COALESCE(r.lead_id, LOWER(TRIM(r.from_email)))
+                ) AS thread_count,
+                SUM(CASE WHEN r.read_at IS NULL THEN 1 ELSE 0 END) OVER (
+                  PARTITION BY COALESCE(r.lead_id, LOWER(TRIM(r.from_email)))
+                ) AS thread_unread_count
+         FROM email_replies r
+         LEFT JOIN leads l ON l.id = r.lead_id
+         LEFT JOIN users u ON u.id = l.assigned_to
+         LEFT JOIN email_messages m ON m.id = r.email_message_id
+         LEFT JOIN users su ON su.id = m.user_id
+         ${where}
+       )
+       SELECT * FROM ranked
+       WHERE rn = 1
+       ORDER BY received_at DESC
        LIMIT ?`,
     )
     .all(...params, Math.min(Math.max(Number(limit) || 100, 1), 300));
@@ -695,18 +711,22 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
       .trim()
       .slice(0, 160),
     hasBody: Boolean(r.body_markdown || r.body_text || r.body_html),
+    read_at: r.thread_unread_count > 0 ? null : r.read_at,
   }));
 }
 
 export function countUnreadEmailReplies({ user, canViewAll }) {
-  if (canViewAll) {
+  if (canViewAll || !user?.id) {
     return db
-      .prepare(`SELECT COUNT(*) AS c FROM email_replies WHERE read_at IS NULL`)
+      .prepare(
+        `SELECT COUNT(DISTINCT COALESCE(lead_id, LOWER(TRIM(from_email)))) AS c
+         FROM email_replies WHERE read_at IS NULL`,
+      )
       .get().c;
   }
   return db
     .prepare(
-      `SELECT COUNT(*) AS c
+      `SELECT COUNT(DISTINCT COALESCE(r.lead_id, LOWER(TRIM(r.from_email)))) AS c
        FROM email_replies r
        LEFT JOIN leads l ON l.id = r.lead_id
        WHERE r.read_at IS NULL
@@ -716,12 +736,17 @@ export function countUnreadEmailReplies({ user, canViewAll }) {
 }
 
 export function countEmailReplies({ user, canViewAll }) {
-  if (canViewAll) {
-    return db.prepare(`SELECT COUNT(*) AS c FROM email_replies`).get().c;
+  if (canViewAll || !user?.id) {
+    return db
+      .prepare(
+        `SELECT COUNT(DISTINCT COALESCE(lead_id, LOWER(TRIM(from_email)))) AS c
+         FROM email_replies`,
+      )
+      .get().c;
   }
   return db
     .prepare(
-      `SELECT COUNT(*) AS c
+      `SELECT COUNT(DISTINCT COALESCE(r.lead_id, LOWER(TRIM(r.from_email)))) AS c
        FROM email_replies r
        LEFT JOIN leads l ON l.id = r.lead_id
        WHERE (l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)`,
@@ -782,6 +807,7 @@ export function getEmailReply(id) {
               l.email AS lead_email,
               l.company AS lead_company,
               l.status AS lead_status,
+              l.business_type AS lead_business_type,
               l.assigned_to AS lead_assigned_to,
               u.name AS assigned_to_name
        FROM email_replies r
@@ -793,30 +819,106 @@ export function getEmailReply(id) {
 
   if (!row) return null;
 
+  // Find all replies in this conversation
+  const convKeyLead = row.lead_id;
+  const convKeyEmail = row.from_email ? row.from_email.toLowerCase().trim() : null;
+
+  let allReplies = [];
+  if (convKeyLead && convKeyEmail) {
+    allReplies = db
+      .prepare(
+        `SELECT * FROM email_replies
+         WHERE lead_id = ? OR LOWER(TRIM(from_email)) = ?
+         ORDER BY received_at ASC`,
+      )
+      .all(convKeyLead, convKeyEmail);
+  } else if (convKeyLead) {
+    allReplies = db
+      .prepare(`SELECT * FROM email_replies WHERE lead_id = ? ORDER BY received_at ASC`)
+      .all(convKeyLead);
+  } else if (convKeyEmail) {
+    allReplies = db
+      .prepare(
+        `SELECT * FROM email_replies WHERE LOWER(TRIM(from_email)) = ? ORDER BY received_at ASC`,
+      )
+      .all(convKeyEmail);
+  } else {
+    allReplies = [row];
+  }
+
+  // Find all outbound messages to this lead / email
+  let outboundMessages = [];
+  if (convKeyLead && convKeyEmail) {
+    outboundMessages = db
+      .prepare(
+        `SELECT m.*, u.name AS sent_by_name
+         FROM email_messages m
+         LEFT JOIN users u ON u.id = m.user_id
+         WHERE m.lead_id = ? OR LOWER(TRIM(m.to_email)) = ?
+         ORDER BY m.sent_at ASC`,
+      )
+      .all(convKeyLead, convKeyEmail);
+  } else if (convKeyLead) {
+    outboundMessages = db
+      .prepare(
+        `SELECT m.*, u.name AS sent_by_name
+         FROM email_messages m
+         LEFT JOIN users u ON u.id = m.user_id
+         WHERE m.lead_id = ?
+         ORDER BY m.sent_at ASC`,
+      )
+      .all(convKeyLead);
+  } else if (convKeyEmail) {
+    outboundMessages = db
+      .prepare(
+        `SELECT m.*, u.name AS sent_by_name
+         FROM email_messages m
+         LEFT JOIN users u ON u.id = m.user_id
+         WHERE LOWER(TRIM(m.to_email)) = ?
+         ORDER BY m.sent_at ASC`,
+      )
+      .all(convKeyEmail);
+  }
+
   const original = findOriginalOutboundMessage(row);
-  const crmReplies = db
-    .prepare(
-      `SELECT m.*, u.name AS sent_by_name
-       FROM email_messages m
-       LEFT JOIN users u ON u.id = m.user_id
-       WHERE m.parent_reply_id = ?
-       ORDER BY m.sent_at ASC`,
-    )
-    .all(id)
-    .map((m) => ({
+
+  // Build unified chronological thread
+  const thread = [];
+  for (const m of outboundMessages) {
+    thread.push({
       id: m.id,
-      subject: m.subject,
+      direction: 'sent',
+      senderName: m.sent_by_name || 'BD Team',
       toEmail: m.to_email,
-      sentAt: m.sent_at,
-      sentByName: m.sent_by_name || null,
+      date: m.sent_at,
+      subject: m.subject,
       htmlContent: m.html_content || null,
       textContent: m.text_content || null,
       hasBody: Boolean(m.html_content || m.text_content),
-    }));
+    });
+  }
+  for (const r of allReplies) {
+    thread.push({
+      id: r.id,
+      direction: 'reply',
+      senderName: r.from_name || r.from_email || row.lead_name || 'Prospect',
+      fromEmail: r.from_email,
+      date: r.received_at,
+      subject: r.subject,
+      htmlContent: r.body_html || null,
+      textContent: r.body_text || null,
+      markdownContent: r.body_markdown || null,
+      hasBody: Boolean(r.body_html || r.body_text || r.body_markdown),
+    });
+  }
+
+  thread.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
   return {
     ...row,
     hasBody: Boolean(row.body_markdown || row.body_text || row.body_html),
+    thread,
+    allReplyIds: allReplies.map((r) => r.id),
     originalMessage: original
       ? {
           id: original.id,
@@ -832,7 +934,7 @@ export function getEmailReply(id) {
           brevoMessageId: original.brevo_message_id || null,
         }
       : null,
-    crmReplies,
+    crmReplies: [],
   };
 }
 
@@ -937,6 +1039,20 @@ export async function sendCrmReplyToInbound({
 
 export function markEmailReplyRead(id, read = true) {
   const readAt = read ? new Date().toISOString() : null;
-  db.prepare(`UPDATE email_replies SET read_at = ? WHERE id = ?`).run(readAt, id);
+  const current = db.prepare(`SELECT lead_id, from_email FROM email_replies WHERE id = ?`).get(id);
+  if (current) {
+    if (current.lead_id) {
+      db.prepare(`UPDATE email_replies SET read_at = ? WHERE lead_id = ?`).run(readAt, current.lead_id);
+    } else if (current.from_email) {
+      db.prepare(`UPDATE email_replies SET read_at = ? WHERE LOWER(TRIM(from_email)) = ?`).run(
+        readAt,
+        current.from_email.toLowerCase().trim(),
+      );
+    } else {
+      db.prepare(`UPDATE email_replies SET read_at = ? WHERE id = ?`).run(readAt, id);
+    }
+  } else {
+    db.prepare(`UPDATE email_replies SET read_at = ? WHERE id = ?`).run(readAt, id);
+  }
   return getEmailReply(id);
 }

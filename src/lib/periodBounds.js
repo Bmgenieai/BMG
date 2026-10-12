@@ -5,7 +5,7 @@
 
 export const WORKING_TZ = 'Asia/Karachi';
 
-const PERIODS = new Set(['today', 'yesterday', 'week', 'month']);
+const PERIODS = new Set(['today', 'yesterday', 'week', 'month', 'overall']);
 
 export function normalizePeriod(raw) {
   const p = String(raw || 'today').trim().toLowerCase();
@@ -98,6 +98,7 @@ const PERIOD_LABELS = {
   yesterday: 'Yesterday',
   week: 'This week',
   month: 'This month',
+  overall: 'Overall',
 };
 
 /**
@@ -110,6 +111,19 @@ export function resolveWorkingPeriod(periodRaw, now = new Date()) {
   const todayYmd = ymdInTz(now);
   let fromYmd;
   let toExclusiveYmd;
+
+  if (period === 'overall') {
+    const toExcl = addCalendarDays(todayYmd, 1);
+    return {
+      period,
+      label: PERIOD_LABELS[period],
+      timezone: WORKING_TZ,
+      fromYmd: '2000-01-01',
+      toYmd: todayYmd,
+      from: '2000-01-01 00:00:00',
+      to: toSqliteUtc(zonedStartOfDay(toExcl)),
+    };
+  }
 
   if (period === 'today') {
     fromYmd = todayYmd;

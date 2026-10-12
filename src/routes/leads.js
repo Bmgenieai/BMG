@@ -8,12 +8,15 @@ import {
   LEAD_SOURCES,
   LEAD_STATUSES,
   LEAD_STATUS_TABS,
+  SOCIAL_LEAD_TABS,
   PRODUCT_LEAD_TABS,
   STATUS_LABELS,
   LOST_REASONS,
   ACTIVITY_TYPES,
   LINKEDIN_ACTIVITY_TYPES,
   REPLY_OUTCOMES,
+  BUSINESS_TYPES,
+  BUSINESS_TYPE_KEYS,
   normalizeStatus,
   canAccessLead,
   roleHasPermission,
@@ -114,6 +117,7 @@ router.get('/meta', (_req, res) => {
     lostReasons: LOST_REASONS,
     activityTypes: ACTIVITY_TYPES,
     replyOutcomes: REPLY_OUTCOMES,
+    businessTypes: BUSINESS_TYPES,
     importBatches,
     emailStatuses: [
       { key: 'sent', label: 'Emailed' },
@@ -171,6 +175,9 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     )
     .all(...baseParams);
   const sourceMap = Object.fromEntries(bySource.map((r) => [r.source, r.c]));
+  const socialCounts = Object.fromEntries(
+    SOCIAL_LEAD_TABS.map((t) => [t.slug, sourceMap[t.source] || 0]),
+  );
   const productCounts = Object.fromEntries(
     PRODUCT_LEAD_TABS.map((t) => [t.slug, sourceMap[t.source] || 0]),
   );
@@ -200,6 +207,7 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
   res.json({
     total,
     statusCounts,
+    socialCounts,
     productCounts,
     demosCount,
     chatsOpen,
@@ -244,6 +252,10 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     clauses.push('l.source = ?');
     params.push(source);
   }
+  if (req.query.business_type) {
+    clauses.push('l.business_type = ?');
+    params.push(String(req.query.business_type));
+  }
   if (status) {
     const statuses = String(status).split(',').map((s) => s.trim()).filter(Boolean);
     if (statuses.length > 1) {
@@ -256,10 +268,10 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   }
   if (q) {
     clauses.push(
-      `(l.name LIKE ? OR l.email LIKE ? OR l.company LIKE ? OR l.phone LIKE ? OR l.country LIKE ? OR l.state LIKE ? OR l.job_title LIKE ? OR l.industry LIKE ?)`,
+      `(l.name LIKE ? OR l.email LIKE ? OR l.company LIKE ? OR l.phone LIKE ? OR l.country LIKE ? OR l.state LIKE ? OR l.job_title LIKE ? OR l.industry LIKE ? OR l.business_type LIKE ?)`,
     );
     const like = `%${q}%`;
-    params.push(like, like, like, like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like, like);
   }
 
   const emailFilter = String(emailStatus || '').toLowerCase();
@@ -456,6 +468,7 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     notes,
     estimated_value,
     bmgenie_user_id,
+    business_type: rawBizType,
   } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
   if (!industry || !String(industry).trim()) {
@@ -473,6 +486,8 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     return res.status(403).json({ error: 'Telesales can only create telesales leads' });
   }
 
+  const businessType = rawBizType && BUSINESS_TYPE_KEYS.includes(rawBizType) ? rawBizType : null;
+
   const nameTrim = name.trim();
   const industryTrim = String(industry).trim();
   // Company format: primary name is the company; keep company column in sync when omitted
@@ -487,8 +502,8 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     `INSERT INTO leads (
       id, name, email, phone, company, country, state, job_title, industry, contact_format,
       source, status, notes, estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by,
-      date_added
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      date_added, business_type
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     nameTrim,
@@ -509,6 +524,8 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     now,
     req.user.id,
     now,
+    now,
+    businessType,
   );
   db.prepare(
     `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
@@ -537,11 +554,21 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     industry,
     contact_format,
     status,
+    source,
+    business_type,
     notes,
     estimated_value,
     lost_reason,
     next_follow_up_at,
   } = req.body || {};
+
+  if (source && !LEAD_SOURCES[source]) {
+    return res.status(400).json({ error: 'Invalid source', allowed: Object.keys(LEAD_SOURCES) });
+  }
+
+  if (business_type !== undefined && business_type !== null && business_type !== '' && !BUSINESS_TYPE_KEYS.includes(business_type)) {
+    return res.status(400).json({ error: 'Invalid business_type', allowed: BUSINESS_TYPE_KEYS });
+  }
 
   const nextStatus = status ? normalizeStatus(status) : undefined;
   if (nextStatus && !LEAD_STATUSES.includes(nextStatus)) {
@@ -582,6 +609,8 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
       industry = COALESCE(?, industry),
       contact_format = COALESCE(?, contact_format),
       status = COALESCE(?, status),
+      source = COALESCE(?, source),
+      business_type = COALESCE(?, business_type),
       notes = COALESCE(?, notes),
       estimated_value = COALESCE(?, estimated_value),
       lost_reason = COALESCE(?, lost_reason),
@@ -600,6 +629,8 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     industry !== undefined ? String(industry).trim() : null,
     contact_format ?? null,
     nextStatus ?? null,
+    source ?? null,
+    business_type !== undefined ? (business_type || null) : null,
     notes !== undefined ? notes : null,
     estimated_value !== undefined ? Number(estimated_value) : null,
     lost_reason !== undefined ? lost_reason : null,
@@ -693,6 +724,67 @@ router.post(
   },
 );
 
+/** Reset LinkedIn outreach counters and remove accidental LinkedIn activities */
+router.post(
+  '/:id/reset-linkedin',
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    const lead = requireLeadAccess(req, res);
+    if (!lead) return;
+
+    db.prepare(
+      `UPDATE leads SET
+        linkedin_connection_sent = 0,
+        linkedin_connection_accepted = 0,
+        linkedin_messages_sent = 0,
+        linkedin_replies = 0,
+        linkedin_followups_sent = 0,
+        linkedin_meetings = 0,
+        updated_at = datetime('now')
+       WHERE id = ?`,
+    ).run(lead.id);
+
+    db.prepare(
+      `DELETE FROM lead_activities
+       WHERE lead_id = ? AND (type LIKE 'linkedin%' OR type = 'meeting_scheduled')`,
+    ).run(lead.id);
+
+    res.json(db.prepare(`SELECT * FROM leads WHERE id = ?`).get(lead.id));
+  },
+);
+
+/** Delete a specific lead activity */
+router.delete(
+  '/:id/activities/:activityId',
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    const lead = requireLeadAccess(req, res);
+    if (!lead) return;
+
+    const act = db
+      .prepare(`SELECT * FROM lead_activities WHERE id = ? AND lead_id = ?`)
+      .get(req.params.activityId, lead.id);
+    if (!act) return res.status(404).json({ error: 'Activity not found' });
+
+    // Decrement corresponding LinkedIn metric if applicable
+    const liDec = {
+      linkedin_connection_sent: 'linkedin_connection_sent',
+      linkedin_connection_accepted: 'linkedin_connection_accepted',
+      linkedin_message: 'linkedin_messages_sent',
+      linkedin_reply: 'linkedin_replies',
+      linkedin_followup: 'linkedin_followups_sent',
+      meeting_scheduled: 'linkedin_meetings',
+    };
+    if (liDec[act.type]) {
+      db.prepare(
+        `UPDATE leads SET ${liDec[act.type]} = MAX(0, COALESCE(${liDec[act.type]}, 0) - 1), updated_at = datetime('now') WHERE id = ?`,
+      ).run(lead.id);
+    }
+
+    db.prepare(`DELETE FROM lead_activities WHERE id = ?`).run(act.id);
+    res.json({ ok: true, deleted: act.id });
+  },
+);
 
 /** Company contacts (employees) under a lead */
 router.get(
@@ -850,8 +942,8 @@ router.post(
       `INSERT INTO leads (
         id, name, email, phone, company, country, state, job_title, industry, contact_format,
         source, status, notes, estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by,
-        date_added
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        date_added, business_type
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
     const now = new Date().toISOString();
@@ -877,6 +969,29 @@ router.post(
         const state = csvCell(row, 'state', 'State');
         const jobTitle = csvCell(row, 'job_title', 'Job Title', 'job title', 'title', 'Title');
         const industry = csvCell(row, 'industry', 'Industry');
+        const rawBiz = csvCell(
+          row,
+          'business_type',
+          'Business Type',
+          'business type',
+          'type',
+          'Type',
+          'category',
+          'Category',
+          'segment',
+          'Segment',
+        );
+        let bizType = null;
+        if (rawBiz) {
+          const s = String(rawBiz).trim().toLowerCase();
+          if (s.includes('realtor') || s.includes('agent') || s.includes('broker')) bizType = 'realtor';
+          else if (s.includes('owner') || s.includes('real estate owner') || s.includes('landlord')) bizType = 'real_estate_owner';
+          else if (s.includes('agency') || s.includes('brokerage') || s.includes('firm')) bizType = 'agency';
+          else if (s.includes('photo') || s.includes('videographer') || s.includes('media')) bizType = 'photographer';
+          else if (s.includes('individual') || s.includes('person') || s.includes('solo')) bizType = 'individual';
+          else if (BUSINESS_TYPE_KEYS.includes(s)) bizType = s;
+          else bizType = 'other';
+        }
         const rawFormat = String(
           csvCell(row, 'contact_format', 'Contact Format', 'format', 'Format') || 'company',
         )
@@ -913,6 +1028,7 @@ router.post(
           now,
           req.user.id,
           dateAdded,
+          bizType,
         );
         db.prepare(
           `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
