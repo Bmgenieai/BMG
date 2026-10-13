@@ -1,0 +1,39 @@
+name: Cleanup remove employees
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cleanup-remove-employees
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Hard-delete listed employees (Windows)
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH cleanup on Windows PC
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          command_timeout: 10m
+          script: |
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+            $path = '${{ secrets.CRM_DEPLOY_PATH }}'
+            if ([string]::IsNullOrWhiteSpace($path)) { $path = 'D:\crm-api.bmgenie.ai' }
+            if (-not (Test-Path $path)) { throw "CRM path not found: $path" }
+            Set-Location $path
+            git fetch origin main
+            if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+            git reset --hard origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'git reset --hard failed' }
+            if (-not (Test-Path .\scripts\windows\cleanup-remove-employees.cjs)) {
+              throw 'cleanup-remove-employees.cjs missing after pull'
+            }
+            Write-Host '--- Hard-delete listed employees ---'
+            node .\scripts\windows\cleanup-remove-employees.cjs
+            if ($LASTEXITCODE -ne 0) { throw 'cleanup script failed' }
+            Write-Host 'CLEANUP_DONE'
+            exit 0
