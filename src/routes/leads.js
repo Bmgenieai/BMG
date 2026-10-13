@@ -555,7 +555,6 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     now,
     req.user.id,
     now,
-    now,
     businessType,
     linkedinUrl,
   );
