@@ -193,6 +193,7 @@ export function migrate() {
     `ALTER TABLE leads ADD COLUMN linkedin_followups_sent INTEGER DEFAULT 0`,
     `ALTER TABLE leads ADD COLUMN linkedin_meetings INTEGER DEFAULT 0`,
     `ALTER TABLE leads ADD COLUMN business_type TEXT`,
+    `ALTER TABLE leads ADD COLUMN linkedin_url TEXT`,
   ];
   for (const sql of leadAlters) {
     try {

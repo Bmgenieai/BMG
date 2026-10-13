@@ -287,10 +287,10 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   }
   if (q) {
     clauses.push(
-      `(l.name LIKE ? OR l.email LIKE ? OR l.company LIKE ? OR l.phone LIKE ? OR l.country LIKE ? OR l.state LIKE ? OR l.job_title LIKE ? OR l.industry LIKE ? OR l.business_type LIKE ?)`,
+      `(l.name LIKE ? OR l.email LIKE ? OR l.company LIKE ? OR l.phone LIKE ? OR l.country LIKE ? OR l.state LIKE ? OR l.job_title LIKE ? OR l.industry LIKE ? OR l.business_type LIKE ? OR l.linkedin_url LIKE ?)`,
     );
     const like = `%${q}%`;
-    params.push(like, like, like, like, like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like, like, like);
   }
 
   const emailFilter = String(emailStatus || '').toLowerCase();
@@ -472,6 +472,16 @@ router.get('/:id', requireAnyPermission('leads:view_all', 'leads:view_own'), (re
   res.json({ ...lead, activities, followUps, employees, emailHistory });
 });
 
+const BD_CREATE_SOURCES = new Set(['telesales', 'linkedin', 'facebook', 'instagram']);
+
+function normalizeLinkedInUrl(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) return s;
+  return `https://${s}`;
+}
+
 router.post('/', requirePermission('leads:create'), (req, res) => {
   const {
     name,
@@ -488,6 +498,7 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     estimated_value,
     bmgenie_user_id,
     business_type: rawBizType,
+    linkedin_url: rawLinkedInUrl,
   } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
   if (!industry || !String(industry).trim()) {
@@ -500,12 +511,13 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
   if (!LEAD_SOURCES[source]) {
     return res.status(400).json({ error: 'Invalid source', allowed: Object.keys(LEAD_SOURCES) });
   }
-  // Telesales can only create telesales-sourced leads
-  if (isTelesales && source !== 'telesales') {
-    return res.status(403).json({ error: 'Telesales can only create telesales leads' });
+  // BDs can create BD + social-channel leads (LinkedIn / Facebook / Instagram panels)
+  if (isTelesales && !BD_CREATE_SOURCES.has(source)) {
+    return res.status(403).json({ error: 'BD can only create BD or social-channel leads' });
   }
 
   const businessType = rawBizType && BUSINESS_TYPE_KEYS.includes(rawBizType) ? rawBizType : null;
+  const linkedinUrl = normalizeLinkedInUrl(rawLinkedInUrl);
 
   const nameTrim = name.trim();
   const industryTrim = String(industry).trim();
@@ -521,8 +533,8 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     `INSERT INTO leads (
       id, name, email, phone, company, country, state, job_title, industry, contact_format,
       source, status, notes, estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by,
-      date_added, business_type
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      date_added, business_type, linkedin_url
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     nameTrim,
@@ -545,6 +557,7 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     now,
     now,
     businessType,
+    linkedinUrl,
   );
   db.prepare(
     `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
@@ -579,6 +592,7 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     estimated_value,
     lost_reason,
     next_follow_up_at,
+    linkedin_url,
   } = req.body || {};
 
   if (source && !LEAD_SOURCES[source]) {
@@ -616,6 +630,9 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
       ? new Date().toISOString()
       : lead.converted_at;
 
+  const linkedinUrlPatch =
+    linkedin_url !== undefined ? normalizeLinkedInUrl(linkedin_url) : null;
+
   db.prepare(
     `UPDATE leads SET
       name = COALESCE(?, name),
@@ -634,6 +651,7 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
       estimated_value = COALESCE(?, estimated_value),
       lost_reason = COALESCE(?, lost_reason),
       next_follow_up_at = COALESCE(?, next_follow_up_at),
+      linkedin_url = CASE WHEN ? THEN ? ELSE linkedin_url END,
       converted_at = ?,
       updated_at = datetime('now')
      WHERE id = ?`,
@@ -654,6 +672,8 @@ router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'
     estimated_value !== undefined ? Number(estimated_value) : null,
     lost_reason !== undefined ? lost_reason : null,
     next_follow_up_at !== undefined ? next_follow_up_at : null,
+    linkedin_url !== undefined ? 1 : 0,
+    linkedinUrlPatch,
     convertedAt,
     lead.id,
   );
