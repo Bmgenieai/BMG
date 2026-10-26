@@ -15,6 +15,16 @@ const OPEN_LIST = OPEN_STATUSES.map((s) => `'${s}'`).join(',');
 /** Normalize mixed ISO / SQLite datetime strings for range compares. */
 const DT = (col) => `datetime(REPLACE(REPLACE(${col}, 'T', ' '), 'Z', ''))`;
 
+/** LinkedIn activity types — never count these on Facebook/Instagram-sourced leads. */
+const LI_TYPE_LIST =
+  "'linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply'";
+const LI_SOURCE_OK = `COALESCE(l.source, '') NOT IN ('facebook', 'instagram')`;
+const LI_ACTION = `(a.type IN (${LI_TYPE_LIST}) AND ${LI_SOURCE_OK})`;
+const LI_TYPE = (type) => `(a.type = '${type}' AND ${LI_SOURCE_OK})`;
+const LI_MSG = `(a.type IN ('linkedin_message','linkedin') AND ${LI_SOURCE_OK})`;
+const FB_ACTION = `a.type IN ('facebook','facebook_message','facebook_reply')`;
+const IG_ACTION = `a.type IN ('instagram','instagram_message','instagram_reply')`;
+
 router.get(
   '/overview',
   requireAnyPermission('analytics:view_all', 'analytics:view_team', 'analytics:view_own'),
@@ -307,22 +317,25 @@ router.get(
           SUM(CASE WHEN a.type IN ('email','email_sent') THEN 1 ELSE 0 END) AS emails,
           SUM(CASE WHEN a.type = 'email_followup' THEN 1 ELSE 0 END) AS email_followups,
           SUM(CASE WHEN a.type IN ('email_opened') THEN 1 ELSE 0 END) AS email_opens,
-          SUM(CASE WHEN a.type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply') THEN 1 ELSE 0 END) AS linkedin_touches,
-          SUM(CASE WHEN a.type = 'linkedin_connection_sent' THEN 1 ELSE 0 END) AS linkedin_connection_sent,
-          SUM(CASE WHEN a.type = 'linkedin_connection_accepted' THEN 1 ELSE 0 END) AS linkedin_connection_accepted,
-          SUM(CASE WHEN a.type IN ('linkedin_message','linkedin') THEN 1 ELSE 0 END) AS linkedin_messages,
-          SUM(CASE WHEN a.type = 'linkedin_reply' THEN 1 ELSE 0 END) AS linkedin_replies,
+          SUM(CASE WHEN ${LI_ACTION} THEN 1 ELSE 0 END) AS linkedin_touches,
+          SUM(CASE WHEN ${LI_TYPE('linkedin_connection_sent')} THEN 1 ELSE 0 END) AS linkedin_connection_sent,
+          SUM(CASE WHEN ${LI_TYPE('linkedin_connection_accepted')} THEN 1 ELSE 0 END) AS linkedin_connection_accepted,
+          SUM(CASE WHEN ${LI_MSG} THEN 1 ELSE 0 END) AS linkedin_messages,
+          SUM(CASE WHEN ${LI_TYPE('linkedin_reply')} THEN 1 ELSE 0 END) AS linkedin_replies,
+          SUM(CASE WHEN ${FB_ACTION} THEN 1 ELSE 0 END) AS facebook_touches,
+          SUM(CASE WHEN ${IG_ACTION} THEN 1 ELSE 0 END) AS instagram_touches,
           SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected') THEN 1 ELSE 0 END) AS calls,
           SUM(CASE WHEN a.type = 'call_attempted' THEN 1 ELSE 0 END) AS calls_attempted,
           SUM(CASE WHEN a.type IN ('call','call_connected') THEN 1 ELSE 0 END) AS calls_connected,
-          SUM(CASE WHEN a.type IN ('reply','linkedin_reply') THEN 1 ELSE 0 END) AS replies,
+          SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies,
           SUM(CASE WHEN a.type = 'reply' AND a.outcome = 'positive' THEN 1 ELSE 0 END) AS positive_replies,
           SUM(CASE WHEN a.type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings_requested,
           SUM(CASE WHEN a.type = 'demo_shown' THEN 1 ELSE 0 END) AS demos_shown,
-          COUNT(DISTINCT CASE WHEN a.type IN ('email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','call','call_attempted','call_connected') THEN a.lead_id END) AS leads_touched,
-          COUNT(DISTINCT CASE WHEN a.type IN ('reply','linkedin_reply') THEN a.lead_id END) AS leads_replied,
+          COUNT(DISTINCT CASE WHEN a.type IN ('email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','facebook','facebook_message','instagram','instagram_message','call','call_attempted','call_connected') THEN a.lead_id END) AS leads_touched,
+          COUNT(DISTINCT CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN a.lead_id END) AS leads_replied,
           COUNT(DISTINCT CASE WHEN a.type = 'reply' AND a.outcome = 'positive' THEN a.lead_id END) AS leads_positive_reply
          FROM lead_activities a
+         LEFT JOIN leads l ON l.id = a.lead_id
          WHERE 1=1 ${actFilter} ${win('a.created_at')}`,
       )
       .get(...params);
@@ -416,6 +429,8 @@ router.get(
         linkedinConnectionAccepted: outreach.linkedin_connection_accepted || 0,
         linkedinMessages: outreach.linkedin_messages || 0,
         linkedinReplies: outreach.linkedin_replies || 0,
+        facebookTouches: outreach.facebook_touches || 0,
+        instagramTouches: outreach.instagram_touches || 0,
         callsAttempted: outreach.calls_attempted || outreach.calls || 0,
         callsConnected: outreach.calls_connected || 0,
         positiveReplies: outreach.positive_replies || 0,
@@ -431,6 +446,8 @@ router.get(
         linkedinConnectionAccepted: outreach.linkedin_connection_accepted || 0,
         linkedinMessages: outreach.linkedin_messages || 0,
         linkedinReplies: outreach.linkedin_replies || 0,
+        facebookTouches: outreach.facebook_touches || 0,
+        instagramTouches: outreach.instagram_touches || 0,
         calls: outreach.calls || 0,
         callsAttempted: outreach.calls_attempted || 0,
         callsConnected: outreach.calls_connected || 0,
@@ -727,14 +744,16 @@ router.get(
            SUM(CASE WHEN a.type IN ('email', 'email_sent') THEN 1 ELSE 0 END) AS emails,
            SUM(CASE WHEN a.type = 'email_followup' THEN 1 ELSE 0 END) AS email_followups,
            SUM(CASE WHEN a.type = 'note' THEN 1 ELSE 0 END) AS notes,
-           SUM(CASE WHEN a.type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply') THEN 1 ELSE 0 END) AS linkedin,
-           SUM(CASE WHEN a.type = 'linkedin_connection_sent' THEN 1 ELSE 0 END) AS linkedin_connection_sent,
-           SUM(CASE WHEN a.type = 'linkedin_message' THEN 1 ELSE 0 END) AS linkedin_messages,
-           SUM(CASE WHEN a.type = 'linkedin_reply' THEN 1 ELSE 0 END) AS linkedin_replies,
+           SUM(CASE WHEN ${LI_ACTION} THEN 1 ELSE 0 END) AS linkedin,
+           SUM(CASE WHEN ${LI_TYPE('linkedin_connection_sent')} THEN 1 ELSE 0 END) AS linkedin_connection_sent,
+           SUM(CASE WHEN ${LI_TYPE('linkedin_message')} THEN 1 ELSE 0 END) AS linkedin_messages,
+           SUM(CASE WHEN ${LI_TYPE('linkedin_reply')} THEN 1 ELSE 0 END) AS linkedin_replies,
+           SUM(CASE WHEN ${FB_ACTION} THEN 1 ELSE 0 END) AS facebook,
+           SUM(CASE WHEN ${IG_ACTION} THEN 1 ELSE 0 END) AS instagram,
            SUM(CASE WHEN a.type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings,
-           SUM(CASE WHEN a.type IN ('reply','linkedin_reply') THEN 1 ELSE 0 END) AS replies,
-           SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','note') THEN 1 ELSE 0 END) AS total_outreach,
-           COUNT(DISTINCT CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','note','reply','linkedin_reply') THEN a.lead_id END) AS leads_touched
+           SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies,
+           SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','facebook','facebook_message','instagram','instagram_message','note') THEN 1 ELSE 0 END) AS total_outreach,
+           COUNT(DISTINCT CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','facebook','facebook_message','instagram','instagram_message','note','reply','linkedin_reply','facebook_reply','instagram_reply') THEN a.lead_id END) AS leads_touched
          FROM lead_activities a
          LEFT JOIN leads l ON l.id = a.lead_id
          WHERE a.user_id IS NOT NULL
@@ -845,6 +864,8 @@ router.get(
         linkedinConnectionSent: num(act.linkedin_connection_sent),
         linkedinMessages: num(act.linkedin_messages),
         linkedinReplies: num(act.linkedin_replies),
+        facebook: num(act.facebook),
+        instagram: num(act.instagram),
         meetings: num(act.meetings),
         replies: num(act.replies),
         totalOutreach: num(act.total_outreach),
@@ -889,6 +910,8 @@ router.get(
       linkedinConnectionSent: sumField('linkedinConnectionSent'),
       linkedinMessages: sumField('linkedinMessages'),
       linkedinReplies: sumField('linkedinReplies'),
+      facebook: sumField('facebook'),
+      instagram: sumField('instagram'),
       meetings: sumField('meetings'),
       replies: sumField('replies'),
       totalOutreach: sumField('totalOutreach'),
@@ -951,8 +974,8 @@ router.get(
                     COUNT(DISTINCT a.lead_id) AS leads_touched,
                     SUM(CASE WHEN a.type IN ('email','email_sent','email_followup') THEN 1 ELSE 0 END) AS emails,
                     SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected') THEN 1 ELSE 0 END) AS calls,
-                    SUM(CASE WHEN a.type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply') THEN 1 ELSE 0 END) AS linkedin,
-                    SUM(CASE WHEN a.type IN ('reply','linkedin_reply') THEN 1 ELSE 0 END) AS replies,
+                    SUM(CASE WHEN ${LI_ACTION} THEN 1 ELSE 0 END) AS linkedin,
+                    SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies,
                     COUNT(*) AS activities
              FROM lead_activities a
              JOIN leads l ON l.id = a.lead_id
@@ -1351,23 +1374,25 @@ router.get(
            LIMIT ?`,
         )
         .all(limit);
-    } else if (metric.startsWith('linkedin')) {
+    } else if (metric.startsWith('linkedin') || metric === 'facebook' || metric === 'instagram') {
       const typeMap = {
-        linkedin: "a.type IN ('linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_connection_accepted','linkedin_reply')",
-        linkedin_connection_sent: "a.type = 'linkedin_connection_sent'",
-        linkedin_connection_accepted: "a.type = 'linkedin_connection_accepted'",
-        linkedin_messages: "a.type = 'linkedin_message'",
-        linkedin_replies: "a.type = 'linkedin_reply'",
-        linkedin_followup: "a.type = 'linkedin_followup'",
+        linkedin: LI_ACTION,
+        linkedin_connection_sent: LI_TYPE('linkedin_connection_sent'),
+        linkedin_connection_accepted: LI_TYPE('linkedin_connection_accepted'),
+        linkedin_messages: LI_MSG,
+        linkedin_replies: LI_TYPE('linkedin_reply'),
+        linkedin_followup: LI_TYPE('linkedin_followup'),
+        facebook: FB_ACTION,
+        instagram: IG_ACTION,
       };
-      const typeClause = typeMap[metric] || "a.type LIKE 'linkedin%'";
+      const typeClause = typeMap[metric] || `(a.type LIKE 'linkedin%' AND ${LI_SOURCE_OK})`;
       title = String(metric).replace(/_/g, ' ');
       const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
       items = db
         .prepare(
           `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
-                  l.status AS lead_status, l.business_type, l.state,
+                  l.status AS lead_status, l.source AS lead_source, l.business_type, l.state,
                   u.name AS user_name
            FROM lead_activities a
            LEFT JOIN leads l ON l.id = a.lead_id

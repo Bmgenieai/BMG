@@ -14,12 +14,16 @@ import {
   LOST_REASONS,
   ACTIVITY_TYPES,
   LINKEDIN_ACTIVITY_TYPES,
+  FACEBOOK_ACTIVITY_TYPES,
+  INSTAGRAM_ACTIVITY_TYPES,
   REPLY_OUTCOMES,
   BUSINESS_TYPES,
   BUSINESS_TYPE_KEYS,
   normalizeStatus,
   canAccessLead,
   roleHasPermission,
+  allowedOutreachTypesForSource,
+  NON_LINKEDIN_SOCIAL_SOURCES,
 } from '../lib/permissions.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
 import {
@@ -482,6 +486,96 @@ function normalizeLinkedInUrl(raw) {
   return `https://${s}`;
 }
 
+function normalizePhone(raw) {
+  if (raw == null) return '';
+  return String(raw).replace(/\D+/g, '');
+}
+
+function normalizeEmail(raw) {
+  if (raw == null) return '';
+  return String(raw).trim().toLowerCase();
+}
+
+/** Find existing leads that look like the same person/company. */
+function findDuplicateLeads({ email, phone, linkedin_url, name, company, excludeId } = {}) {
+  const emailNorm = normalizeEmail(email);
+  const phoneNorm = normalizePhone(phone);
+  const liNorm = normalizeLinkedInUrl(linkedin_url);
+  const nameNorm = name ? String(name).trim().toLowerCase() : '';
+  const companyNorm = company ? String(company).trim().toLowerCase() : '';
+
+  const clauses = [];
+  const params = [];
+
+  if (emailNorm) {
+    clauses.push(`LOWER(TRIM(COALESCE(l.email, ''))) = ?`);
+    params.push(emailNorm);
+  }
+  if (phoneNorm && phoneNorm.length >= 7) {
+    clauses.push(
+      `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(l.phone, ''), ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?`,
+    );
+    params.push(phoneNorm);
+  }
+  if (liNorm) {
+    clauses.push(
+      `LOWER(TRIM(REPLACE(REPLACE(COALESCE(l.linkedin_url, ''), 'https://', ''), 'http://', ''))) = LOWER(TRIM(REPLACE(REPLACE(?, 'https://', ''), 'http://', '')))`,
+    );
+    params.push(liNorm);
+  }
+  if (nameNorm && companyNorm && nameNorm === companyNorm) {
+    clauses.push(
+      `(LOWER(TRIM(COALESCE(l.name, ''))) = ? OR LOWER(TRIM(COALESCE(l.company, ''))) = ?)`,
+    );
+    params.push(nameNorm, companyNorm);
+  } else if (nameNorm && companyNorm) {
+    clauses.push(
+      `(LOWER(TRIM(COALESCE(l.name, ''))) = ? AND LOWER(TRIM(COALESCE(l.company, ''))) = ?)`,
+    );
+    params.push(nameNorm, companyNorm);
+  }
+
+  if (!clauses.length) return [];
+
+  let sql = `SELECT l.id, l.name, l.email, l.phone, l.company, l.source, l.status, l.linkedin_url,
+                    COALESCE(l.times_added, 1) AS times_added, l.created_at, l.assigned_to,
+                    u.name AS assigned_name
+             FROM leads l
+             LEFT JOIN users u ON u.id = l.assigned_to
+             WHERE (l.archived_at IS NULL OR l.archived_at = '')
+               AND (${clauses.join(' OR ')})`;
+  if (excludeId) {
+    sql += ` AND l.id != ?`;
+    params.push(excludeId);
+  }
+  sql += ` ORDER BY l.created_at DESC LIMIT 10`;
+  return db.prepare(sql).all(...params);
+}
+
+function bumpTimesAdded(leadIds, userId, reason) {
+  const ids = [...new Set((leadIds || []).filter(Boolean))];
+  if (!ids.length) return;
+  const upd = db.prepare(
+    `UPDATE leads SET times_added = COALESCE(times_added, 1) + 1, updated_at = datetime('now') WHERE id = ?`,
+  );
+  const act = db.prepare(
+    `INSERT INTO lead_activities (id, lead_id, user_id, type, summary) VALUES (?, ?, ?, 'note', ?)`,
+  );
+  for (const id of ids) {
+    upd.run(id);
+    act.run(uuid(), id, userId || null, reason || 'Duplicate add attempt recorded');
+  }
+}
+
+router.post('/check-duplicate', requirePermission('leads:create'), (req, res) => {
+  const matches = findDuplicateLeads(req.body || {});
+  res.json({
+    duplicate: matches.length > 0,
+    matches,
+    timesAdded: matches.length ? Math.max(...matches.map((m) => Number(m.times_added) || 1)) : 0,
+  });
+});
+
 router.post('/', requirePermission('leads:create'), (req, res) => {
   const {
     name,
@@ -499,6 +593,7 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     bmgenie_user_id,
     business_type: rawBizType,
     linkedin_url: rawLinkedInUrl,
+    forceDuplicate,
   } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
   if (!industry || !String(industry).trim()) {
@@ -527,14 +622,45 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
       ? company?.trim() || nameTrim
       : company?.trim() || null;
 
+  const duplicates = findDuplicateLeads({
+    email,
+    phone,
+    linkedin_url: linkedinUrl,
+    name: nameTrim,
+    company: companyVal,
+  });
+
+  if (duplicates.length && !forceDuplicate) {
+    const maxTimes = Math.max(...duplicates.map((m) => Number(m.times_added) || 1));
+    return res.status(409).json({
+      error: 'A similar lead already exists',
+      duplicate: true,
+      matches: duplicates,
+      timesAdded: maxTimes,
+      message: `This lead appears to already exist (added ${maxTimes} time${maxTimes === 1 ? '' : 's'}). Open the existing lead or confirm to add anyway.`,
+    });
+  }
+
+  if (duplicates.length && forceDuplicate) {
+    bumpTimesAdded(
+      duplicates.map((d) => d.id),
+      req.user.id,
+      `Duplicate lead re-added by ${req.user.name} (now counted again)`,
+    );
+  }
+
   const id = uuid();
   const now = new Date().toISOString();
+  const initialTimes =
+    duplicates.length && forceDuplicate
+      ? Math.max(...duplicates.map((m) => Number(m.times_added) || 1)) + 1
+      : 1;
   db.prepare(
     `INSERT INTO leads (
       id, name, email, phone, company, country, state, job_title, industry, contact_format,
       source, status, notes, estimated_value, bmgenie_user_id, created_by, assigned_to, assigned_at, assigned_by,
-      date_added, business_type, linkedin_url
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      date_added, business_type, linkedin_url, times_added
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     nameTrim,
@@ -557,6 +683,7 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     now,
     businessType,
     linkedinUrl,
+    initialTimes,
   );
   db.prepare(
     `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
@@ -565,7 +692,9 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
     uuid(),
     id,
     req.user.id,
-    `Lead created by ${req.user.name} (${LEAD_SOURCES[source].label}, ${contactFormat})`,
+    duplicates.length && forceDuplicate
+      ? `Lead re-added by ${req.user.name} (${LEAD_SOURCES[source].label}, ${contactFormat}) — times added: ${initialTimes}`
+      : `Lead created by ${req.user.name} (${LEAD_SOURCES[source].label}, ${contactFormat})`,
   );
   res.status(201).json(getLeadWithJoins(id));
 });
@@ -696,9 +825,45 @@ router.post(
     const { type = 'note', summary, outcome, next_follow_up_at, status: rawStatus } = req.body || {};
     if (!summary) return res.status(400).json({ error: 'summary required' });
 
-    const allowedTypes = new Set([...ACTIVITY_TYPES, 'created', 'status_change', ...LINKEDIN_ACTIVITY_TYPES]);
+    const allowedTypes = new Set([
+      ...ACTIVITY_TYPES,
+      'created',
+      'status_change',
+      ...LINKEDIN_ACTIVITY_TYPES,
+      ...FACEBOOK_ACTIVITY_TYPES,
+      ...INSTAGRAM_ACTIVITY_TYPES,
+    ]);
     if (!allowedTypes.has(type)) {
       return res.status(400).json({ error: 'Invalid activity type', allowed: [...allowedTypes] });
+    }
+
+    // Keep LinkedIn / Facebook / Instagram outreach on the correct platform
+    const isLiType = type === 'linkedin' || type.startsWith('linkedin_');
+    const isFbType = type === 'facebook' || type.startsWith('facebook_');
+    const isIgType = type === 'instagram' || type.startsWith('instagram_');
+    if (NON_LINKEDIN_SOCIAL_SOURCES.has(lead.source) && isLiType) {
+      return res.status(400).json({
+        error: `Cannot log LinkedIn activity on a ${lead.source} lead — use ${lead.source} outreach instead`,
+        allowed: allowedOutreachTypesForSource(lead.source),
+      });
+    }
+    if (lead.source === 'facebook' && isIgType) {
+      return res.status(400).json({
+        error: 'Cannot log Instagram activity on a Facebook lead',
+        allowed: FACEBOOK_ACTIVITY_TYPES,
+      });
+    }
+    if (lead.source === 'instagram' && isFbType) {
+      return res.status(400).json({
+        error: 'Cannot log Facebook activity on an Instagram lead',
+        allowed: INSTAGRAM_ACTIVITY_TYPES,
+      });
+    }
+    if (lead.source === 'linkedin' && (isFbType || isIgType)) {
+      return res.status(400).json({
+        error: 'Cannot log Facebook/Instagram activity on a LinkedIn lead',
+        allowed: allowedOutreachTypesForSource('linkedin'),
+      });
     }
 
     let status = rawStatus ? normalizeStatus(rawStatus) : undefined;
@@ -712,7 +877,7 @@ router.post(
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(actId, lead.id, req.user.id, type, summary, outcome || null, next_follow_up_at || null);
 
-    // LinkedIn metric counters on the lead
+    // LinkedIn metric counters on the lead (only for LinkedIn-sourced / non-social leads)
     const liBump = {
       linkedin_connection_sent: 'linkedin_connection_sent',
       linkedin_connection_accepted: 'linkedin_connection_accepted',
@@ -721,7 +886,7 @@ router.post(
       linkedin_followup: 'linkedin_followups_sent',
       meeting_scheduled: 'linkedin_meetings',
     };
-    if (liBump[type]) {
+    if (liBump[type] && !NON_LINKEDIN_SOCIAL_SOURCES.has(lead.source)) {
       db.prepare(
         `UPDATE leads SET ${liBump[type]} = COALESCE(${liBump[type]}, 0) + 1, updated_at = datetime('now') WHERE id = ?`,
       ).run(lead.id);
@@ -738,13 +903,22 @@ router.post(
       'linkedin_connection_sent',
       'linkedin_message',
       'linkedin_followup',
+      'facebook',
+      'facebook_message',
+      'instagram',
+      'instagram_message',
       'whatsapp',
     ]);
     if (outreachTypes.has(type)) {
       touchLeadContacted(lead.id, { userId: req.user.id });
     }
 
-    if (type === 'reply' || type === 'linkedin_reply') {
+    if (
+      type === 'reply' ||
+      type === 'linkedin_reply' ||
+      type === 'facebook_reply' ||
+      type === 'instagram_reply'
+    ) {
       onLeadReply(lead.id, { userId: req.user.id });
     } else if (type === 'meeting_scheduled' && !status) {
       advanceLeadStage(lead.id, 'demo_scheduled', { userId: req.user.id });
@@ -976,12 +1150,13 @@ router.post(
 
     let imported = 0;
     let skipped = 0;
+    let duplicates = 0;
     const insert = db.prepare(
       `INSERT INTO leads (
         id, name, email, phone, company, country, state, job_title, industry, contact_format,
         source, status, notes, estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by,
-        date_added, business_type
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        date_added, business_type, times_added
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
     );
 
     const now = new Date().toISOString();
@@ -1045,6 +1220,24 @@ router.post(
           ) || 0;
         const companyVal =
           contactFormat === 'company' ? company || name : company || null;
+
+        const existing = findDuplicateLeads({
+          email,
+          phone,
+          name,
+          company: companyVal,
+        });
+        if (existing.length) {
+          bumpTimesAdded(
+            existing.map((d) => d.id),
+            req.user.id,
+            `Duplicate CSV row skipped — times_added incremented (${req.file.originalname})`,
+          );
+          duplicates += 1;
+          skipped += 1;
+          continue;
+        }
+
         const id = uuid();
         insert.run(
           id,
@@ -1090,6 +1283,7 @@ router.post(
       rowCount: records.length,
       imported,
       skipped,
+      duplicates,
       source,
       dateAdded,
     });

@@ -270,6 +270,29 @@ export const LINKEDIN_ACTIVITY_TYPES = [
   'meeting_scheduled',
 ];
 
+export const FACEBOOK_ACTIVITY_TYPES = [
+  'facebook',
+  'facebook_message',
+  'facebook_reply',
+];
+
+export const INSTAGRAM_ACTIVITY_TYPES = [
+  'instagram',
+  'instagram_message',
+  'instagram_reply',
+];
+
+/** Sources whose outreach must not be counted as LinkedIn actions. */
+export const NON_LINKEDIN_SOCIAL_SOURCES = new Set(['facebook', 'instagram']);
+
+/** Activity types allowed for a lead based on its source channel. */
+export function allowedOutreachTypesForSource(source) {
+  if (source === 'facebook') return FACEBOOK_ACTIVITY_TYPES;
+  if (source === 'instagram') return INSTAGRAM_ACTIVITY_TYPES;
+  if (source === 'linkedin') return [...LINKEDIN_ACTIVITY_TYPES, 'linkedin'];
+  return null; // no platform restriction
+}
+
 export const REPLY_OUTCOMES = ['positive', 'negative', 'neutral', 'no_reply'];
 
 /** Prospect business type — lets CEO see outreach split by segment. */

@@ -194,6 +194,7 @@ export function migrate() {
     `ALTER TABLE leads ADD COLUMN linkedin_meetings INTEGER DEFAULT 0`,
     `ALTER TABLE leads ADD COLUMN business_type TEXT`,
     `ALTER TABLE leads ADD COLUMN linkedin_url TEXT`,
+    `ALTER TABLE leads ADD COLUMN times_added INTEGER DEFAULT 1`,
   ];
   for (const sql of leadAlters) {
     try {
@@ -201,6 +202,54 @@ export function migrate() {
     } catch {
       /* column already exists */
     }
+  }
+
+  try {
+    db.exec(
+      `UPDATE leads SET times_added = 1 WHERE times_added IS NULL OR times_added < 1`,
+    );
+  } catch {
+    /* ignore */
+  }
+
+  // Mis-logged LinkedIn activities on Facebook / Instagram leads → correct platform types
+  try {
+    db.exec(`
+      UPDATE lead_activities
+      SET type = CASE
+        WHEN type IN ('linkedin_message', 'linkedin', 'linkedin_followup', 'linkedin_connection_sent')
+          THEN 'facebook_message'
+        WHEN type IN ('linkedin_reply', 'linkedin_connection_accepted')
+          THEN 'facebook_reply'
+        ELSE type
+      END
+      WHERE type LIKE 'linkedin%'
+        AND lead_id IN (SELECT id FROM leads WHERE source = 'facebook')
+    `);
+    db.exec(`
+      UPDATE lead_activities
+      SET type = CASE
+        WHEN type IN ('linkedin_message', 'linkedin', 'linkedin_followup', 'linkedin_connection_sent')
+          THEN 'instagram_message'
+        WHEN type IN ('linkedin_reply', 'linkedin_connection_accepted')
+          THEN 'instagram_reply'
+        ELSE type
+      END
+      WHERE type LIKE 'linkedin%'
+        AND lead_id IN (SELECT id FROM leads WHERE source = 'instagram')
+    `);
+    db.exec(`
+      UPDATE leads SET
+        linkedin_connection_sent = 0,
+        linkedin_connection_accepted = 0,
+        linkedin_messages_sent = 0,
+        linkedin_replies = 0,
+        linkedin_followups_sent = 0,
+        linkedin_meetings = 0
+      WHERE source IN ('facebook', 'instagram')
+    `);
+  } catch {
+    /* ignore */
   }
 
   try {
