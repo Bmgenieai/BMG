@@ -205,7 +205,14 @@ export async function syncSenderMailboxOnce() {
     }
     return { ok: true, ingested, scanned, skipped };
   } catch (err) {
-    lastError = err.message || String(err);
+    lastError =
+      err.responseText ||
+      err.serverResponseCode ||
+      err.message ||
+      String(err);
+    if (err.responseText && err.message && err.responseText !== err.message) {
+      lastError = `${err.message}: ${err.responseText}`;
+    }
     console.warn('[sender-mailbox] sync failed:', lastError);
     try {
       await client.logout();
