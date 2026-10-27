@@ -82,7 +82,8 @@ function looksLikeReply(parsed) {
 async function processMessage(client, uid) {
   // search() returns UIDs — must pass { uid: true } to download/flags
   const downloaded = await client.download(uid, undefined, { uid: true });
-  const parsed = await simpleParser(downloaded.source);
+  if (!downloaded?.content) return { skipped: 'no_content' };
+  const parsed = await simpleParser(downloaded.content);
 
   const fromEmail = String(parsed.from?.value?.[0]?.address || '').trim().toLowerCase();
   const fromName = parsed.from?.value?.[0]?.name || null;
@@ -96,7 +97,9 @@ async function processMessage(client, uid) {
   const messageId = parsed.messageId
     ? String(parsed.messageId).replace(/^<|>$/g, '')
     : null;
-  const providerMessageId = messageId ? `mailbox:${messageId}` : `mailbox:uid-${seq}-${parsed.date?.getTime() || Date.now()}`;
+  const providerMessageId = messageId
+    ? `mailbox:${messageId}`
+    : `mailbox:uid-${uid}-${parsed.date?.getTime() || Date.now()}`;
 
   const toEmails = [
     ...addrList(parsed.to?.value),
