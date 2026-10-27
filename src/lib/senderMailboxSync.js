@@ -5,10 +5,10 @@
  *
  * Env:
  *   SENDER_MAILBOX_SYNC=true
- *   SENDER_MAILBOX_IMAP_HOST=imap.gmail.com
+ *   SENDER_MAILBOX_IMAP_HOST=mail2.benchmarkstudio.biz
  *   SENDER_MAILBOX_IMAP_PORT=993
  *   SENDER_MAILBOX_USER=magic.retouching@bmgenie.ai
- *   SENDER_MAILBOX_PASS=<Google App Password>
+ *   SENDER_MAILBOX_PASS=<mailbox password>
  *   SENDER_MAILBOX_SYNC_MS=120000   (optional, default 2 min)
  *   SENDER_MAILBOX_LOOKBACK_DAYS=120 (optional — import older inbox replies)
  */
@@ -34,7 +34,7 @@ export function senderMailboxSyncConfig() {
   return {
     enabled,
     configured: Boolean(user && pass),
-    host: (process.env.SENDER_MAILBOX_IMAP_HOST || 'imap.gmail.com').trim(),
+    host: (process.env.SENDER_MAILBOX_IMAP_HOST || 'mail2.benchmarkstudio.biz').trim(),
     port: Number(process.env.SENDER_MAILBOX_IMAP_PORT) || 993,
     user,
     syncMs: Math.max(60_000, Number(process.env.SENDER_MAILBOX_SYNC_MS) || 120_000),
@@ -76,7 +76,7 @@ function looksLikeReply(parsed) {
     return true;
   }
   const sub = String(parsed.subject || '');
-  return /^(re|fw|fwd)\s*:/i.test(sub);
+  return /^(re|fw|fwd|automatic reply)\s*:/i.test(sub);
 }
 
 async function processMessage(client, seq) {

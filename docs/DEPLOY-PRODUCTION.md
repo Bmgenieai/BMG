@@ -75,10 +75,10 @@ Pipeline: **Bmgenieai/BMG** → Actions → **Deploy CRM API to Windows**
 | `SERVER_PASSWORD` | SSH password |
 | `CRM_DEPLOY_PATH` | `D:\crm-api.bmgenie.ai` |
 | `SENDER_MAILBOX_SYNC` | `true` |
-| `SENDER_MAILBOX_IMAP_HOST` | `imap.gmail.com` |
+| `SENDER_MAILBOX_IMAP_HOST` | `mail2.benchmarkstudio.biz` |
 | `SENDER_MAILBOX_IMAP_PORT` | `993` |
 | `SENDER_MAILBOX_USER` | `magic.retouching@bmgenie.ai` |
-| `SENDER_MAILBOX_PASS` | Google App Password for that mailbox |
+| `SENDER_MAILBOX_PASS` | Mailbox password (https://mail2.benchmarkstudio.biz/) |
 | `SENDER_MAILBOX_LOOKBACK_DAYS` | `120` (optional) |
 
 On each deploy, the pipeline upserts these into `D:\crm-api.bmgenie.ai\.env` (no manual Windows edit).
