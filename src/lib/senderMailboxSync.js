@@ -79,8 +79,9 @@ function looksLikeReply(parsed) {
   return /^(re|fw|fwd|automatic reply)\s*:/i.test(sub);
 }
 
-async function processMessage(client, seq) {
-  const downloaded = await client.download(seq);
+async function processMessage(client, uid) {
+  // search() returns UIDs — must pass { uid: true } to download/flags
+  const downloaded = await client.download(uid, undefined, { uid: true });
   const parsed = await simpleParser(downloaded.source);
 
   const fromEmail = String(parsed.from?.value?.[0]?.address || '').trim().toLowerCase();
@@ -148,6 +149,7 @@ export async function syncSenderMailboxOnce() {
   let ingested = 0;
   let scanned = 0;
   let skipped = 0;
+  const skipReasons = {};
 
   const client = new ImapFlow({
     host: cfg.host,
@@ -168,30 +170,35 @@ export async function syncSenderMailboxOnce() {
       const set = new Set([...(uids || []), ...(recent || [])]);
       const list = [...set].sort((a, b) => a - b).slice(-800);
 
-      for (const seq of list) {
+      for (const uid of list) {
         scanned += 1;
         try {
-          const result = await processMessage(client, seq);
+          const result = await processMessage(client, uid);
           if (result?.ok && !result.skipped) {
             ingested += 1;
             try {
-              await client.messageFlagsAdd(seq, ['\\Seen']);
+              await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
             } catch {
               /* ignore */
             }
           } else if (result?.skipped === 'duplicate' && result.ok) {
             try {
-              await client.messageFlagsAdd(seq, ['\\Seen']);
+              await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
             } catch {
               /* ignore */
             }
             skipped += 1;
+            skipReasons.duplicate = (skipReasons.duplicate || 0) + 1;
           } else {
             skipped += 1;
+            const reason = result?.skipped || result?.error || 'unknown';
+            skipReasons[reason] = (skipReasons[reason] || 0) + 1;
           }
         } catch (err) {
           skipped += 1;
-          console.warn('[sender-mailbox] message failed', seq, err.message);
+          const reason = `throw:${err.message || 'error'}`;
+          skipReasons[reason] = (skipReasons[reason] || 0) + 1;
+          console.warn('[sender-mailbox] message failed', uid, err.message);
         }
       }
     } finally {
@@ -204,7 +211,7 @@ export async function syncSenderMailboxOnce() {
     if (ingested > 0) {
       console.log(`[sender-mailbox] synced ingested=${ingested} scanned=${scanned} skipped=${skipped}`);
     }
-    return { ok: true, ingested, scanned, skipped };
+    return { ok: true, ingested, scanned, skipped, skipReasons };
   } catch (err) {
     lastError =
       err.responseText ||
