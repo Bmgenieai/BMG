@@ -16,11 +16,21 @@ jobs:
     steps:
       - name: SSH deploy on Windows PC
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          SENDER_MAILBOX_SYNC: ${{ secrets.SENDER_MAILBOX_SYNC }}
+          SENDER_MAILBOX_IMAP_HOST: ${{ secrets.SENDER_MAILBOX_IMAP_HOST }}
+          SENDER_MAILBOX_IMAP_PORT: ${{ secrets.SENDER_MAILBOX_IMAP_PORT }}
+          SENDER_MAILBOX_USER: ${{ secrets.SENDER_MAILBOX_USER }}
+          SENDER_MAILBOX_PASS: ${{ secrets.SENDER_MAILBOX_PASS }}
+          SENDER_MAILBOX_SYNC_MS: ${{ secrets.SENDER_MAILBOX_SYNC_MS }}
+          SENDER_MAILBOX_LOOKBACK_DAYS: ${{ secrets.SENDER_MAILBOX_LOOKBACK_DAYS }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           command_timeout: 20m
+          # Passed into the remote PowerShell session; deploy-crm-api.ps1 upserts into .env
+          envs: SENDER_MAILBOX_SYNC,SENDER_MAILBOX_IMAP_HOST,SENDER_MAILBOX_IMAP_PORT,SENDER_MAILBOX_USER,SENDER_MAILBOX_PASS,SENDER_MAILBOX_SYNC_MS,SENDER_MAILBOX_LOOKBACK_DAYS
           script: |
             Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
             $path = '${{ secrets.CRM_DEPLOY_PATH }}'

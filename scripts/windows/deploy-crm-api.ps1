@@ -21,6 +21,55 @@ if (-not (Test-Path .env)) {
   throw '.env missing — copy .env.example to .env once on the server'
 }
 
+# Upsert KEY=VALUE in .env (preserves other lines). Empty value = no-op.
+function Set-DotEnvValue {
+  param(
+    [Parameter(Mandatory = $true)][string]$Key,
+    [AllowEmptyString()][string]$Value
+  )
+  if ($null -eq $Value -or [string]::IsNullOrWhiteSpace($Value)) { return }
+  $envFile = Join-Path $Root '.env'
+  $lines = @(Get-Content -Path $envFile -ErrorAction Stop)
+  $pattern = '^\s*' + [regex]::Escape($Key) + '\s*='
+  $found = $false
+  $out = foreach ($line in $lines) {
+    if ($line -match $pattern) {
+      $found = $true
+      "$Key=$Value"
+    } else {
+      $line
+    }
+  }
+  if (-not $found) {
+    $out += "$Key=$Value"
+  }
+  Set-Content -Path $envFile -Value $out -Encoding UTF8
+  Write-Host "Upserted .env $Key"
+}
+
+# Optional: pipeline injects mailbox sync (GitHub Actions secrets → env vars on the SSH session)
+if (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_SYNC)) {
+  Set-DotEnvValue -Key 'SENDER_MAILBOX_SYNC' -Value $env:SENDER_MAILBOX_SYNC.Trim()
+}
+if (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_IMAP_HOST)) {
+  Set-DotEnvValue -Key 'SENDER_MAILBOX_IMAP_HOST' -Value $env:SENDER_MAILBOX_IMAP_HOST.Trim()
+}
+if (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_IMAP_PORT)) {
+  Set-DotEnvValue -Key 'SENDER_MAILBOX_IMAP_PORT' -Value $env:SENDER_MAILBOX_IMAP_PORT.Trim()
+}
+if (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_USER)) {
+  Set-DotEnvValue -Key 'SENDER_MAILBOX_USER' -Value $env:SENDER_MAILBOX_USER.Trim()
+}
+if (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_PASS)) {
+  Set-DotEnvValue -Key 'SENDER_MAILBOX_PASS' -Value $env:SENDER_MAILBOX_PASS.Trim()
+}
+if (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_SYNC_MS)) {
+  Set-DotEnvValue -Key 'SENDER_MAILBOX_SYNC_MS' -Value $env:SENDER_MAILBOX_SYNC_MS.Trim()
+}
+if (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_LOOKBACK_DAYS)) {
+  Set-DotEnvValue -Key 'SENDER_MAILBOX_LOOKBACK_DAYS' -Value $env:SENDER_MAILBOX_LOOKBACK_DAYS.Trim()
+}
+
 function Stop-PortListener {
   param([int]$Port = 4050)
 

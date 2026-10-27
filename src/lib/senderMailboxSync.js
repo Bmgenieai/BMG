@@ -10,6 +10,7 @@
  *   SENDER_MAILBOX_USER=magic.retouching@bmgenie.ai
  *   SENDER_MAILBOX_PASS=<Google App Password>
  *   SENDER_MAILBOX_SYNC_MS=120000   (optional, default 2 min)
+ *   SENDER_MAILBOX_LOOKBACK_DAYS=120 (optional — import older inbox replies)
  */
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
@@ -37,6 +38,10 @@ export function senderMailboxSyncConfig() {
     port: Number(process.env.SENDER_MAILBOX_IMAP_PORT) || 993,
     user,
     syncMs: Math.max(60_000, Number(process.env.SENDER_MAILBOX_SYNC_MS) || 120_000),
+    lookbackDays: Math.min(
+      365,
+      Math.max(14, Number(process.env.SENDER_MAILBOX_LOOKBACK_DAYS) || 120),
+    ),
     lastError,
     lastSyncAt,
     lastIngested,
@@ -155,12 +160,12 @@ export async function syncSenderMailboxOnce() {
     await client.connect();
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // Unseen first; also recent mail from last 14 days in case flags were cleared
-      const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+      // Unseen + all mail in lookback window (catches older replies already in inbox)
+      const since = new Date(Date.now() - cfg.lookbackDays * 24 * 60 * 60 * 1000);
       const uids = await client.search({ seen: false });
       const recent = await client.search({ since });
       const set = new Set([...(uids || []), ...(recent || [])]);
-      const list = [...set].slice(-150);
+      const list = [...set].sort((a, b) => a - b).slice(-800);
 
       for (const seq of list) {
         scanned += 1;

@@ -72,17 +72,31 @@ Many prospects hit **Reply** to the visible From address, not Reply-To. Those la
 
 Keep the Reply-To flow above, and also enable IMAP sync on the CRM API:
 
+**Preferred (no Windows PC):** set GitHub secrets on **Bmgenieai/BMG** — deploy upserts `.env` automatically:
+
+| Secret | Value |
+|--------|--------|
+| `SENDER_MAILBOX_SYNC` | `true` |
+| `SENDER_MAILBOX_IMAP_HOST` | `imap.gmail.com` |
+| `SENDER_MAILBOX_IMAP_PORT` | `993` |
+| `SENDER_MAILBOX_USER` | `magic.retouching@bmgenie.ai` |
+| `SENDER_MAILBOX_PASS` | Google App Password |
+| `SENDER_MAILBOX_LOOKBACK_DAYS` | `120` |
+
+Or local/Windows `.env`:
+
 ```env
 SENDER_MAILBOX_SYNC=true
 SENDER_MAILBOX_IMAP_HOST=imap.gmail.com
 SENDER_MAILBOX_IMAP_PORT=993
 SENDER_MAILBOX_USER=magic.retouching@bmgenie.ai
 SENDER_MAILBOX_PASS=<Google App Password>
+SENDER_MAILBOX_LOOKBACK_DAYS=120
 ```
 
-Google Workspace: enable 2FA → App passwords → create one for “Mail” → paste into `SENDER_MAILBOX_PASS`. Restart the API (`pm2 restart bmg-crm-api`).
+Google Workspace (any browser): enable 2FA → App passwords → create one for “Mail” → put in `SENDER_MAILBOX_PASS` secret → re-run **Deploy CRM API to Windows**.
 
-The worker polls INBOX every ~2 minutes, matches replies to CRM leads (In-Reply-To / References / from-email / subject), and inserts them into **Email replies** with the same threading. CEO/manager can also click **Sync now** on that page.
+The worker polls INBOX every ~2 minutes (and backfills ~120 days of inbox mail on sync), matches replies to CRM leads (In-Reply-To / References / from-email / subject), and inserts them into **Email replies** with the same threading. CEO/manager can also click **Sync now** on that page.
 
 Optional backup (no App Password): Gmail filter that forwards inbound to `mailbox@reply.bmgenie.ai` (still uses Brevo inbound webhook).
 
