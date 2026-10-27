@@ -124,13 +124,14 @@ async function processMessage(client, seq) {
     receivedAt: parsed.date ? parsed.date.toISOString() : new Date().toISOString(),
     raw: {
       ingestSource: 'sender_mailbox',
+      mailboxHost: process.env.SENDER_MAILBOX_IMAP_HOST || 'mail2.benchmarkstudio.biz',
       messageId,
       from: fromEmail,
       to: toEmails,
       subject: parsed.subject,
     },
-    source: 'sender_mailbox',
-    // Prefer a lead match, but still keep Re:/reply mail in Email replies even if unmatched
+    // Use brevo_inbound for CHECK compatibility on older DBs; raw.ingestSource marks mailbox origin
+    source: 'brevo_inbound',
     requireLeadMatch: false,
   });
 
