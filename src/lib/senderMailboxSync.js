@@ -130,8 +130,8 @@ async function processMessage(client, seq) {
       subject: parsed.subject,
     },
     source: 'sender_mailbox',
-    // Only keep mail we can attach to a CRM lead / outbound thread
-    requireLeadMatch: true,
+    // Prefer a lead match, but still keep Re:/reply mail in Email replies even if unmatched
+    requireLeadMatch: false,
   });
 
   return result;
