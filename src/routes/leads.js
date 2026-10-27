@@ -206,6 +206,10 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
   const chatsOpen = db
     .prepare(`SELECT COUNT(*) AS c FROM chat_threads WHERE status = 'open'`)
     .get().c;
+  /** Visitors who clicked Talk to a human and are waiting for CRM reply. */
+  const chatsWaitingHuman = db
+    .prepare(`SELECT COUNT(*) AS c FROM chat_threads WHERE status = 'waiting_human'`)
+    .get().c;
 
   const canViewAllReplies = roleHasPermission(req.user.role, 'leads:view_all');
   const emailRepliesCount = countEmailReplies({
@@ -224,6 +228,7 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     productCounts,
     demosCount,
     chatsOpen,
+    chatsWaitingHuman,
     emailRepliesCount,
     emailRepliesUnread,
     cohort,
