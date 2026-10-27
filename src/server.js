@@ -17,6 +17,7 @@ import emailRoutes from './routes/email.js';
 import demosRoutes from './routes/demos.js';
 import chatsRoutes from './routes/chats.js';
 import { startScheduledEmailWorker } from './lib/scheduledEmailWorker.js';
+import { startSenderMailboxSync } from './lib/senderMailboxSync.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -102,4 +103,5 @@ app.listen(PORT, () => {
     console.log(`Serving frontend from ${distPath}`);
   }
   startScheduledEmailWorker();
+  startSenderMailboxSync();
 });

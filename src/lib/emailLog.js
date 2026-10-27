@@ -444,6 +444,74 @@ function findMessageByInReplyTo(inReplyTo) {
     .get(mid, `<${mid}>`);
 }
 
+/** Match outbound CRM message from In-Reply-To and/or References headers. */
+function findMessageByThreadHeaders(inReplyTo, referencesRaw) {
+  const ids = [];
+  const push = (raw) => {
+    const mid = normalizeMessageId(raw);
+    if (mid && !ids.includes(mid)) ids.push(mid);
+  };
+  push(inReplyTo);
+  if (referencesRaw) {
+    for (const part of String(referencesRaw).split(/\s+/)) push(part);
+  }
+  for (const mid of ids) {
+    const msg = findMessageByInReplyTo(mid);
+    if (msg) return msg;
+  }
+  return null;
+}
+
+/** Match by prospect email + subject (strip Re:/Fw:). */
+function findMessageBySubjectAndFrom(subject, fromEmail) {
+  const em = normalizeEmail(fromEmail);
+  if (!em || !subject) return null;
+  const stripped = String(subject)
+    .replace(/^(re|fw|fwd)\s*:\s*/gi, '')
+    .trim();
+  if (!stripped) return null;
+
+  const exact = db
+    .prepare(
+      `SELECT * FROM email_messages
+       WHERE lower(to_email) = ?
+         AND lower(trim(COALESCE(subject, ''))) = lower(?)
+       ORDER BY sent_at DESC LIMIT 1`,
+    )
+    .get(em, stripped);
+  if (exact) return exact;
+
+  const like = db
+    .prepare(
+      `SELECT * FROM email_messages
+       WHERE lower(to_email) = ?
+         AND lower(COALESCE(subject, '')) LIKE lower(?)
+       ORDER BY sent_at DESC LIMIT 1`,
+    )
+    .get(em, `%${stripped.slice(0, 100)}%`);
+  return like || null;
+}
+
+function resolveInboundLeadAndMessage({
+  toList = [],
+  fromEmail,
+  inReplyTo,
+  references,
+  subject,
+}) {
+  const message =
+    findMessageByThreadHeaders(inReplyTo, references) ||
+    findMessageBySubjectAndFrom(subject, fromEmail) ||
+    findMessage({ brevoMessageId: null, email: fromEmail });
+
+  const leadId =
+    findLeadIdFromInboundAddresses(toList) ||
+    message?.lead_id ||
+    findLeadId({ message, email: fromEmail, tags: [] });
+
+  return { message, leadId };
+}
+
 /**
  * Stub row when Brevo fires a transactional "reply" event (no body).
  * Full body arrives later via inbound parsing when Reply-To routing is enabled.
@@ -497,6 +565,141 @@ function upsertReplyStubFromEvent({
 }
 
 /**
+ * Persist a parsed inbound reply (Brevo inbound parse OR sender mailbox IMAP).
+ * @returns {{ ok: boolean, skipped?: string, replyId?: string, leadId?: string|null }}
+ */
+export function ingestParsedReply({
+  providerMessageId = null,
+  fromEmail = null,
+  fromName = null,
+  toEmails = [],
+  inReplyTo = null,
+  references = null,
+  subject = null,
+  bodyText = null,
+  bodyHtml = null,
+  bodyMarkdown = null,
+  spamScore = null,
+  receivedAt = null,
+  raw = null,
+  source = 'brevo_inbound',
+  requireLeadMatch = false,
+}) {
+  const sourceKey = ['brevo_inbound', 'brevo_event', 'sender_mailbox'].includes(source)
+    ? source
+    : 'brevo_inbound';
+
+  const providerId = providerMessageId ? String(providerMessageId).slice(0, 500) : null;
+  if (providerId) {
+    const dup = db
+      .prepare(`SELECT id, lead_id FROM email_replies WHERE provider_message_id = ?`)
+      .get(providerId);
+    if (dup) {
+      return { ok: true, skipped: 'duplicate', replyId: dup.id, leadId: dup.lead_id };
+    }
+  }
+
+  const toList = Array.isArray(toEmails) ? toEmails.filter(Boolean) : [];
+  const { message, leadId } = resolveInboundLeadAndMessage({
+    toList,
+    fromEmail,
+    inReplyTo,
+    references,
+    subject,
+  });
+
+  if (requireLeadMatch && !leadId) {
+    return { ok: false, skipped: 'no_lead_match' };
+  }
+
+  const when = receivedAt || new Date().toISOString();
+  const id = uuid();
+  db.prepare(
+    `INSERT INTO email_replies (
+       id, lead_id, email_message_id, provider_message_id, in_reply_to,
+       from_email, from_name, to_emails, subject,
+       body_text, body_html, body_markdown, spam_score,
+       source, received_at, raw_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    leadId,
+    message?.id || null,
+    providerId,
+    normalizeMessageId(inReplyTo),
+    normalizeEmail(fromEmail),
+    fromName || null,
+    JSON.stringify([...new Set(toList)]),
+    subject || null,
+    bodyText ? String(bodyText).slice(0, 100_000) : null,
+    bodyHtml ? String(bodyHtml).slice(0, 200_000) : null,
+    bodyMarkdown ? String(bodyMarkdown).slice(0, 100_000) : null,
+    spamScore,
+    sourceKey,
+    when,
+    raw ? JSON.stringify(raw).slice(0, 16_000) : null,
+  );
+
+  if (leadId) {
+    const alreadyCounted =
+      message?.status === 'replied' ||
+      Boolean(
+        db
+          .prepare(
+            `SELECT id FROM email_events
+             WHERE lead_id = ? AND event IN ('reply','replied')
+               AND datetime(occurred_at) >= datetime(?, '-2 days')
+             LIMIT 1`,
+          )
+          .get(leadId, when.replace('T', ' ').slice(0, 19)),
+      );
+
+    if (!alreadyCounted) {
+      db.prepare(
+        `UPDATE leads
+         SET email_reply_count = COALESCE(email_reply_count, 0) + 1,
+             last_email_replied_at = ?,
+             updated_at = datetime('now')
+         WHERE id = ?`,
+      ).run(when, leadId);
+
+      if (message) {
+        db.prepare(
+          `UPDATE email_messages
+           SET reply_count = COALESCE(reply_count, 0) + 1,
+               last_replied_at = ?,
+               status = 'replied'
+           WHERE id = ?`,
+        ).run(when, message.id);
+      }
+    } else {
+      db.prepare(
+        `UPDATE leads SET last_email_replied_at = ?, updated_at = datetime('now') WHERE id = ?`,
+      ).run(when, leadId);
+      if (message) {
+        db.prepare(
+          `UPDATE email_messages
+           SET last_replied_at = ?, status = 'replied'
+           WHERE id = ?`,
+        ).run(when, message.id);
+      }
+    }
+
+    const preview = (bodyMarkdown || bodyText || subject || '(empty reply)')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 180);
+    db.prepare(
+      `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, outcome)
+       VALUES (?, ?, NULL, 'reply', ?, 'neutral')`,
+    ).run(uuid(), leadId, `Email reply: ${preview}`);
+    onLeadReply(leadId);
+  }
+
+  return { ok: true, replyId: id, leadId };
+}
+
+/**
  * Ingest one Brevo inbound-parse item (full reply body).
  * @returns {{ ok: boolean, skipped?: string, replyId?: string, leadId?: string|null }}
  */
@@ -510,15 +713,6 @@ export function ingestBrevoInboundEmail(item) {
     (Array.isArray(item.Uuid) && item.Uuid[0] ? `uuid:${item.Uuid[0]}` : null) ||
     null;
 
-  if (providerMessageId) {
-    const dup = db
-      .prepare(`SELECT id, lead_id FROM email_replies WHERE provider_message_id = ?`)
-      .get(providerMessageId);
-    if (dup) {
-      return { ok: true, skipped: 'duplicate', replyId: dup.id, leadId: dup.lead_id };
-    }
-  }
-
   const fromEmail = mailboxAddress(item.From);
   const fromName = mailboxName(item.From);
   const toList = [
@@ -531,12 +725,16 @@ export function ingestBrevoInboundEmail(item) {
     ...collectAddresses(item.Cc),
   ];
 
-  const inReplyTo = item.InReplyTo || item.inReplyTo || null;
-  const message = findMessageByInReplyTo(inReplyTo) || findMessage({ brevoMessageId: null, email: fromEmail });
-  let leadId =
-    findLeadIdFromInboundAddresses(toList) ||
-    message?.lead_id ||
-    findLeadId({ message, email: fromEmail, tags: [] });
+  const headers = Array.isArray(item.Headers) ? item.Headers : [];
+  const headerVal = (name) => {
+    const hit = headers.find(
+      (h) => String(h?.Name || h?.name || '').toLowerCase() === name.toLowerCase(),
+    );
+    return hit?.Value || hit?.value || null;
+  };
+
+  const inReplyTo = item.InReplyTo || item.inReplyTo || headerVal('In-Reply-To') || null;
+  const references = item.References || item.references || headerVal('References') || null;
 
   const subject = item.Subject || item.subject || null;
   const bodyMarkdown = item.ExtractedMarkdownMessage || null;
@@ -555,89 +753,22 @@ export function ingestBrevoInboundEmail(item) {
     if (!Number.isNaN(d.getTime())) receivedAt = d.toISOString();
   }
 
-  const id = uuid();
-  db.prepare(
-    `INSERT INTO email_replies (
-       id, lead_id, email_message_id, provider_message_id, in_reply_to,
-       from_email, from_name, to_emails, subject,
-       body_text, body_html, body_markdown, spam_score,
-       source, received_at, raw_json
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'brevo_inbound', ?, ?)`,
-  ).run(
-    id,
-    leadId,
-    message?.id || null,
+  return ingestParsedReply({
     providerMessageId,
-    normalizeMessageId(inReplyTo),
     fromEmail,
     fromName,
-    JSON.stringify([...new Set(toList)]),
+    toEmails: toList,
+    inReplyTo,
+    references,
     subject,
-    bodyText ? String(bodyText).slice(0, 100_000) : null,
-    bodyHtml ? String(bodyHtml).slice(0, 200_000) : null,
-    bodyMarkdown ? String(bodyMarkdown).slice(0, 100_000) : null,
+    bodyText,
+    bodyHtml,
+    bodyMarkdown,
     spamScore,
     receivedAt,
-    JSON.stringify(item).slice(0, 16_000),
-  );
-
-  if (leadId) {
-    const now = receivedAt;
-    // Avoid double-counting when transactional "reply" webhook already ran
-    const alreadyCounted = message?.status === 'replied' || Boolean(
-      db
-        .prepare(
-          `SELECT id FROM email_events
-           WHERE lead_id = ? AND event IN ('reply','replied')
-             AND datetime(occurred_at) >= datetime(?, '-2 days')
-           LIMIT 1`,
-        )
-        .get(leadId, now.replace('T', ' ').slice(0, 19)),
-    );
-
-    if (!alreadyCounted) {
-      db.prepare(
-        `UPDATE leads
-         SET email_reply_count = COALESCE(email_reply_count, 0) + 1,
-             last_email_replied_at = ?,
-             updated_at = datetime('now')
-         WHERE id = ?`,
-      ).run(now, leadId);
-
-      if (message) {
-        db.prepare(
-          `UPDATE email_messages
-           SET reply_count = COALESCE(reply_count, 0) + 1,
-               last_replied_at = ?,
-               status = 'replied'
-           WHERE id = ?`,
-        ).run(now, message.id);
-      }
-    } else {
-      db.prepare(
-        `UPDATE leads SET last_email_replied_at = ?, updated_at = datetime('now') WHERE id = ?`,
-      ).run(now, leadId);
-      if (message) {
-        db.prepare(
-          `UPDATE email_messages
-           SET last_replied_at = ?, status = 'replied'
-           WHERE id = ?`,
-        ).run(now, message.id);
-      }
-    }
-
-    const preview = (bodyMarkdown || bodyText || subject || '(empty reply)')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 180);
-    db.prepare(
-      `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, outcome)
-       VALUES (?, ?, NULL, 'reply', ?, 'neutral')`,
-    ).run(uuid(), leadId, `Email reply: ${preview}`);
-    onLeadReply(leadId);
-  }
-
-  return { ok: true, replyId: id, leadId };
+    raw: item,
+    source: 'brevo_inbound',
+  });
 }
 
 /**

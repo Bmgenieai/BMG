@@ -112,14 +112,57 @@ router.post('/webhooks/brevo-inbound', (req, res) => {
   res.json({ ok: true, processed: results.length, results: results.slice(0, 50) });
 });
 
-router.get('/status', authRequired, (_req, res) => {
+router.get('/status', authRequired, async (_req, res) => {
+  let mailbox = null;
+  try {
+    const { senderMailboxSyncConfig } = await import('../lib/senderMailboxSync.js');
+    mailbox = senderMailboxSyncConfig();
+  } catch {
+    mailbox = null;
+  }
   res.json({
     ...getBrevoPublicConfig(),
     webhookPath: '/api/email/webhooks/brevo',
     inboundWebhookPath: '/api/email/webhooks/brevo-inbound',
     webhookSecretConfigured: Boolean((process.env.BREVO_WEBHOOK_SECRET || '').trim()),
+    senderMailbox: mailbox
+      ? {
+          enabled: mailbox.enabled,
+          configured: mailbox.configured,
+          user: mailbox.user,
+          host: mailbox.host,
+          lastSyncAt: mailbox.lastSyncAt,
+          lastIngested: mailbox.lastIngested,
+          lastError: mailbox.lastError,
+        }
+      : null,
   });
 });
+
+/** Manually poll magic.retouching IMAP for replies that landed on From (CEO/manager). */
+router.post(
+  '/mailbox-sync',
+  authRequired,
+  requireAnyPermission('analytics:view_all', 'leads:view_all'),
+  async (_req, res) => {
+    try {
+      const { syncSenderMailboxOnce, senderMailboxSyncConfig } = await import(
+        '../lib/senderMailboxSync.js'
+      );
+      const cfg = senderMailboxSyncConfig();
+      if (!cfg.enabled) {
+        return res.status(400).json({
+          error:
+            'Sender mailbox sync is off. Set SENDER_MAILBOX_SYNC=true and SENDER_MAILBOX_USER / SENDER_MAILBOX_PASS on the API server.',
+        });
+      }
+      const result = await syncSenderMailboxOnce();
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err.message || 'Mailbox sync failed' });
+    }
+  },
+);
 
 /** Email replies inbox for BD / telesales */
 router.get(

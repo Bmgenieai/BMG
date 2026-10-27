@@ -377,7 +377,7 @@ export function migrate() {
       body_markdown TEXT,
       spam_score REAL,
       source TEXT NOT NULL DEFAULT 'brevo_inbound'
-        CHECK(source IN ('brevo_inbound','brevo_event')),
+        CHECK(source IN ('brevo_inbound','brevo_event','sender_mailbox')),
       read_at TEXT,
       received_at TEXT NOT NULL DEFAULT (datetime('now')),
       raw_json TEXT,
@@ -403,6 +403,60 @@ export function migrate() {
     } catch {
       /* column already exists */
     }
+  }
+
+  // Allow sender_mailbox source for replies that landed on magic.retouching@ inbox
+  try {
+    const row = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='email_replies'`)
+      .get();
+    const sql = String(row?.sql || '');
+    if (sql && !sql.includes("'sender_mailbox'")) {
+      db.exec(`
+        CREATE TABLE email_replies_mig (
+          id TEXT PRIMARY KEY,
+          lead_id TEXT REFERENCES leads(id) ON DELETE SET NULL,
+          email_message_id TEXT REFERENCES email_messages(id) ON DELETE SET NULL,
+          provider_message_id TEXT,
+          in_reply_to TEXT,
+          from_email TEXT,
+          from_name TEXT,
+          to_emails TEXT,
+          subject TEXT,
+          body_text TEXT,
+          body_html TEXT,
+          body_markdown TEXT,
+          spam_score REAL,
+          source TEXT NOT NULL DEFAULT 'brevo_inbound'
+            CHECK(source IN ('brevo_inbound','brevo_event','sender_mailbox')),
+          read_at TEXT,
+          received_at TEXT NOT NULL DEFAULT (datetime('now')),
+          raw_json TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO email_replies_mig (
+          id, lead_id, email_message_id, provider_message_id, in_reply_to,
+          from_email, from_name, to_emails, subject, body_text, body_html, body_markdown,
+          spam_score, source, read_at, received_at, raw_json, created_at
+        )
+        SELECT
+          id, lead_id, email_message_id, provider_message_id, in_reply_to,
+          from_email, from_name, to_emails, subject, body_text, body_html, body_markdown,
+          spam_score, source, read_at, received_at, raw_json, created_at
+        FROM email_replies;
+        DROP TABLE email_replies;
+        ALTER TABLE email_replies_mig RENAME TO email_replies;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_email_replies_provider
+          ON email_replies(provider_message_id)
+          WHERE provider_message_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_email_replies_lead ON email_replies(lead_id, received_at);
+        CREATE INDEX IF NOT EXISTS idx_email_replies_unread
+          ON email_replies(read_at, received_at)
+          WHERE read_at IS NULL;
+      `);
+    }
+  } catch (err) {
+    console.warn('[migrate] email_replies sender_mailbox source:', err.message);
   }
 
   // Schema meta for one-time data migrations

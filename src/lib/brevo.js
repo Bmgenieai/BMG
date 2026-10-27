@@ -307,6 +307,12 @@ export async function getContactLists() {
 }
 
 export function getBrevoPublicConfig() {
+  const mailboxUser =
+    (process.env.SENDER_MAILBOX_USER || process.env.BREVO_SENDER_EMAIL || '').trim() || null;
+  const mailboxPass = Boolean((process.env.SENDER_MAILBOX_PASS || '').trim());
+  const mailboxSyncRequested = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.SENDER_MAILBOX_SYNC || '').trim().toLowerCase(),
+  );
   return {
     enabled: brevoEnabled(),
     sender: process.env.BREVO_SENDER_EMAIL || null,
@@ -314,5 +320,7 @@ export function getBrevoPublicConfig() {
     defaultListId: defaultListId(),
     replyDomain: replyDomain(),
     inboundRepliesEnabled: Boolean(replyDomain()),
+    senderMailboxSyncEnabled: mailboxSyncRequested && Boolean(mailboxUser && mailboxPass),
+    senderMailboxUser: mailboxUser,
   };
 }

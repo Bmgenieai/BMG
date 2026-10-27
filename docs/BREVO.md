@@ -66,6 +66,26 @@ BD / CEO can **reply from CRM** on Email replies → thread → “Send via Brev
 
 Without inbound DNS, the Replies tab still lists **reply notifications** from the transactional `reply` event (no body until inbound is live).
 
+### 4. Replies to `magic.retouching@` (From address)
+
+Many prospects hit **Reply** to the visible From address, not Reply-To. Those land in the Google mailbox for `magic.retouching@bmgenie.ai` and never hit `reply.bmgenie.ai`.
+
+Keep the Reply-To flow above, and also enable IMAP sync on the CRM API:
+
+```env
+SENDER_MAILBOX_SYNC=true
+SENDER_MAILBOX_IMAP_HOST=imap.gmail.com
+SENDER_MAILBOX_IMAP_PORT=993
+SENDER_MAILBOX_USER=magic.retouching@bmgenie.ai
+SENDER_MAILBOX_PASS=<Google App Password>
+```
+
+Google Workspace: enable 2FA → App passwords → create one for “Mail” → paste into `SENDER_MAILBOX_PASS`. Restart the API (`pm2 restart bmg-crm-api`).
+
+The worker polls INBOX every ~2 minutes, matches replies to CRM leads (In-Reply-To / References / from-email / subject), and inserts them into **Email replies** with the same threading. CEO/manager can also click **Sync now** on that page.
+
+Optional backup (no App Password): Gmail filter that forwards inbound to `mailbox@reply.bmgenie.ai` (still uses Brevo inbound webhook).
+
 ## CRM features (implemented)
 
 | Feature | Where |
