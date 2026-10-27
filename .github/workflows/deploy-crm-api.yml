@@ -16,27 +16,28 @@ jobs:
     steps:
       - name: SSH deploy on Windows PC
         uses: appleboy/ssh-action@v1.2.0
-        env:
-          SENDER_MAILBOX_SYNC: ${{ secrets.SENDER_MAILBOX_SYNC }}
-          SENDER_MAILBOX_IMAP_HOST: ${{ secrets.SENDER_MAILBOX_IMAP_HOST }}
-          SENDER_MAILBOX_IMAP_PORT: ${{ secrets.SENDER_MAILBOX_IMAP_PORT }}
-          SENDER_MAILBOX_USER: ${{ secrets.SENDER_MAILBOX_USER }}
-          SENDER_MAILBOX_PASS: ${{ secrets.SENDER_MAILBOX_PASS }}
-          SENDER_MAILBOX_SYNC_MS: ${{ secrets.SENDER_MAILBOX_SYNC_MS }}
-          SENDER_MAILBOX_LOOKBACK_DAYS: ${{ secrets.SENDER_MAILBOX_LOOKBACK_DAYS }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           command_timeout: 20m
-          # Passed into the remote PowerShell session; deploy-crm-api.ps1 upserts into .env
-          envs: SENDER_MAILBOX_SYNC,SENDER_MAILBOX_IMAP_HOST,SENDER_MAILBOX_IMAP_PORT,SENDER_MAILBOX_USER,SENDER_MAILBOX_PASS,SENDER_MAILBOX_SYNC_MS,SENDER_MAILBOX_LOOKBACK_DAYS
           script: |
             Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
             $path = '${{ secrets.CRM_DEPLOY_PATH }}'
             if ([string]::IsNullOrWhiteSpace($path)) { $path = 'D:\crm-api.bmgenie.ai' }
             if (-not (Test-Path $path)) { throw "CRM path not found: $path" }
             Set-Location $path
+
+            # Windows PowerShell has no `export` — set process env so deploy-crm-api.ps1 can upsert .env
+            $env:SENDER_MAILBOX_SYNC = '${{ secrets.SENDER_MAILBOX_SYNC }}'
+            $env:SENDER_MAILBOX_IMAP_HOST = '${{ secrets.SENDER_MAILBOX_IMAP_HOST }}'
+            $env:SENDER_MAILBOX_IMAP_PORT = '${{ secrets.SENDER_MAILBOX_IMAP_PORT }}'
+            $env:SENDER_MAILBOX_USER = '${{ secrets.SENDER_MAILBOX_USER }}'
+            $env:SENDER_MAILBOX_PASS = '${{ secrets.SENDER_MAILBOX_PASS }}'
+            $env:SENDER_MAILBOX_SYNC_MS = '${{ secrets.SENDER_MAILBOX_SYNC_MS }}'
+            $env:SENDER_MAILBOX_LOOKBACK_DAYS = '${{ secrets.SENDER_MAILBOX_LOOKBACK_DAYS }}'
+            Write-Host ("Mailbox sync env present: SYNC=" + (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_SYNC)) + " USER=" + (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_USER)) + " PASS=" + (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_PASS)))
+
             # Pull FIRST so we run the latest deploy script (not the previous commit's copy)
             git fetch origin main
             if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
