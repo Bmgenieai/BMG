@@ -74,6 +74,8 @@ Pipeline: **Bmgenieai/BMG** → Actions → **Deploy CRM API to Windows**
 | `DEPLOY_USER` | SSH username |
 | `SERVER_PASSWORD` | SSH password |
 | `CRM_DEPLOY_PATH` | `D:\crm-api.bmgenie.ai` |
+| `BMGENIE_API_URL` | `https://api.bmgenie.ai` (optional — deploy defaults to this) |
+| `CRM_INGEST_API_KEY` | Same shared key as main BMGenie API (upserted into Windows `.env` on deploy) |
 | `SENDER_MAILBOX_SYNC` | `true` |
 | `SENDER_MAILBOX_IMAP_HOST` | `mail2.benchmarkstudio.biz` |
 | `SENDER_MAILBOX_IMAP_PORT` | `993` |

@@ -3,14 +3,10 @@ import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
 import { authRequired, requireAnyPermission } from '../middleware/auth.js';
 import { cohortSql, normalizeCohort, cohortRefDate } from '../lib/cohort.js';
+import { postBmgenieJson } from '../lib/bmgenieApi.js';
 
 const router = Router();
 router.use(authRequired);
-
-const TAWK_DASHBOARD = (process.env.TAWK_DASHBOARD_URL || 'https://dashboard.tawk.to/').replace(
-  /\/$/,
-  '',
-);
 
 /** Signup-day cohort for chats: prefer linked lead signup; else first chat day. */
 function chatCohortClause(cohortRaw, date) {
@@ -28,24 +24,38 @@ function chatCohortClause(cohortRaw, date) {
 function mapChatRow(r) {
   const transcript = safeJson(r.transcript_json, []);
   const crmReplies = safeJson(r.crm_replies_json, []);
+  const isBmgenie = (r.provider || '') === 'bmgenie';
+  const mappedTranscript = Array.isArray(transcript)
+    ? transcript.map((m) => ({
+        id: m.id,
+        n: m.n || m.role || m.t || 'msg',
+        t: m.t || m.role,
+        role: m.role || m.t,
+        msg: m.msg || m.message || m.body || m.text,
+        at: m.at || m.createdAt,
+        fromCrm: m.role === 'agent' || m.t === 'agent',
+      }))
+    : [];
+  const mappedCrm = isBmgenie
+    ? []
+    : (Array.isArray(crmReplies) ? crmReplies : []).map((m) => ({
+        n: m.agentName || 'CRM agent',
+        t: 'agent',
+        role: 'agent',
+        msg: m.message,
+        at: m.createdAt,
+        fromCrm: true,
+      }));
   return {
     ...r,
     transcript,
     crmReplies,
-    combinedMessages: [
-      ...(Array.isArray(transcript) ? transcript : []),
-      ...crmReplies.map((m) => ({
-        n: m.agentName || 'CRM agent',
-        t: 'agent',
-        msg: m.message,
-        at: m.createdAt,
-        fromCrm: true,
-      })),
-    ],
-    tawkDashboardUrl: TAWK_DASHBOARD,
+    combinedMessages: [...mappedTranscript, ...mappedCrm],
+    liveDelivery: isBmgenie,
     canReplyInCrm: true,
-    replyHint:
-      'Replies are saved in CRM for the team. The visitor still sees live messages in Tawk — open Tawk to deliver the same reply there (Tawk API cannot inject agent messages).',
+    replyHint: isBmgenie
+      ? 'Replies are delivered live to the visitor’s website chat.'
+      : 'Legacy Tawk thread — replies are saved in CRM only.',
     transcript_json: undefined,
     crm_replies_json: undefined,
     raw_json: undefined,
@@ -53,7 +63,7 @@ function mapChatRow(r) {
 }
 
 router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
-  const { status, q, cohort: cohortRaw, date } = req.query;
+  const { status, q, cohort: cohortRaw, date, mode } = req.query;
   const clauses = ['1=1'];
   const params = [];
 
@@ -61,10 +71,16 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     clauses.push('c.status = ?');
     params.push(status);
   }
+  if (mode) {
+    clauses.push('c.mode = ?');
+    params.push(mode);
+  }
   if (q) {
-    clauses.push('(c.visitor_name LIKE ? OR c.visitor_email LIKE ? OR c.preview LIKE ?)');
+    clauses.push(
+      '(c.visitor_name LIKE ? OR c.visitor_email LIKE ? OR c.preview LIKE ? OR c.visitor_city LIKE ? OR c.visitor_country LIKE ?)',
+    );
     const like = `%${q}%`;
-    params.push(like, like, like);
+    params.push(like, like, like, like, like);
   }
 
   const cohortPred = chatCohortClause(cohortRaw, date);
@@ -102,6 +118,11 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
   const open = db
     .prepare(`SELECT COUNT(*) AS c ${join} WHERE c.status = 'open' AND (${where})`)
     .get(...params).c;
+  const waitingHuman = db
+    .prepare(
+      `SELECT COUNT(*) AS c ${join} WHERE c.status = 'waiting_human' AND (${where})`,
+    )
+    .get(...params).c;
   const today = db
     .prepare(
       `SELECT COUNT(*) AS c ${join}
@@ -109,7 +130,7 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
          AND (${where})`,
     )
     .get(refDate, ...params).c;
-  res.json({ total, open, today, cohort, cohortDate: refDate });
+  res.json({ total, open, waitingHuman, today, cohort, cohortDate: refDate });
 });
 
 router.get('/:id', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, res) => {
@@ -129,11 +150,9 @@ router.get('/:id', requireAnyPermission('leads:view_all', 'leads:view_own'), (re
 });
 
 /**
- * Save a telesales/CEO reply on the chat thread in CRM.
- * Also logs activity on the linked lead when present.
- * Live delivery to the website visitor still requires pasting/sending in Tawk.
+ * Reply to visitor. For bmgenie provider, deliver live to the website chatbot.
  */
-router.post('/:id/reply', requireAnyPermission('leads:update_any', 'leads:update_own'), (req, res) => {
+router.post('/:id/reply', requireAnyPermission('leads:update_any', 'leads:update_own'), async (req, res) => {
   const message = String(req.body?.message || '').trim();
   if (!message || message.length < 1) {
     return res.status(400).json({ error: 'message is required' });
@@ -145,7 +164,6 @@ router.post('/:id/reply', requireAnyPermission('leads:update_any', 'leads:update
   const row = db.prepare(`SELECT * FROM chat_threads WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Chat not found' });
 
-  const replies = safeJson(row.crm_replies_json, []);
   const entry = {
     id: uuid(),
     message,
@@ -154,16 +172,69 @@ router.post('/:id/reply', requireAnyPermission('leads:update_any', 'leads:update
     agentName: req.user.name || req.user.email,
     agentRole: req.user.role,
   };
-  replies.push(entry);
 
-  db.prepare(
-    `UPDATE chat_threads
-     SET crm_replies_json = ?,
-         preview = ?,
-         updated_at = datetime('now'),
-         status = CASE WHEN status = 'closed' THEN 'open' ELSE status END
-     WHERE id = ?`,
-  ).run(JSON.stringify(replies), `CRM: ${message.slice(0, 180)}`, row.id);
+  if (row.provider === 'bmgenie' && row.external_chat_id) {
+    const delivered = await postBmgenieJson(
+      `/support-chat/internal/sessions/${row.external_chat_id}/agent-reply`,
+      {
+        message,
+        agentName: entry.agentName,
+        agentId: entry.agentId,
+      },
+    );
+    if (!delivered.ok) {
+      return res.status(502).json({
+        error: delivered.error || 'Failed to deliver reply to website visitor',
+      });
+    }
+
+    const replies = safeJson(row.crm_replies_json, []);
+    replies.push(entry);
+    const transcript = Array.isArray(delivered.data?.messages)
+      ? delivered.data.messages.map((m) => ({
+          id: m.id,
+          role: m.role,
+          n:
+            m.role === 'visitor'
+              ? 'Visitor'
+              : m.role === 'ai'
+                ? 'AI'
+                : m.role === 'agent'
+                  ? m.agentName || 'Agent'
+                  : 'System',
+          t: m.role,
+          msg: m.body,
+          at: m.createdAt,
+        }))
+      : safeJson(row.transcript_json, []);
+
+    db.prepare(
+      `UPDATE chat_threads
+       SET crm_replies_json = ?,
+           transcript_json = ?,
+           preview = ?,
+           mode = 'human',
+           status = 'human_active',
+           updated_at = datetime('now')
+       WHERE id = ?`,
+    ).run(
+      JSON.stringify(replies),
+      JSON.stringify(transcript),
+      `CRM: ${message.slice(0, 180)}`,
+      row.id,
+    );
+  } else {
+    const replies = safeJson(row.crm_replies_json, []);
+    replies.push(entry);
+    db.prepare(
+      `UPDATE chat_threads
+       SET crm_replies_json = ?,
+           preview = ?,
+           updated_at = datetime('now'),
+           status = CASE WHEN status = 'closed' THEN 'open' ELSE status END
+       WHERE id = ?`,
+    ).run(JSON.stringify(replies), `CRM: ${message.slice(0, 180)}`, row.id);
+  }
 
   if (row.lead_id) {
     db.prepare(
@@ -185,7 +256,9 @@ router.post('/:id/reply', requireAnyPermission('leads:update_any', 'leads:update
     ...mapChatRow(updated),
     savedReply: entry,
     deliveryNote:
-      'Reply saved in CRM. Open Tawk to send this message to the visitor (Tawk cannot receive CRM replies automatically).',
+      row.provider === 'bmgenie'
+        ? 'Reply delivered to the visitor’s website chat.'
+        : 'Reply saved in CRM (legacy thread).',
   });
 });
 

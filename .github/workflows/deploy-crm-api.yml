@@ -29,6 +29,11 @@ jobs:
             Set-Location $path
 
             # Windows PowerShell has no `export` — set process env so deploy-crm-api.ps1 can upsert .env
+            # Support chat live replies + Product analytics → main BMGenie API
+            $env:BMGENIE_API_URL = '${{ secrets.BMGENIE_API_URL }}'
+            $env:CRM_INGEST_API_KEY = '${{ secrets.CRM_INGEST_API_KEY }}'
+            Write-Host ("BMGenie API link env present: URL=" + (-not [string]::IsNullOrWhiteSpace($env:BMGENIE_API_URL)) + " INGEST_KEY=" + (-not [string]::IsNullOrWhiteSpace($env:CRM_INGEST_API_KEY)))
+
             $env:SENDER_MAILBOX_SYNC = '${{ secrets.SENDER_MAILBOX_SYNC }}'
             $env:SENDER_MAILBOX_IMAP_HOST = '${{ secrets.SENDER_MAILBOX_IMAP_HOST }}'
             $env:SENDER_MAILBOX_IMAP_PORT = '${{ secrets.SENDER_MAILBOX_IMAP_PORT }}'

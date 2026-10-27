@@ -441,12 +441,23 @@ function upsertDemoBooking({
   return { lead, action };
 }
 
+function resolveChatStatus(event, meta, existingStatus) {
+  if (event === 'chat.closed' || event === 'chat.transcript') return 'closed';
+  if (meta.status && typeof meta.status === 'string') return meta.status;
+  if (event === 'chat.handoff') return 'waiting_human';
+  if (event === 'chat.message' && meta.mode === 'human') {
+    return existingStatus === 'waiting_human' ? 'waiting_human' : 'human_active';
+  }
+  return existingStatus || 'open';
+}
+
 function upsertChatThread({
   displayName,
   normalizedEmail,
   bmgenieUserId,
   metadata,
   event,
+  country,
 }) {
   const meta = metadata || {};
   const chatId = meta.chatId || meta.externalChatId;
@@ -454,9 +465,10 @@ function upsertChatThread({
     return { error: 'metadata.chatId required for chat events' };
   }
 
+  const provider = meta.provider || 'bmgenie';
   const existing = db
     .prepare(`SELECT * FROM chat_threads WHERE provider = ? AND external_chat_id = ?`)
-    .get(meta.provider || 'tawk', chatId);
+    .get(provider, chatId);
 
   let lead = findAnyByUser(bmgenieUserId, normalizedEmail);
   if (!lead && (normalizedEmail || displayName)) {
@@ -465,11 +477,11 @@ function upsertChatThread({
       email: normalizedEmail,
       source: 'chat_support',
       bmgenieUserId,
+      country: country || meta.country || null,
       notes: meta.message || 'Chat started on bmgenie.ai',
-      metadata: meta,
+      metadata: { ...meta, city: meta.city || null },
     });
   } else if (lead && lead.source !== 'chat_support' && OPEN_STATUSES.includes(lead.status)) {
-    // keep existing source; only attach activity
     db.prepare(
       `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
        VALUES (?, ?, NULL, 'product_sync', ?)`,
@@ -479,9 +491,25 @@ function upsertChatThread({
   const preview =
     meta.message ||
     (Array.isArray(meta.transcript) && meta.transcript.length
-      ? String(meta.transcript[meta.transcript.length - 1]?.msg || meta.transcript[meta.transcript.length - 1]?.message || '').slice(0, 240)
+      ? String(
+          meta.transcript[meta.transcript.length - 1]?.msg ||
+            meta.transcript[meta.transcript.length - 1]?.message ||
+            '',
+        ).slice(0, 240)
       : existing?.preview) ||
     null;
+
+  const nextStatus = resolveChatStatus(event, meta, existing?.status);
+  const mode =
+    meta.mode ||
+    (event === 'chat.handoff' ? 'human' : existing?.mode) ||
+    (provider === 'bmgenie' ? 'ai' : null);
+  const visitorCountry = meta.country || country || existing?.visitor_country || null;
+  const visitorCity = meta.city || existing?.visitor_city || null;
+  const handoffAt =
+    event === 'chat.handoff'
+      ? new Date().toISOString()
+      : existing?.handoff_at || null;
 
   if (existing) {
     db.prepare(
@@ -496,6 +524,10 @@ function upsertChatThread({
         transcript_json = COALESCE(?, transcript_json),
         ended_at = CASE WHEN ? = 'closed' THEN COALESCE(ended_at, datetime('now')) ELSE ended_at END,
         tawk_property_id = COALESCE(?, tawk_property_id),
+        visitor_country = COALESCE(?, visitor_country),
+        visitor_city = COALESCE(?, visitor_city),
+        mode = COALESCE(?, mode),
+        handoff_at = COALESCE(?, handoff_at),
         raw_json = ?,
         updated_at = datetime('now')
        WHERE id = ?`,
@@ -504,12 +536,16 @@ function upsertChatThread({
       normalizedEmail || null,
       bmgenieUserId || null,
       lead?.id || null,
-      event === 'chat.transcript' ? 'closed' : existing.status || 'open',
+      nextStatus,
       meta.pageUrl || null,
       preview,
       meta.transcript ? serializeMetadata(meta.transcript) : null,
-      event === 'chat.transcript' ? 'closed' : 'open',
+      nextStatus,
       meta.tawkPropertyId || null,
+      visitorCountry,
+      visitorCity,
+      mode,
+      handoffAt,
       serializeMetadata(meta),
       existing.id,
     );
@@ -524,21 +560,26 @@ function upsertChatThread({
   db.prepare(
     `INSERT INTO chat_threads (
       id, provider, external_chat_id, visitor_name, visitor_email, bmgenie_user_id,
-      lead_id, status, page_url, preview, transcript_json, started_at, tawk_property_id, raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)`,
+      lead_id, status, page_url, preview, transcript_json, started_at, tawk_property_id,
+      visitor_country, visitor_city, mode, handoff_at, raw_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
-    meta.provider || 'tawk',
+    provider,
     chatId,
     displayName || null,
     normalizedEmail || null,
     bmgenieUserId || null,
     lead?.id || null,
-    event === 'chat.transcript' ? 'closed' : 'open',
+    nextStatus,
     meta.pageUrl || null,
     preview,
     meta.transcript ? serializeMetadata(meta.transcript) : null,
     meta.tawkPropertyId || null,
+    visitorCountry,
+    visitorCity,
+    mode || 'ai',
+    handoffAt,
     serializeMetadata(meta),
   );
 
@@ -565,7 +606,13 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
   } = req.body || {};
 
   if (!event) return res.status(400).json({ error: 'event required' });
-  if (!name && !email && !['chat.started', 'chat.transcript'].includes(event)) {
+  if (
+    !name &&
+    !email &&
+    !['chat.started', 'chat.transcript', 'chat.message', 'chat.handoff', 'chat.closed'].includes(
+      event,
+    )
+  ) {
     return res.status(400).json({ error: 'name or email required' });
   }
 
@@ -779,13 +826,20 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
     });
     lead = result.lead;
     action = result.action;
-  } else if (event === 'chat.started' || event === 'chat.transcript') {
+  } else if (
+    event === 'chat.started' ||
+    event === 'chat.transcript' ||
+    event === 'chat.message' ||
+    event === 'chat.handoff' ||
+    event === 'chat.closed'
+  ) {
     const result = upsertChatThread({
       displayName,
       normalizedEmail,
       bmgenieUserId,
       metadata,
       event,
+      country,
     });
     if (result.error) return res.status(400).json({ error: result.error });
     lead = result.lead;
@@ -805,6 +859,9 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
         'demo.booked',
         'chat.started',
         'chat.transcript',
+        'chat.message',
+        'chat.handoff',
+        'chat.closed',
       ],
     });
   }

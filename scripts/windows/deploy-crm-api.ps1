@@ -47,6 +47,19 @@ function Set-DotEnvValue {
   Write-Host "Upserted .env $Key"
 }
 
+# Main BMGenie API — required for Product analytics + live support-chat replies.
+# Pipeline may inject BMGENIE_API_URL / CRM_INGEST_API_KEY (GitHub secrets).
+# If BMGENIE_API_URL is unset, default production URL so Windows always can reach main API.
+$bmgenieApiUrl = $env:BMGENIE_API_URL
+if ([string]::IsNullOrWhiteSpace($bmgenieApiUrl)) {
+  $bmgenieApiUrl = 'https://api.bmgenie.ai'
+}
+Set-DotEnvValue -Key 'BMGENIE_API_URL' -Value $bmgenieApiUrl.Trim()
+
+if (-not [string]::IsNullOrWhiteSpace($env:CRM_INGEST_API_KEY)) {
+  Set-DotEnvValue -Key 'CRM_INGEST_API_KEY' -Value $env:CRM_INGEST_API_KEY.Trim()
+}
+
 # Optional: pipeline injects mailbox sync (GitHub Actions secrets → env vars on the SSH session)
 if (-not [string]::IsNullOrWhiteSpace($env:SENDER_MAILBOX_SYNC)) {
   Set-DotEnvValue -Key 'SENDER_MAILBOX_SYNC' -Value $env:SENDER_MAILBOX_SYNC.Trim()

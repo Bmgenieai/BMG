@@ -288,6 +288,10 @@ export function migrate() {
 
   const chatAlters = [
     `ALTER TABLE chat_threads ADD COLUMN crm_replies_json TEXT`,
+    `ALTER TABLE chat_threads ADD COLUMN visitor_country TEXT`,
+    `ALTER TABLE chat_threads ADD COLUMN visitor_city TEXT`,
+    `ALTER TABLE chat_threads ADD COLUMN mode TEXT DEFAULT 'ai'`,
+    `ALTER TABLE chat_threads ADD COLUMN handoff_at TEXT`,
   ];
   for (const sql of chatAlters) {
     try {

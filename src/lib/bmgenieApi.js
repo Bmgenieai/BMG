@@ -85,3 +85,63 @@ export function normalizeUserRows(users = []) {
     ...u,
   }));
 }
+
+/**
+ * POST to main BMGenie API (support-chat agent reply, etc.).
+ * Path is used as-is on BMGENIE_API_URL (e.g. /support-chat/internal/...).
+ */
+export async function postBmgenieJson(path, body = {}) {
+  const base = baseUrl();
+  const key = ingestKey();
+  if (!base || !key) {
+    return {
+      ok: false,
+      unavailable: true,
+      error: 'BMGENIE_API_URL or CRM_INGEST_API_KEY not configured',
+      data: null,
+    };
+  }
+
+  const p = path.startsWith('/') ? path : `/${path}`;
+  const url = `${base}${p}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-CRM-Ingest-Key': key,
+      },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { error: text?.slice(0, 200) };
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        unavailable: res.status >= 500,
+        error: data?.message || data?.error || `BMGenie API HTTP ${res.status}`,
+        status: res.status,
+        data: null,
+      };
+    }
+    return { ok: true, unavailable: false, error: null, data };
+  } catch (err) {
+    return {
+      ok: false,
+      unavailable: true,
+      error: err?.message || 'BMGenie API unreachable',
+      data: null,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}

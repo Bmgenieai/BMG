@@ -106,7 +106,7 @@ export const LEAD_SOURCES = {
   chat_support: {
     key: 'chat_support',
     label: 'Chat support',
-    description: 'Started a Tawk.to chat on bmgenie.ai',
+    description: 'Started AI / human chat on bmgenie.ai',
   },
   csv_import: {
     key: 'csv_import',
