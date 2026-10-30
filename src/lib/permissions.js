@@ -66,10 +66,57 @@ export function roleHasPermission(role, permission) {
   return allowed.includes(role);
 }
 
+/**
+ * Product sources BD accounts can see and work as a shared pool
+ * (not limited to assigned_to / created_by). Start with free-credit;
+ * expand here if signup / win-back should match.
+ */
+export const BD_SHARED_PRODUCT_SOURCES = ['free_credit_no_purchase'];
+
+export function isBdSharedProductSource(source) {
+  return BD_SHARED_PRODUCT_SOURCES.includes(source);
+}
+
+/** SQL + params for lead list/count scoping (no table alias). */
+export function leadVisibilityClause(user, { columnPrefix = '' } = {}) {
+  if (roleHasPermission(user.role, 'leads:view_all')) {
+    return { sql: '1=1', params: [] };
+  }
+  const c = (name) => (columnPrefix ? `${columnPrefix}.${name}` : name);
+  if (!BD_SHARED_PRODUCT_SOURCES.length) {
+    return {
+      sql: `(${c('assigned_to')} = ? OR ${c('created_by')} = ?)`,
+      params: [user.id, user.id],
+    };
+  }
+  const placeholders = BD_SHARED_PRODUCT_SOURCES.map(() => '?').join(',');
+  return {
+    sql: `(${c('assigned_to')} = ? OR ${c('created_by')} = ? OR ${c('source')} IN (${placeholders}))`,
+    params: [user.id, user.id, ...BD_SHARED_PRODUCT_SOURCES],
+  };
+}
+
 export function canAccessLead(user, lead) {
   if (!lead) return false;
   if (roleHasPermission(user.role, 'leads:view_all')) return true;
-  return lead.assigned_to === user.id || lead.created_by === user.id;
+  if (lead.assigned_to === user.id || lead.created_by === user.id) return true;
+  // Shared product pool (e.g. Free credit · no purchase)
+  if (
+    roleHasPermission(user.role, 'leads:view_own') &&
+    isBdSharedProductSource(lead.source)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** BD may update / email shared product-pool leads (and own leads). */
+export function canUpdateLead(user, lead) {
+  if (!lead) return false;
+  if (roleHasPermission(user.role, 'leads:update_any')) return true;
+  if (!roleHasPermission(user.role, 'leads:update_own')) return false;
+  if (lead.assigned_to === user.id || lead.created_by === user.id) return true;
+  return isBdSharedProductSource(lead.source);
 }
 
 export const LEAD_SOURCES = {

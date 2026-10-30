@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
 import { LEAD_SOURCES, OPEN_STATUSES } from '../lib/permissions.js';
+import { testLeadSql, pakistanLeadSql } from '../lib/leadFilters.js';
 
 const router = Router();
 
@@ -93,12 +94,21 @@ function serializeMetadata(metadata) {
   }
 }
 
+function resolveCity(country, metadata) {
+  const fromMeta =
+    metadata &&
+    (metadata.city || metadata.City || metadata.town || metadata.locality || null);
+  const city = fromMeta != null ? String(fromMeta).trim() : '';
+  return city || null;
+}
+
 function insertLead({
   name,
   email,
   phone,
   company,
   country,
+  city,
   source,
   bmgenieUserId,
   estimatedValue,
@@ -110,11 +120,12 @@ function insertLead({
   const signedUpAt =
     (metadata && (metadata.signedUpAt || metadata.signed_up_at || metadata.createdAt)) ||
     null;
+  const resolvedCity = city || resolveCity(country, metadata);
   db.prepare(
     `INSERT INTO leads (
-      id, name, email, phone, company, country, source, status,
+      id, name, email, phone, company, country, city, source, status,
       bmgenie_user_id, estimated_value, notes, metadata, signed_up_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`,
   ).run(
     id,
     name,
@@ -122,6 +133,7 @@ function insertLead({
     phone || null,
     company || null,
     country || null,
+    resolvedCity,
     source,
     status,
     bmgenieUserId || null,
@@ -144,6 +156,7 @@ function updateLead(id, fields, activitySummary) {
     'phone',
     'company',
     'country',
+    'city',
     'source',
     'status',
     'notes',
@@ -600,6 +613,7 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
     phone,
     company,
     country,
+    city: cityRaw,
     estimatedValue,
     notes,
     metadata,
@@ -618,6 +632,10 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
 
   const displayName = (name || email || 'BMGenie user').trim();
   const normalizedEmail = email ? String(email).trim().toLowerCase() : null;
+  const city =
+    (cityRaw != null && String(cityRaw).trim()) ||
+    resolveCity(country, metadata) ||
+    null;
 
   let lead = null;
   let action = 'noop';
@@ -634,6 +652,7 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
           phone: phone ?? existing.phone,
           company: company ?? existing.company,
           country: country ?? existing.country,
+          city: city ?? existing.city,
           bmgenie_user_id: bmgenieUserId || existing.bmgenie_user_id,
           source:
             OPEN_STATUSES.includes(existing.status) && existing.source === 'signup_no_listing'
@@ -651,6 +670,7 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
         phone,
         company,
         country,
+        city,
         source: sourceOverride || 'signup_no_listing',
         bmgenieUserId,
         estimatedValue: estimatedValue ?? 65,
@@ -670,6 +690,8 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
           email: normalizedEmail || open.email,
           phone: phone ?? open.phone,
           company: company ?? open.company,
+          country: country ?? open.country,
+          city: city ?? open.city,
           bmgenie_user_id: bmgenieUserId || open.bmgenie_user_id,
           notes: notes || 'Used free listing credit — has not purchased a package',
           estimated_value: estimatedValue ?? open.estimated_value ?? 65,
@@ -685,6 +707,7 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
         phone,
         company,
         country,
+        city,
         source: 'free_credit_no_purchase',
         bmgenieUserId,
         estimatedValue: estimatedValue ?? 65,
@@ -868,6 +891,33 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
 
   if (sourceOverride && LEAD_SOURCES[sourceOverride] && lead && action !== 'skipped') {
     // already applied where relevant
+  }
+
+  // Soft-archive test / Pakistan product leads so they never enter BD queues
+  if (lead?.id) {
+    const shouldArchive = db
+      .prepare(
+        `SELECT id FROM leads
+         WHERE id = ?
+           AND (archived_at IS NULL OR archived_at = '')
+           AND (${testLeadSql('')} OR ${pakistanLeadSql('')})`,
+      )
+      .get(lead.id);
+    if (shouldArchive) {
+      db.prepare(
+        `UPDATE leads
+         SET archived_at = datetime('now'),
+             updated_at = datetime('now'),
+             notes = CASE
+               WHEN notes IS NULL OR notes = '' THEN 'Auto-archived: test account or Pakistan (not for BD outreach)'
+               WHEN notes LIKE '%Auto-archived: test account or Pakistan%' THEN notes
+               ELSE notes || ' | Auto-archived: test account or Pakistan (not for BD outreach)'
+             END
+         WHERE id = ?`,
+      ).run(lead.id);
+      lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(lead.id);
+      if (action === 'created' || action === 'updated') action = `${action}_archived`;
+    }
   }
 
   res.json({ ok: true, action, lead, ...(extra || {}) });

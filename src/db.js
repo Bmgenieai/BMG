@@ -195,6 +195,7 @@ export function migrate() {
     `ALTER TABLE leads ADD COLUMN business_type TEXT`,
     `ALTER TABLE leads ADD COLUMN linkedin_url TEXT`,
     `ALTER TABLE leads ADD COLUMN times_added INTEGER DEFAULT 1`,
+    `ALTER TABLE leads ADD COLUMN city TEXT`,
   ];
   for (const sql of leadAlters) {
     try {
@@ -208,6 +209,56 @@ export function migrate() {
     db.exec(
       `UPDATE leads SET times_added = 1 WHERE times_added IS NULL OR times_added < 1`,
     );
+  } catch {
+    /* ignore */
+  }
+
+  // Backfill city from product-ingest metadata when column is empty
+  try {
+    db.exec(`
+      UPDATE leads
+      SET city = TRIM(json_extract(metadata, '$.city'))
+      WHERE (city IS NULL OR TRIM(city) = '')
+        AND metadata IS NOT NULL
+        AND TRIM(COALESCE(json_extract(metadata, '$.city'), '')) != ''
+    `);
+  } catch {
+    /* ignore — older SQLite / bad JSON */
+  }
+
+  // Soft-archive test + Pakistan product-queue leads so BD/CEO queues stay clean
+  try {
+    db.exec(`
+      UPDATE leads
+      SET archived_at = COALESCE(NULLIF(archived_at, ''), datetime('now')),
+          updated_at = datetime('now'),
+          notes = CASE
+            WHEN notes IS NULL OR notes = '' THEN 'Auto-archived: test account or Pakistan (not for BD outreach)'
+            WHEN notes LIKE '%Auto-archived: test account or Pakistan%' THEN notes
+            ELSE notes || ' | Auto-archived: test account or Pakistan (not for BD outreach)'
+          END
+      WHERE (archived_at IS NULL OR archived_at = '')
+        AND source IN (
+          'signup_no_listing',
+          'free_credit_no_purchase',
+          'purchased_no_repurchase',
+          'checkout_abandoned',
+          'revision_requested'
+        )
+        AND (
+          LOWER(TRIM(COALESCE(email, ''))) LIKE '%@bmgenie.ai'
+          OR LOWER(TRIM(COALESCE(email, ''))) LIKE '%@benchmarkstudio.biz'
+          OR LOWER(TRIM(COALESCE(email, ''))) LIKE '%test%'
+          OR LOWER(TRIM(COALESCE(email, ''))) LIKE '%demo%'
+          OR LOWER(TRIM(COALESCE(email, ''))) LIKE '%+qa%'
+          OR LOWER(TRIM(COALESCE(email, ''))) LIKE '%e2e%'
+          OR LOWER(TRIM(COALESCE(email, ''))) LIKE '%smoke%'
+          OR LOWER(TRIM(COALESCE(name, ''))) LIKE '%test%'
+          OR LOWER(TRIM(COALESCE(name, ''))) LIKE '%internal%'
+          OR LOWER(TRIM(COALESCE(country, ''))) IN ('pk', 'pak', 'pakistan')
+          OR LOWER(TRIM(COALESCE(country, ''))) LIKE 'pakistan%'
+        )
+    `);
   } catch {
     /* ignore */
   }

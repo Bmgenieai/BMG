@@ -6,6 +6,7 @@ import {
   upsertContact,
 } from './brevo.js';
 import { recordEmailSend } from './emailLog.js';
+import { claimLeadIfUnassigned } from './leadAutomation.js';
 
 const TICK_MS = 30_000;
 const BATCH_LIMIT = 15;
@@ -104,6 +105,8 @@ async function processOne(row) {
       htmlContent: content.htmlContent || null,
       textContent: content.textContent || null,
     });
+
+    claimLeadIfUnassigned(lead.id, row.user_id);
 
     db.prepare(
       `UPDATE scheduled_emails

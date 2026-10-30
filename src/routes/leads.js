@@ -21,10 +21,13 @@ import {
   BUSINESS_TYPE_KEYS,
   normalizeStatus,
   canAccessLead,
+  canUpdateLead,
+  leadVisibilityClause,
   roleHasPermission,
   allowedOutreachTypesForSource,
   NON_LINKEDIN_SOCIAL_SOURCES,
 } from '../lib/permissions.js';
+import { excludeTestAndPakistanSql } from '../lib/leadFilters.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
 import {
   getLeadEmailHistory,
@@ -90,13 +93,14 @@ function getLeadWithJoins(id) {
     .get(id);
 }
 
-function requireLeadAccess(req, res) {
+function requireLeadAccess(req, res, { forUpdate = false } = {}) {
   const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(req.params.id);
   if (!lead) {
     res.status(404).json({ error: 'Lead not found' });
     return null;
   }
-  if (!canAccessLead(req.user, lead)) {
+  const ok = forUpdate ? canUpdateLead(req.user, lead) : canAccessLead(req.user, lead);
+  if (!ok) {
     res.status(403).json({ error: 'Permission denied' });
     return null;
   }
@@ -159,23 +163,24 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
   const refDate = cohortRefDate(req.query.date);
   const cohortPred = cohortSql('COALESCE(signed_up_at, created_at)', cohort, refDate);
 
-  const assigneeClause = !roleHasPermission(req.user.role, 'leads:view_all')
-    ? 'AND (assigned_to = ? OR created_by = ?)'
-    : '';
-  const assigneeParam = assigneeClause ? [req.user.id, req.user.id] : [];
+  const visibility = leadVisibilityClause(req.user);
+  const assigneeClause = visibility.sql === '1=1' ? '' : `AND ${visibility.sql}`;
+  const assigneeParam = visibility.params;
   const cohortClause = cohortPred.sql === '1=1' ? '' : `AND ${cohortPred.sql}`;
   const activeClause = `AND (archived_at IS NULL OR archived_at = '')`;
+  // Hide test / Pakistan from sidebar counts (same as list). No table alias on counts.
+  const queueClause = `AND ${excludeTestAndPakistanSql('')}`;
   const baseParams = [...assigneeParam, ...cohortPred.params];
 
   const total = db
     .prepare(
-      `SELECT COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} ${activeClause}`,
+      `SELECT COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} ${activeClause} ${queueClause}`,
     )
     .get(...baseParams).c;
 
   const byStatus = db
     .prepare(
-      `SELECT status, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} ${activeClause} GROUP BY status`,
+      `SELECT status, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} ${activeClause} ${queueClause} GROUP BY status`,
     )
     .all(...baseParams);
   const statusMap = Object.fromEntries(byStatus.map((r) => [r.status, r.c]));
@@ -191,7 +196,7 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
 
   const bySource = db
     .prepare(
-      `SELECT source, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} ${activeClause} GROUP BY source`,
+      `SELECT source, COUNT(*) AS c FROM leads WHERE 1=1 ${assigneeClause} ${cohortClause} ${activeClause} ${queueClause} GROUP BY source`,
     )
     .all(...baseParams);
   const sourceMap = Object.fromEntries(bySource.map((r) => [r.source, r.c]));
@@ -257,12 +262,16 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   const params = [];
 
   if (!roleHasPermission(req.user.role, 'leads:view_all')) {
-    clauses.push('(l.assigned_to = ? OR l.created_by = ?)');
-    params.push(req.user.id, req.user.id);
+    const visibility = leadVisibilityClause(req.user, { columnPrefix: 'l' });
+    clauses.push(visibility.sql);
+    params.push(...visibility.params);
   } else if (assigned_to) {
     clauses.push('l.assigned_to = ?');
     params.push(assigned_to);
   }
+
+  // Never show internal/test or Pakistan prospects in active queues
+  clauses.push(excludeTestAndPakistanSql('l'));
 
   if (unassigned === '1' || unassigned === 'true') {
     clauses.push('l.assigned_to IS NULL');
@@ -409,7 +418,7 @@ router.post(
           skipped.push({ id, reason: 'not_found' });
           continue;
         }
-        if (!canAny && lead.assigned_to !== req.user.id && lead.created_by !== req.user.id) {
+        if (!canAny && !canUpdateLead(req.user, lead)) {
           skipped.push({ id, reason: 'permission' });
           continue;
         }
@@ -705,7 +714,7 @@ router.post('/', requirePermission('leads:create'), (req, res) => {
 });
 
 router.patch('/:id', requireAnyPermission('leads:update_any', 'leads:update_own'), (req, res) => {
-  const lead = requireLeadAccess(req, res);
+  const lead = requireLeadAccess(req, res, { forUpdate: true });
   if (!lead) return;
 
   const {
@@ -825,7 +834,7 @@ router.post(
   '/:id/activities',
   requireAnyPermission('leads:update_any', 'leads:update_own'),
   (req, res) => {
-    const lead = requireLeadAccess(req, res);
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
     const { type = 'note', summary, outcome, next_follow_up_at, status: rawStatus } = req.body || {};
     if (!summary) return res.status(400).json({ error: 'summary required' });
@@ -946,7 +955,7 @@ router.post(
   '/:id/reset-linkedin',
   requireAnyPermission('leads:update_any', 'leads:update_own'),
   (req, res) => {
-    const lead = requireLeadAccess(req, res);
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
 
     db.prepare(
@@ -975,7 +984,7 @@ router.delete(
   '/:id/activities/:activityId',
   requireAnyPermission('leads:update_any', 'leads:update_own'),
   (req, res) => {
-    const lead = requireLeadAccess(req, res);
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
 
     const act = db
@@ -1008,7 +1017,7 @@ router.get(
   '/:id/employees',
   requireAnyPermission('leads:view_all', 'leads:view_own'),
   (req, res) => {
-    const lead = requireLeadAccess(req, res);
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
     const rows = db
       .prepare(
@@ -1025,7 +1034,7 @@ router.post(
   '/:id/employees',
   requireAnyPermission('leads:update_any', 'leads:update_own'),
   (req, res) => {
-    const lead = requireLeadAccess(req, res);
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
     const { name, phone, email, job_title, notes } = req.body || {};
     if (!name || !String(name).trim()) {
@@ -1057,7 +1066,7 @@ router.patch(
   '/:id/employees/:empId',
   requireAnyPermission('leads:update_any', 'leads:update_own'),
   (req, res) => {
-    const lead = requireLeadAccess(req, res);
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
     const emp = db
       .prepare(`SELECT * FROM lead_employees WHERE id = ? AND lead_id = ?`)
@@ -1090,7 +1099,7 @@ router.delete(
   '/:id/employees/:empId',
   requireAnyPermission('leads:update_any', 'leads:update_own'),
   (req, res) => {
-    const lead = requireLeadAccess(req, res);
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
     const emp = db
       .prepare(`SELECT * FROM lead_employees WHERE id = ? AND lead_id = ?`)
@@ -1300,13 +1309,9 @@ router.post(
   '/:id/archive',
   requireAnyPermission('leads:update_any', 'leads:update_own'),
   (req, res) => {
-    const lead = requireLeadAccess(req, res);
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
-    if (
-      !roleHasPermission(req.user.role, 'leads:update_any') &&
-      lead.assigned_to !== req.user.id &&
-      lead.created_by !== req.user.id
-    ) {
+    if (!canUpdateLead(req.user, lead)) {
       return res.status(403).json({ error: 'Permission denied' });
     }
     const now = new Date().toISOString();
@@ -1326,13 +1331,9 @@ router.post(
   '/:id/unarchive',
   requireAnyPermission('leads:update_any', 'leads:update_own'),
   (req, res) => {
-    const lead = requireLeadAccess(req, res);
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
-    if (
-      !roleHasPermission(req.user.role, 'leads:update_any') &&
-      lead.assigned_to !== req.user.id &&
-      lead.created_by !== req.user.id
-    ) {
+    if (!canUpdateLead(req.user, lead)) {
       return res.status(403).json({ error: 'Permission denied' });
     }
     db.prepare(

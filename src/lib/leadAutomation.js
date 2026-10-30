@@ -113,3 +113,27 @@ export function onLeadReply(leadId, { userId = null } = {}) {
 export function onDemoBooked(leadId, { userId = null } = {}) {
   return advanceLeadStage(leadId, 'demo_scheduled', { userId });
 }
+
+/**
+ * Assign unassigned lead to the acting user (e.g. BD emailing a shared product-pool lead).
+ * No-op if already assigned. Returns whether ownership was claimed.
+ */
+export function claimLeadIfUnassigned(leadId, userId) {
+  if (!leadId || !userId) return { claimed: false };
+  const result = db
+    .prepare(
+      `UPDATE leads
+       SET assigned_to = ?,
+           assigned_at = datetime('now'),
+           assigned_by = ?,
+           updated_at = datetime('now')
+       WHERE id = ? AND (assigned_to IS NULL OR assigned_to = '')`,
+    )
+    .run(userId, userId, leadId);
+  if (!result.changes) return { claimed: false };
+  db.prepare(
+    `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
+     VALUES (?, ?, ?, 'note', ?)`,
+  ).run(uuid(), leadId, userId, 'Claimed ownership (contacted from shared product pool)');
+  return { claimed: true };
+}

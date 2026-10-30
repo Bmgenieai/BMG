@@ -13,7 +13,8 @@ import {
   sendTransactionalEmail,
   upsertContact,
 } from '../lib/brevo.js';
-import { canAccessLead, roleHasPermission } from '../lib/permissions.js';
+import { canAccessLead, canUpdateLead, roleHasPermission } from '../lib/permissions.js';
+import { claimLeadIfUnassigned } from '../lib/leadAutomation.js';
 import {
   countEmailReplies,
   countUnreadEmailReplies,
@@ -248,7 +249,7 @@ router.post(
       if (row.lead_id) {
         const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(row.lead_id);
         if (!lead) return res.status(404).json({ error: 'Lead not found' });
-        if (!canAccessLead(req.user, lead) && !roleHasPermission(req.user.role, 'leads:update_any')) {
+        if (!canUpdateLead(req.user, lead)) {
           return res.status(403).json({ error: 'Permission denied' });
         }
       }
@@ -296,7 +297,7 @@ router.post(
     try {
       const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(req.params.id);
       if (!lead) return res.status(404).json({ error: 'Lead not found' });
-      if (!canAccessLead(req.user, lead) && !roleHasPermission(req.user.role, 'leads:update_any')) {
+      if (!canUpdateLead(req.user, lead)) {
         return res.status(403).json({ error: 'Permission denied' });
       }
       if (!lead.email) return res.status(400).json({ error: 'Lead has no email' });
@@ -346,8 +347,8 @@ router.post(
         .prepare(`SELECT * FROM leads WHERE id IN (${placeholders}) AND email IS NOT NULL AND email != ''`)
         .all(...ids);
 
-      // Telesales may only sync leads they own / created
-      leads = leads.filter((lead) => canAccessLead(req.user, lead));
+      // BD: own leads + shared product pool (e.g. free credit)
+      leads = leads.filter((lead) => canUpdateLead(req.user, lead));
 
       let synced = 0;
       let failed = 0;
@@ -396,7 +397,7 @@ router.post(
     try {
       const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(req.params.id);
       if (!lead) return res.status(404).json({ error: 'Lead not found' });
-      if (!canAccessLead(req.user, lead) && !roleHasPermission(req.user.role, 'leads:update_any')) {
+      if (!canUpdateLead(req.user, lead)) {
         return res.status(403).json({ error: 'Permission denied' });
       }
       if (!lead.email) return res.status(400).json({ error: 'Lead has no email' });
@@ -451,6 +452,9 @@ router.post(
         textContent: content.textContent || null,
       });
 
+      // BD working a shared product-pool lead (e.g. free credit) becomes the owner
+      claimLeadIfUnassigned(lead.id, req.user.id);
+
       // Outreach stays on qualified — funnel stage only advances on reply/demo/trial/paid
       res.json({ ok: true, brevo: result, subject: content.subject });
     } catch (err) {
@@ -478,7 +482,7 @@ router.post(
         .prepare(`SELECT * FROM leads WHERE id IN (${placeholders}) AND email IS NOT NULL AND email != ''`)
         .all(...ids);
 
-      leads = leads.filter((lead) => canAccessLead(req.user, lead));
+      leads = leads.filter((lead) => canUpdateLead(req.user, lead));
 
       if (!leads.length) {
         return res.status(400).json({
@@ -536,6 +540,7 @@ router.post(
               htmlContent: content.htmlContent || null,
               textContent: content.textContent || null,
             });
+            claimLeadIfUnassigned(lead.id, req.user.id);
           });
 
           sent += 1;
@@ -563,7 +568,7 @@ router.post(
     const { leadId, templateId, subject, htmlContent, textContent } = req.body || {};
     const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(leadId);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
-    if (!canAccessLead(req.user, lead) && !roleHasPermission(req.user.role, 'leads:update_any')) {
+    if (!canUpdateLead(req.user, lead)) {
       return res.status(403).json({ error: 'Permission denied' });
     }
     try {
@@ -627,7 +632,7 @@ router.post(
         `SELECT * FROM leads WHERE id IN (${placeholders}) AND email IS NOT NULL AND email != ''`,
       )
       .all(...ids)
-      .filter((lead) => canAccessLead(req.user, lead));
+      .filter((lead) => canUpdateLead(req.user, lead));
 
     if (!leads.length) {
       return res.status(400).json({ error: 'No accessible leads with email addresses found' });
