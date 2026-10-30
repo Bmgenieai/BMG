@@ -67,11 +67,16 @@ export function roleHasPermission(role, permission) {
 }
 
 /**
- * Product sources BD accounts can see and work as a shared pool
- * (not limited to assigned_to / created_by). Start with free-credit;
- * expand here if signup / win-back should match.
+ * Product sources BD can see/work as a shared pool (not only assigned/created).
+ * Keep in sync with PRODUCT_LEAD_TABS below.
  */
-export const BD_SHARED_PRODUCT_SOURCES = ['free_credit_no_purchase'];
+export const BD_SHARED_PRODUCT_SOURCES = [
+  'signup_no_listing',
+  'free_credit_no_purchase',
+  'purchased_no_repurchase',
+  'checkout_abandoned',
+  'revision_requested',
+];
 
 export function isBdSharedProductSource(source) {
   return BD_SHARED_PRODUCT_SOURCES.includes(source);
