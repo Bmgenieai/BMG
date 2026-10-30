@@ -20,7 +20,7 @@ export function migrate() {
       email TEXT NOT NULL UNIQUE COLLATE NOCASE,
       password_hash TEXT NOT NULL,
       name TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('ceo','manager','telesales')),
+      role TEXT NOT NULL CHECK(role IN ('ceo','manager','telesales','chat_support')),
       phone TEXT,
       is_active INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -343,6 +343,8 @@ export function migrate() {
     `ALTER TABLE chat_threads ADD COLUMN visitor_city TEXT`,
     `ALTER TABLE chat_threads ADD COLUMN mode TEXT DEFAULT 'ai'`,
     `ALTER TABLE chat_threads ADD COLUMN handoff_at TEXT`,
+    `ALTER TABLE chat_threads ADD COLUMN assigned_to_user_id TEXT REFERENCES users(id) ON DELETE SET NULL`,
+    `ALTER TABLE chat_threads ADD COLUMN assigned_at TEXT`,
   ];
   for (const sql of chatAlters) {
     try {
@@ -528,6 +530,39 @@ export function migrate() {
     `INSERT INTO schema_meta (key, value, updated_at) VALUES (?, ?, datetime('now'))
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
   );
+
+  // Expand users.role CHECK to include chat_support (SQLite cannot ALTER CHECK)
+  if (!metaGet.get('users_role_chat_support_v1')?.value) {
+    try {
+      db.pragma('foreign_keys = OFF');
+      db.exec(`
+        CREATE TABLE users_mig (
+          id TEXT PRIMARY KEY,
+          email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          password_hash TEXT NOT NULL,
+          name TEXT NOT NULL,
+          role TEXT NOT NULL CHECK(role IN ('ceo','manager','telesales','chat_support')),
+          phone TEXT,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          created_by TEXT
+        );
+        INSERT INTO users_mig (
+          id, email, password_hash, name, role, phone, is_active, created_at, updated_at, created_by
+        )
+        SELECT id, email, password_hash, name, role, phone, is_active, created_at, updated_at, created_by
+        FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_mig RENAME TO users;
+      `);
+      db.pragma('foreign_keys = ON');
+      metaSet.run('users_role_chat_support_v1', '1');
+    } catch (err) {
+      db.pragma('foreign_keys = ON');
+      console.warn('[migrate] users_role_chat_support_v1:', err.message);
+    }
+  }
 
   // One-time: oldest dispositions → prior funnel stages
   if (!metaGet.get('status_funnel_v1')?.value) {

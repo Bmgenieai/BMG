@@ -6,15 +6,17 @@
  * - ceo — full access + admin
  * - manager — team visibility / performance (view-mostly; no BD day-to-day ops)
  * - telesales — BD (create leads, notes, status, send email)
+ * - chat_support — website AI/human chat inbox only
  */
 
-export const ROLES = ['ceo', 'manager', 'telesales'];
+export const ROLES = ['ceo', 'manager', 'telesales', 'chat_support'];
 
-/** Display names for UI (DB still stores ceo / manager / telesales). */
+/** Display names for UI (DB still stores ceo / manager / telesales / chat_support). */
 export const ROLE_LABELS = {
   ceo: 'CEO',
   manager: 'Manager',
   telesales: 'BD',
+  chat_support: 'Chat Support',
 };
 
 export function roleLabel(role) {
@@ -58,6 +60,10 @@ export const PERMISSIONS = {
 
   // Cold email (Brevo) — BD + CEO only; manager watches replies/performance
   'email:bulk_send': ['ceo', 'telesales'],
+
+  // Website AI / human chat inbox — Chat Support + CEO reply; others may view
+  'chats:view': ['ceo', 'manager', 'telesales', 'chat_support'],
+  'chats:reply': ['ceo', 'chat_support'],
 };
 
 export function roleHasPermission(role, permission) {

@@ -541,6 +541,8 @@ function upsertChatThread({
         visitor_city = COALESCE(?, visitor_city),
         mode = COALESCE(?, mode),
         handoff_at = COALESCE(?, handoff_at),
+        assigned_to_user_id = CASE WHEN ? = 'closed' THEN NULL ELSE assigned_to_user_id END,
+        assigned_at = CASE WHEN ? = 'closed' THEN NULL ELSE assigned_at END,
         raw_json = ?,
         updated_at = datetime('now')
        WHERE id = ?`,
@@ -559,6 +561,8 @@ function upsertChatThread({
       visitorCity,
       mode,
       handoffAt,
+      nextStatus,
+      nextStatus,
       serializeMetadata(meta),
       existing.id,
     );
