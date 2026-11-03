@@ -1,0 +1,60 @@
+name: Handover BD user
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Set to 1 to count only (no writes)'
+        required: false
+        default: '0'
+      from_email:
+        description: 'Leaving BD email'
+        required: false
+        default: 'ramzan.hashmi@bmgenie.ai'
+      to_email:
+        description: 'New BD email'
+        required: false
+        default: 'nabeelhassan@bmgenie.ai'
+      to_name:
+        description: 'New BD display name (used if account is created)'
+        required: false
+        default: 'Nabeel Hassan'
+
+concurrency:
+  group: handover-bd-user
+  cancel-in-progress: false
+
+jobs:
+  handover:
+    name: Move BD ownership (Windows)
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH handover on Windows PC
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          command_timeout: 15m
+          script: |
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+            $path = '${{ secrets.CRM_DEPLOY_PATH }}'
+            if ([string]::IsNullOrWhiteSpace($path)) { $path = 'D:\crm-api.bmgenie.ai' }
+            if (-not (Test-Path $path)) { throw "CRM path not found: $path" }
+            Set-Location $path
+            git fetch origin main
+            if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+            git reset --hard origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'git reset --hard failed' }
+            if (-not (Test-Path .\scripts\windows\handover-bd-user.cjs)) {
+              throw 'handover-bd-user.cjs missing after pull'
+            }
+            $env:FROM_EMAIL = '${{ inputs.from_email }}'
+            $env:TO_EMAIL = '${{ inputs.to_email }}'
+            $env:TO_NAME = '${{ inputs.to_name }}'
+            $env:DRY_RUN = '${{ inputs.dry_run }}'
+            Write-Host "--- BD handover FROM=$env:FROM_EMAIL TO=$env:TO_EMAIL DRY_RUN=$env:DRY_RUN ---"
+            node .\scripts\windows\handover-bd-user.cjs
+            if ($LASTEXITCODE -ne 0) { throw 'handover script failed' }
+            Write-Host 'HANDOVER_WORKFLOW_DONE'
+            exit 0
