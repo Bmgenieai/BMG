@@ -5,19 +5,22 @@ import {
   sendTransactionalEmail,
   upsertContact,
 } from './brevo.js';
+import { resolveSendAccount } from './emailAccounts.js';
 import { recordEmailSend } from './emailLog.js';
 import { claimLeadIfUnassigned } from './leadAutomation.js';
 
 const TICK_MS = 30_000;
 const BATCH_LIMIT = 15;
 
-function senderFromUserId(userId) {
+function senderFromUserId(userId, emailAccountId = null) {
   const user = db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).get(userId);
+  const resolved = resolveSendAccount(emailAccountId || null);
   return {
     user,
+    accountId: resolved.accountId,
     sender: {
-      name: user?.name || 'BMGenie Sales',
-      email: process.env.BREVO_SENDER_EMAIL || undefined,
+      name: resolved.sender.name || user?.name || 'BMGenie Sales',
+      email: resolved.sender.email,
     },
   };
 }
@@ -57,7 +60,10 @@ async function processOne(row) {
     return;
   }
 
-  const { user, sender } = senderFromUserId(row.user_id);
+  const { user, sender, accountId } = senderFromUserId(
+    row.user_id,
+    row.email_account_id || null,
+  );
   if (!user) {
     db.prepare(
       `UPDATE scheduled_emails SET status = 'failed', error = ?, sent_at = datetime('now')
@@ -91,6 +97,7 @@ async function processOne(row) {
       htmlContent: content.htmlContent,
       textContent: content.textContent,
       leadId: lead.id,
+      sender,
     });
 
     recordEmailSend({
@@ -100,10 +107,11 @@ async function processOne(row) {
       toEmail: lead.email,
       templateId: row.template_id || null,
       brevoMessageId: result?.messageId || result?.message_id || null,
-      source: 'scheduled',
-      summaryPrefix: 'Brevo scheduled',
+      source: row.campaign_id ? 'campaign' : 'scheduled',
+      summaryPrefix: row.campaign_id ? 'Campaign email' : 'Brevo scheduled',
       htmlContent: content.htmlContent || null,
       textContent: content.textContent || null,
+      emailAccountId: accountId,
     });
 
     claimLeadIfUnassigned(lead.id, row.user_id);
@@ -113,6 +121,35 @@ async function processOne(row) {
        SET status = 'sent', sent_at = datetime('now'), error = NULL
        WHERE id = ?`,
     ).run(row.id);
+
+    if (row.campaign_id) {
+      const pending = db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM scheduled_emails
+           WHERE campaign_id = ? AND lead_id = ? AND status IN ('pending', 'sending')`,
+        )
+        .get(row.campaign_id, lead.id).c;
+      if (!pending) {
+        db.prepare(
+          `UPDATE email_campaign_leads
+           SET status = 'completed', completed_at = datetime('now')
+           WHERE campaign_id = ? AND lead_id = ? AND status = 'active'`,
+        ).run(row.campaign_id, lead.id);
+      }
+      const open = db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM email_campaign_leads
+           WHERE campaign_id = ? AND status IN ('pending', 'active')`,
+        )
+        .get(row.campaign_id).c;
+      if (!open) {
+        db.prepare(
+          `UPDATE email_campaigns
+           SET status = 'completed', updated_at = datetime('now')
+           WHERE id = ? AND status = 'active'`,
+        ).run(row.campaign_id);
+      }
+    }
   } catch (err) {
     db.prepare(
       `UPDATE scheduled_emails

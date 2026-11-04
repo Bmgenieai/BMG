@@ -16,13 +16,23 @@ const EARLY_STAGES = new Set(['uncontacted', 'contacted', 'new']);
 export function cancelScheduledOutreach(leadId, reason = 'Reply received — outreach stopped') {
   if (!leadId) return 0;
   try {
-    return db
+    const changes = db
       .prepare(
         `UPDATE scheduled_emails
          SET status = 'cancelled', error = ?
          WHERE lead_id = ? AND status IN ('pending', 'sending')`,
       )
       .run(reason, leadId).changes;
+    try {
+      db.prepare(
+        `UPDATE email_campaign_leads
+         SET status = 'stopped', stopped_reason = ?, completed_at = datetime('now')
+         WHERE lead_id = ? AND status IN ('pending', 'active')`,
+      ).run(reason, leadId);
+    } catch {
+      /* table may not exist on very old DBs mid-migrate */
+    }
+    return changes;
   } catch {
     return 0;
   }

@@ -235,11 +235,18 @@ export function replyToForLead(leadId) {
  *   tags?: string[],
  *   headers?: Record<string, string>,
  *   replyTo?: { email: string, name?: string } | null,
+ *   sender?: { email: string, name?: string } | null,
  * }} opts
  */
 export async function sendTransactionalEmail(opts) {
   assertEnabled();
-  const sender = senderConfig();
+  const sender =
+    opts.sender?.email
+      ? {
+          email: String(opts.sender.email).trim(),
+          name: String(opts.sender.name || opts.sender.email).trim(),
+        }
+      : senderConfig();
   const tags = [...(opts.tags || [])];
   if (opts.leadId) tags.push(`crm-lead-${opts.leadId}`);
   const body = {
@@ -254,7 +261,14 @@ export async function sendTransactionalEmail(opts) {
     body.params = { CRM_LEAD_ID: opts.leadId };
   }
   const replyTo =
-    opts.replyTo === null ? null : opts.replyTo || replyToForLead(opts.leadId);
+    opts.replyTo === null
+      ? null
+      : opts.replyTo ||
+        (() => {
+          const rt = replyToForLead(opts.leadId);
+          if (rt && sender.name) rt.name = sender.name;
+          return rt;
+        })();
   if (replyTo) body.replyTo = replyTo;
   if (opts.headers && typeof opts.headers === 'object') {
     const headers = {};

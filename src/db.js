@@ -600,6 +600,116 @@ export function migrate() {
     }
     metaSet.run('status_funnel_v2', '1');
   }
+
+  // Multi-sender accounts + in-CRM campaigns
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS email_accounts (
+      id TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      name TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      verified INTEGER NOT NULL DEFAULT 0,
+      imap_host TEXT,
+      imap_port INTEGER,
+      imap_user TEXT,
+      imap_pass TEXT,
+      imap_enabled INTEGER NOT NULL DEFAULT 0,
+      created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_accounts_active
+      ON email_accounts(is_active, is_default);
+
+    CREATE TABLE IF NOT EXISTS email_campaigns (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft'
+        CHECK(status IN ('draft','active','paused','completed','cancelled')),
+      email_account_id TEXT REFERENCES email_accounts(id) ON DELETE SET NULL,
+      created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      launched_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_campaigns_status
+      ON email_campaigns(status, created_at);
+
+    CREATE TABLE IF NOT EXISTS email_campaign_steps (
+      id TEXT PRIMARY KEY,
+      campaign_id TEXT NOT NULL REFERENCES email_campaigns(id) ON DELETE CASCADE,
+      step_order INTEGER NOT NULL DEFAULT 1,
+      delay_days INTEGER NOT NULL DEFAULT 0,
+      subject TEXT,
+      html_content TEXT,
+      text_content TEXT,
+      template_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_campaign_steps_campaign
+      ON email_campaign_steps(campaign_id, step_order);
+
+    CREATE TABLE IF NOT EXISTS email_campaign_leads (
+      id TEXT PRIMARY KEY,
+      campaign_id TEXT NOT NULL REFERENCES email_campaigns(id) ON DELETE CASCADE,
+      lead_id TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','active','completed','stopped','failed')),
+      stopped_reason TEXT,
+      enrolled_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT,
+      UNIQUE(campaign_id, lead_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_campaign_leads_campaign
+      ON email_campaign_leads(campaign_id, status);
+    CREATE INDEX IF NOT EXISTS idx_email_campaign_leads_lead
+      ON email_campaign_leads(lead_id);
+  `);
+
+  const scheduledAlters = [
+    `ALTER TABLE scheduled_emails ADD COLUMN email_account_id TEXT`,
+    `ALTER TABLE scheduled_emails ADD COLUMN campaign_id TEXT`,
+    `ALTER TABLE scheduled_emails ADD COLUMN campaign_step_id TEXT`,
+  ];
+  for (const sql of scheduledAlters) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* column already exists */
+    }
+  }
+
+  try {
+    db.exec(`ALTER TABLE email_messages ADD COLUMN email_account_id TEXT`);
+  } catch {
+    /* exists */
+  }
+
+  // Seed default account from BREVO_SENDER_EMAIL once
+  if (!metaGet.get('email_accounts_seed_v1')?.value) {
+    try {
+      const envEmail = (process.env.BREVO_SENDER_EMAIL || '').trim().toLowerCase();
+      const envName = (process.env.BREVO_SENDER_NAME || 'BMGenie Sales').trim();
+      if (envEmail) {
+        const existing = db
+          .prepare(`SELECT id FROM email_accounts WHERE lower(email) = ?`)
+          .get(envEmail);
+        if (!existing) {
+          const id = `ea_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+          db.prepare(
+            `INSERT INTO email_accounts (
+               id, label, email, name, is_active, is_default, verified
+             ) VALUES (?, ?, ?, ?, 1, 1, 1)`,
+          ).run(id, envName || envEmail, envEmail, envName || envEmail);
+        }
+      }
+      metaSet.run('email_accounts_seed_v1', '1');
+    } catch (err) {
+      console.warn('[migrate] email_accounts_seed_v1:', err.message);
+    }
+  }
 }
 
 migrate();

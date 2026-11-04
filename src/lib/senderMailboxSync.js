@@ -1,19 +1,15 @@
 /**
- * Poll magic.retouching@ (or BREVO_SENDER_EMAIL) IMAP inbox for prospect replies
- * that bypassed Reply-To and landed on the From address. Ingest into Email replies
- * with the same threading as Brevo inbound parsing.
+ * Poll sending mailboxes (IMAP) for prospect replies that landed on From
+ * instead of Reply-To. Always keep magic.retouching env mailbox + any
+ * email_accounts with IMAP enabled (e.g. Christina).
  *
- * Env:
+ * Env (legacy / Magic Retouching):
  *   SENDER_MAILBOX_SYNC=true
- *   SENDER_MAILBOX_IMAP_HOST=mail2.benchmarkstudio.biz
- *   SENDER_MAILBOX_IMAP_PORT=993
- *   SENDER_MAILBOX_USER=magic.retouching@bmgenie.ai
- *   SENDER_MAILBOX_PASS=<mailbox password>
- *   SENDER_MAILBOX_SYNC_MS=120000   (optional, default 2 min)
- *   SENDER_MAILBOX_LOOKBACK_DAYS=120 (optional — import older inbox replies)
+ *   SENDER_MAILBOX_IMAP_HOST / PORT / USER / PASS
  */
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
+import { db } from '../db.js';
 import { ingestParsedReply } from './emailLog.js';
 
 let timer = null;
@@ -26,17 +22,67 @@ function truthy(v) {
   return ['1', 'true', 'yes', 'on'].includes(String(v || '').trim().toLowerCase());
 }
 
-export function senderMailboxSyncConfig() {
+function envMailbox() {
   const user =
     (process.env.SENDER_MAILBOX_USER || process.env.BREVO_SENDER_EMAIL || '').trim() || null;
   const pass = (process.env.SENDER_MAILBOX_PASS || '').trim() || null;
   const enabled = truthy(process.env.SENDER_MAILBOX_SYNC) && Boolean(user && pass);
+  if (!enabled) return null;
   return {
-    enabled,
-    configured: Boolean(user && pass),
+    id: 'env',
+    label: user,
     host: (process.env.SENDER_MAILBOX_IMAP_HOST || 'mail2.benchmarkstudio.biz').trim(),
     port: Number(process.env.SENDER_MAILBOX_IMAP_PORT) || 993,
     user,
+    pass,
+  };
+}
+
+function accountMailboxes() {
+  try {
+    return db
+      .prepare(
+        `SELECT id, label, email, imap_host, imap_port, imap_user, imap_pass
+         FROM email_accounts
+         WHERE is_active = 1 AND imap_enabled = 1
+           AND imap_user IS NOT NULL AND TRIM(imap_user) != ''
+           AND imap_pass IS NOT NULL AND TRIM(imap_pass) != ''`,
+      )
+      .all()
+      .map((a) => ({
+        id: a.id,
+        label: a.label || a.email,
+        host: (a.imap_host || process.env.SENDER_MAILBOX_IMAP_HOST || 'mail2.benchmarkstudio.biz').trim(),
+        port: Number(a.imap_port) || 993,
+        user: String(a.imap_user).trim(),
+        pass: String(a.imap_pass),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+export function listSyncMailboxes() {
+  const list = [];
+  const env = envMailbox();
+  if (env) list.push(env);
+  for (const a of accountMailboxes()) {
+    if (env && a.user.toLowerCase() === env.user.toLowerCase()) continue;
+    list.push(a);
+  }
+  return list;
+}
+
+export function senderMailboxSyncConfig() {
+  const boxes = listSyncMailboxes();
+  const env = envMailbox();
+  return {
+    enabled: boxes.length > 0,
+    configured: boxes.length > 0,
+    host: env?.host || boxes[0]?.host || null,
+    port: env?.port || boxes[0]?.port || 993,
+    user: env?.user || boxes[0]?.user || null,
+    mailboxes: boxes.map((b) => ({ id: b.id, user: b.user, label: b.label, host: b.host })),
     syncMs: Math.max(60_000, Number(process.env.SENDER_MAILBOX_SYNC_MS) || 120_000),
     lookbackDays: Math.min(
       365,
@@ -59,6 +105,16 @@ function ourAddresses() {
       .toLowerCase();
     if (e) set.add(e);
   }
+  try {
+    for (const row of db.prepare(`SELECT email FROM email_accounts WHERE is_active = 1`).all()) {
+      const e = String(row.email || '')
+        .trim()
+        .toLowerCase();
+      if (e) set.add(e);
+    }
+  } catch {
+    /* ignore */
+  }
   return set;
 }
 
@@ -79,8 +135,7 @@ function looksLikeReply(parsed) {
   return /^(re|fw|fwd|automatic reply)\s*:/i.test(sub);
 }
 
-async function processMessage(client, uid) {
-  // search() returns UIDs — must pass { uid: true } to download/flags
+async function processMessage(client, uid, mailboxMeta) {
   const downloaded = await client.download(uid, undefined, { uid: true });
   if (!downloaded?.content) return { skipped: 'no_content' };
   const parsed = await simpleParser(downloaded.content);
@@ -98,8 +153,8 @@ async function processMessage(client, uid) {
     ? String(parsed.messageId).replace(/^<|>$/g, '')
     : null;
   const providerMessageId = messageId
-    ? `mailbox:${messageId}`
-    : `mailbox:uid-${uid}-${parsed.date?.getTime() || Date.now()}`;
+    ? `mailbox:${mailboxMeta.user}:${messageId}`
+    : `mailbox:${mailboxMeta.user}:uid-${uid}-${parsed.date?.getTime() || Date.now()}`;
 
   const toEmails = [
     ...addrList(parsed.to?.value),
@@ -113,7 +168,7 @@ async function processMessage(client, uid) {
       ? String(parsed.references)
       : null;
 
-  const result = ingestParsedReply({
+  return ingestParsedReply({
     providerMessageId,
     fromEmail,
     fromName,
@@ -128,37 +183,29 @@ async function processMessage(client, uid) {
     receivedAt: parsed.date ? parsed.date.toISOString() : new Date().toISOString(),
     raw: {
       ingestSource: 'sender_mailbox',
-      mailboxHost: process.env.SENDER_MAILBOX_IMAP_HOST || 'mail2.benchmarkstudio.biz',
+      mailboxUser: mailboxMeta.user,
+      mailboxHost: mailboxMeta.host,
       messageId,
       from: fromEmail,
       to: toEmails,
       subject: parsed.subject,
     },
-    // Use brevo_inbound for CHECK compatibility on older DBs; raw.ingestSource marks mailbox origin
     source: 'brevo_inbound',
     requireLeadMatch: false,
   });
-
-  return result;
 }
 
-export async function syncSenderMailboxOnce() {
-  const cfg = senderMailboxSyncConfig();
-  if (!cfg.enabled) {
-    return { ok: false, skipped: 'disabled' };
-  }
-  if (running) return { ok: false, skipped: 'busy' };
-  running = true;
+async function syncOneMailbox(box, lookbackDays) {
   let ingested = 0;
   let scanned = 0;
   let skipped = 0;
   const skipReasons = {};
 
   const client = new ImapFlow({
-    host: cfg.host,
-    port: cfg.port,
+    host: box.host,
+    port: box.port,
     secure: true,
-    auth: { user: cfg.user, pass: process.env.SENDER_MAILBOX_PASS },
+    auth: { user: box.user, pass: box.pass },
     logger: false,
   });
 
@@ -166,8 +213,7 @@ export async function syncSenderMailboxOnce() {
     await client.connect();
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // Unseen + all mail in lookback window (catches older replies already in inbox)
-      const since = new Date(Date.now() - cfg.lookbackDays * 24 * 60 * 60 * 1000);
+      const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
       const uids = await client.search({ seen: false });
       const recent = await client.search({ since });
       const set = new Set([...(uids || []), ...(recent || [])]);
@@ -176,7 +222,7 @@ export async function syncSenderMailboxOnce() {
       for (const uid of list) {
         scanned += 1;
         try {
-          const result = await processMessage(client, uid);
+          const result = await processMessage(client, uid, box);
           if (result?.ok && !result.skipped) {
             ingested += 1;
             try {
@@ -201,36 +247,59 @@ export async function syncSenderMailboxOnce() {
           skipped += 1;
           const reason = `throw:${err.message || 'error'}`;
           skipReasons[reason] = (skipReasons[reason] || 0) + 1;
-          console.warn('[sender-mailbox] message failed', uid, err.message);
+          console.warn('[sender-mailbox] message failed', box.user, uid, err.message);
         }
       }
     } finally {
       lock.release();
     }
     await client.logout();
-    lastError = null;
-    lastSyncAt = new Date().toISOString();
-    lastIngested = ingested;
-    if (ingested > 0) {
-      console.log(`[sender-mailbox] synced ingested=${ingested} scanned=${scanned} skipped=${skipped}`);
-    }
-    return { ok: true, ingested, scanned, skipped, skipReasons };
+    return { ok: true, user: box.user, ingested, scanned, skipped, skipReasons };
   } catch (err) {
-    lastError =
+    let error =
       err.responseText ||
       err.serverResponseCode ||
       err.message ||
       String(err);
     if (err.responseText && err.message && err.responseText !== err.message) {
-      lastError = `${err.message}: ${err.responseText}`;
+      error = `${err.message}: ${err.responseText}`;
     }
-    console.warn('[sender-mailbox] sync failed:', lastError);
+    console.warn('[sender-mailbox] sync failed:', box.user, error);
     try {
       await client.logout();
     } catch {
       /* ignore */
     }
-    return { ok: false, error: lastError };
+    return { ok: false, user: box.user, error };
+  }
+}
+
+export async function syncSenderMailboxOnce() {
+  const cfg = senderMailboxSyncConfig();
+  if (!cfg.enabled) {
+    return { ok: false, skipped: 'disabled' };
+  }
+  if (running) return { ok: false, skipped: 'busy' };
+  running = true;
+
+  const boxes = listSyncMailboxes();
+  let ingested = 0;
+  const results = [];
+
+  try {
+    for (const box of boxes) {
+      const r = await syncOneMailbox(box, cfg.lookbackDays);
+      results.push(r);
+      if (r.ok) ingested += r.ingested || 0;
+      else lastError = r.error;
+    }
+    if (results.every((r) => r.ok)) lastError = null;
+    lastSyncAt = new Date().toISOString();
+    lastIngested = ingested;
+    if (ingested > 0) {
+      console.log(`[sender-mailbox] synced ingested=${ingested} mailboxes=${boxes.length}`);
+    }
+    return { ok: true, ingested, results };
   } finally {
     running = false;
   }
@@ -247,7 +316,7 @@ export function startSenderMailboxSync() {
     return;
   }
   console.log(
-    `[sender-mailbox] polling ${cfg.user} via ${cfg.host}:${cfg.port} every ${Math.round(cfg.syncMs / 1000)}s`,
+    `[sender-mailbox] polling ${cfg.mailboxes.map((m) => m.user).join(', ')} every ${Math.round(cfg.syncMs / 1000)}s`,
   );
   const tick = () => {
     syncSenderMailboxOnce().catch((err) => {

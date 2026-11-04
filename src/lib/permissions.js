@@ -60,6 +60,8 @@ export const PERMISSIONS = {
 
   // Cold email (Brevo) — BD + CEO only; manager watches replies/performance
   'email:bulk_send': ['ceo', 'telesales'],
+  'email:manage_accounts': ['ceo'],
+  'email:manage_campaigns': ['ceo', 'telesales'],
 
   // Website AI / human chat inbox — Chat Support + CEO reply; others may view
   'chats:view': ['ceo', 'manager', 'telesales', 'chat_support'],

@@ -13,6 +13,14 @@ import {
   sendTransactionalEmail,
   upsertContact,
 } from '../lib/brevo.js';
+import {
+  createEmailAccount,
+  getEmailAccount,
+  listEmailAccounts,
+  resolveSendAccount,
+  updateEmailAccount,
+} from '../lib/emailAccounts.js';
+import * as campaigns from '../lib/campaigns.js';
 import { canAccessLead, canUpdateLead, roleHasPermission } from '../lib/permissions.js';
 import { claimLeadIfUnassigned } from '../lib/leadAutomation.js';
 import {
@@ -31,25 +39,35 @@ import {
 
 const router = Router();
 
-function senderFromUser(user) {
-  return { name: user.name, email: process.env.BREVO_SENDER_EMAIL || undefined };
-}
-
-function resolveEmailContent({ subject, htmlContent, textContent, templateId, lead, user }) {
-  const sender = senderFromUser(user);
+function resolveEmailContent({
+  subject,
+  htmlContent,
+  textContent,
+  templateId,
+  lead,
+  user,
+  emailAccountId = null,
+}) {
+  const { sender } = resolveSendAccount(emailAccountId);
+  const mergeSender = {
+    name: user?.name || sender.name,
+    email: sender.email,
+  };
   if (templateId) {
     const tpl = getTemplateById(templateId);
     if (!tpl) throw Object.assign(new Error('Unknown template'), { status: 400 });
     return {
-      subject: applyMergeTags(subject || tpl.subject, lead, sender),
-      htmlContent: applyMergeTags(htmlContent || tpl.htmlContent, lead, sender),
-      textContent: applyMergeTags(textContent || tpl.textContent, lead, sender),
+      subject: applyMergeTags(subject || tpl.subject, lead, mergeSender),
+      htmlContent: applyMergeTags(htmlContent || tpl.htmlContent, lead, mergeSender),
+      textContent: applyMergeTags(textContent || tpl.textContent, lead, mergeSender),
+      sender,
     };
   }
   return {
-    subject: applyMergeTags(subject, lead, sender),
-    htmlContent: htmlContent ? applyMergeTags(htmlContent, lead, sender) : undefined,
-    textContent: textContent ? applyMergeTags(textContent, lead, sender) : undefined,
+    subject: applyMergeTags(subject, lead, mergeSender),
+    htmlContent: htmlContent ? applyMergeTags(htmlContent, lead, mergeSender) : undefined,
+    textContent: textContent ? applyMergeTags(textContent, lead, mergeSender) : undefined,
+    sender,
   };
 }
 
@@ -402,7 +420,9 @@ router.post(
       }
       if (!lead.email) return res.status(400).json({ error: 'Lead has no email' });
 
-      const { subject, htmlContent, textContent, templateId, syncToBrevo } = req.body || {};
+      const { subject, htmlContent, textContent, templateId, syncToBrevo, emailAccountId } =
+        req.body || {};
+      const { accountId } = resolveSendAccount(emailAccountId || null);
       const content = resolveEmailContent({
         subject,
         htmlContent,
@@ -410,6 +430,7 @@ router.post(
         templateId,
         lead,
         user: req.user,
+        emailAccountId: accountId,
       });
 
       if (!content.subject || (!content.htmlContent && !content.textContent)) {
@@ -437,6 +458,7 @@ router.post(
         htmlContent: content.htmlContent,
         textContent: content.textContent,
         leadId: lead.id,
+        sender: content.sender,
       });
 
       recordEmailSend({
@@ -450,6 +472,7 @@ router.post(
         summaryPrefix: 'Brevo cold email',
         htmlContent: content.htmlContent || null,
         textContent: content.textContent || null,
+        emailAccountId: accountId,
       });
 
       // BD working a shared product-pool lead (e.g. free credit) becomes the owner
@@ -471,10 +494,20 @@ router.post(
   requirePermission('email:bulk_send'),
   async (req, res) => {
     try {
-      const { leadIds, subject, htmlContent, textContent, templateId, syncToBrevo } = req.body || {};
+      const {
+        leadIds,
+        subject,
+        htmlContent,
+        textContent,
+        templateId,
+        syncToBrevo,
+        emailAccountId,
+      } = req.body || {};
       if (!Array.isArray(leadIds) || !leadIds.length) {
         return res.status(400).json({ error: 'leadIds[] required' });
       }
+
+      const { accountId } = resolveSendAccount(emailAccountId || null);
 
       const ids = leadIds.slice(0, 25);
       const placeholders = ids.map(() => '?').join(',');
@@ -503,6 +536,7 @@ router.post(
             templateId,
             lead,
             user: req.user,
+            emailAccountId: accountId,
           });
           if (!content.subject || (!content.htmlContent && !content.textContent)) {
             throw new Error('Missing subject or body');
@@ -527,6 +561,7 @@ router.post(
             htmlContent: content.htmlContent,
             textContent: content.textContent,
             leadId: lead.id,
+            sender: content.sender,
           }).then((result) => {
             recordEmailSend({
               leadId: lead.id,
@@ -539,6 +574,7 @@ router.post(
               summaryPrefix: 'Brevo bulk',
               htmlContent: content.htmlContent || null,
               textContent: content.textContent || null,
+              emailAccountId: accountId,
             });
             claimLeadIfUnassigned(lead.id, req.user.id);
           });
@@ -601,6 +637,7 @@ router.post(
       templateId,
       syncToBrevo,
       scheduledAt,
+      emailAccountId,
     } = req.body || {};
 
     if (!Array.isArray(leadIds) || !leadIds.length) {
@@ -625,6 +662,8 @@ router.post(
       return res.status(400).json({ error: 'htmlContent or textContent required (or use templateId)' });
     }
 
+    const { accountId } = resolveSendAccount(emailAccountId || null);
+
     const ids = leadIds.slice(0, 25);
     const placeholders = ids.map(() => '?').join(',');
     let leads = db
@@ -643,8 +682,8 @@ router.post(
     const insert = db.prepare(
       `INSERT INTO scheduled_emails (
          id, batch_id, lead_id, user_id, subject, html_content, text_content,
-         template_id, sync_to_brevo, scheduled_at, status
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+         template_id, sync_to_brevo, scheduled_at, status, email_account_id
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
     );
 
     const tx = db.transaction(() => {
@@ -660,6 +699,7 @@ router.post(
           templateId || null,
           syncToBrevo === false ? 0 : 1,
           scheduledSql,
+          accountId,
         );
       }
     });
@@ -839,6 +879,257 @@ router.get(
     const conversation = getLeadConversation(lead.id);
     if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
     res.json(conversation);
+  },
+);
+
+/** BD / CEO email performance (sent, delivered, opened, replies). */
+router.get(
+  '/performance',
+  authRequired,
+  requireAnyPermission('email:bulk_send', 'analytics:view_own', 'analytics:view_team', 'analytics:view_all'),
+  (req, res) => {
+    const canTeam =
+      roleHasPermission(req.user.role, 'analytics:view_team') ||
+      roleHasPermission(req.user.role, 'analytics:view_all');
+    let userId = req.user.id;
+    if (canTeam && req.query.userId) {
+      userId = String(req.query.userId);
+    }
+
+    const sent = db
+      .prepare(`SELECT COUNT(*) AS c FROM email_messages WHERE user_id = ?`)
+      .get(userId).c;
+    const delivered = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM email_messages m
+         WHERE m.user_id = ?
+           AND (
+             m.status IN ('delivered', 'opened', 'replied')
+             OR EXISTS (
+               SELECT 1 FROM email_events e
+               WHERE e.email_message_id = m.id AND e.event IN ('delivered', 'request')
+             )
+           )`,
+      )
+      .get(userId).c;
+    const opened = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM email_messages
+         WHERE user_id = ? AND COALESCE(open_count, 0) > 0`,
+      )
+      .get(userId).c;
+    const replies = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM email_replies r
+         WHERE EXISTS (
+           SELECT 1 FROM email_messages m
+           WHERE m.user_id = ?
+             AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+         )`,
+      )
+      .get(userId).c;
+
+    const user = db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).get(userId);
+
+    let team = [];
+    if (canTeam) {
+      team = db
+        .prepare(
+          `SELECT u.id, u.name,
+                  (SELECT COUNT(*) FROM email_messages m WHERE m.user_id = u.id) AS sent,
+                  (SELECT COUNT(*) FROM email_messages m
+                     WHERE m.user_id = u.id AND COALESCE(m.open_count, 0) > 0) AS opened,
+                  (SELECT COUNT(*) FROM email_replies r
+                     WHERE EXISTS (
+                       SELECT 1 FROM email_messages m
+                       WHERE m.user_id = u.id
+                         AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+                     )) AS replies
+           FROM users u
+           WHERE u.role = 'telesales' AND u.is_active = 1
+           ORDER BY u.name COLLATE NOCASE`,
+        )
+        .all();
+    }
+
+    res.json({
+      user,
+      stats: {
+        sent,
+        delivered,
+        opened,
+        replies,
+        openRate: sent ? Math.round((opened / sent) * 1000) / 10 : 0,
+        replyRate: sent ? Math.round((replies / sent) * 1000) / 10 : 0,
+        deliveryRate: sent ? Math.round((delivered / sent) * 1000) / 10 : 0,
+      },
+      team,
+    });
+  },
+);
+
+/** Active sending accounts (for From dropdown). */
+router.get(
+  '/accounts',
+  authRequired,
+  requireAnyPermission('email:bulk_send', 'leads:update_any', 'leads:update_own', 'email:manage_accounts'),
+  (req, res) => {
+    const manage = roleHasPermission(req.user.role, 'email:manage_accounts');
+    const rows = listEmailAccounts({ activeOnly: !manage });
+    res.json({ accounts: rows });
+  },
+);
+
+router.post(
+  '/accounts',
+  authRequired,
+  requirePermission('email:manage_accounts'),
+  (req, res) => {
+    try {
+      const account = createEmailAccount(req.body || {}, { userId: req.user.id });
+      res.status(201).json(account);
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.patch(
+  '/accounts/:id',
+  authRequired,
+  requirePermission('email:manage_accounts'),
+  (req, res) => {
+    try {
+      const account = updateEmailAccount(req.params.id, req.body || {});
+      res.json(account);
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.get(
+  '/accounts/:id',
+  authRequired,
+  requirePermission('email:manage_accounts'),
+  (req, res) => {
+    const account = getEmailAccount(req.params.id);
+    if (!account) return res.status(404).json({ error: 'Not found' });
+    res.json(account);
+  },
+);
+
+router.get(
+  '/campaigns',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (_req, res) => {
+    res.json({ campaigns: campaigns.listCampaigns() });
+  },
+);
+
+router.post(
+  '/campaigns',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    try {
+      const row = campaigns.createCampaign(req.body || {}, { userId: req.user.id });
+      res.status(201).json(row);
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.get(
+  '/campaigns/:id',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    const row = campaigns.getCampaign(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    res.json(row);
+  },
+);
+
+router.patch(
+  '/campaigns/:id',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    try {
+      res.json(campaigns.updateCampaign(req.params.id, req.body || {}));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.post(
+  '/campaigns/:id/leads',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    try {
+      const { leadIds } = req.body || {};
+      res.json(campaigns.addLeads(req.params.id, leadIds, { user: req.user }));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.delete(
+  '/campaigns/:id/leads/:leadId',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    try {
+      const removed = campaigns.removeLead(req.params.id, req.params.leadId);
+      res.json({ ok: true, removed });
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.post(
+  '/campaigns/:id/launch',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    try {
+      res.json(campaigns.launchCampaign(req.params.id, { userId: req.user.id }));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.post(
+  '/campaigns/:id/pause',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    try {
+      res.json(campaigns.pauseCampaign(req.params.id));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.post(
+  '/campaigns/:id/cancel',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    try {
+      res.json(campaigns.cancelCampaign(req.params.id));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
   },
 );
 

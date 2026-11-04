@@ -1332,8 +1332,32 @@ router.get(
            LIMIT ?`,
         )
         .all(limit);
+    } else if (metric === 'email_delivered' || metric === 'delivered') {
+      title = 'Emails delivered';
+      const uClause = userId ? ` AND m.user_id = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT m.id, m.subject, m.to_email, COALESCE(m.last_opened_at, m.sent_at) AS date,
+                  m.status, m.open_count, m.reply_count,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type, l.state,
+                  u.name AS user_name
+           FROM email_messages m
+           LEFT JOIN leads l ON l.id = m.lead_id
+           LEFT JOIN users u ON u.id = m.user_id
+           WHERE m.status IN ('delivered', 'opened', 'replied')
+              OR EXISTS (
+                SELECT 1 FROM email_events e
+                WHERE e.email_message_id = m.id AND e.event IN ('delivered', 'request')
+              )
+             ${win('m.sent_at')} ${uClause} ${stateClause}
+           ORDER BY m.sent_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
     } else if (metric === 'email_opens') {
       title = 'Email opens';
+      const uClause = userId ? ` AND m.user_id = '${userId}'` : '';
       items = db
         .prepare(
           `SELECT e.id, e.subject, e.email AS to_email, e.occurred_at AS date,
@@ -1344,24 +1368,54 @@ router.get(
            LEFT JOIN leads l ON l.id = e.lead_id
            LEFT JOIN email_messages m ON m.id = e.email_message_id
            LEFT JOIN users u ON u.id = m.user_id
-           WHERE e.event = 'opened' ${win('e.occurred_at')}
+           WHERE e.event IN ('opened', 'unique_opened', 'uniqueOpened')
+             ${win('e.occurred_at')} ${uClause}
            ORDER BY e.occurred_at DESC
            LIMIT ?`,
         )
         .all(limit);
+      if (!items.length) {
+        items = db
+          .prepare(
+            `SELECT m.id, m.subject, m.to_email, m.last_opened_at AS date, m.status,
+                    m.open_count, m.reply_count,
+                    l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                    l.status AS lead_status, l.business_type, l.state,
+                    u.name AS user_name
+             FROM email_messages m
+             LEFT JOIN leads l ON l.id = m.lead_id
+             LEFT JOIN users u ON u.id = m.user_id
+             WHERE COALESCE(m.open_count, 0) > 0
+               ${win('m.sent_at')} ${uClause} ${stateClause}
+             ORDER BY m.last_opened_at DESC
+             LIMIT ?`,
+          )
+          .all(limit);
+      }
     } else if (metric === 'email_replies' || metric === 'replies') {
       title = 'Replies received';
+      const uClause = userId
+        ? ` AND (
+             m.user_id = '${userId}'
+             OR EXISTS (
+               SELECT 1 FROM email_messages m2
+               WHERE m2.lead_id = r.lead_id AND m2.user_id = '${userId}'
+             )
+           )`
+        : '';
       items = db
         .prepare(
           `SELECT r.id, r.from_name, r.from_email, r.subject, r.received_at AS date,
                   COALESCE(r.body_text, r.body_markdown, r.subject) AS preview,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
                   l.status AS lead_status, l.business_type, l.state,
-                  u.name AS user_name
+                  COALESCE(u.name, ua.name) AS user_name
            FROM email_replies r
            LEFT JOIN leads l ON l.id = r.lead_id
-           LEFT JOIN users u ON u.id = l.assigned_to
-           WHERE 1=1 ${win('r.received_at')} ${stateClause}
+           LEFT JOIN email_messages m ON m.id = r.email_message_id
+           LEFT JOIN users u ON u.id = m.user_id
+           LEFT JOIN users ua ON ua.id = l.assigned_to
+           WHERE 1=1 ${win('r.received_at')} ${stateClause} ${uClause}
            ORDER BY r.received_at DESC
            LIMIT ?`,
         )
