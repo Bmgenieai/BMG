@@ -14,7 +14,9 @@ import {
   upsertContact,
 } from '../lib/brevo.js';
 import {
+  backfillLegacyEmailAccountIds,
   createEmailAccount,
+  emailAccountMatch,
   getEmailAccount,
   listEmailAccounts,
   resolveSendAccount,
@@ -892,6 +894,7 @@ router.get(
       roleHasPermission(req.user.role, 'analytics:view_team') ||
       roleHasPermission(req.user.role, 'analytics:view_all');
 
+    backfillLegacyEmailAccountIds();
     const accounts = listEmailAccounts({ activeOnly: true });
     let accountId = req.query.emailAccountId ? String(req.query.emailAccountId) : '';
     if (!accountId) {
@@ -910,15 +913,14 @@ router.get(
       userId = String(req.query.userId);
     }
 
-    const accountClause = accountId ? ' AND m.email_account_id = ?' : '';
+    const acct = emailAccountMatch(account, { alias: 'm' });
     const userClause = userId ? ' AND m.user_id = ?' : '';
-    const params = [];
-    if (accountId) params.push(accountId);
+    const params = [...acct.params];
     if (userId) params.push(userId);
 
     const sent = db
       .prepare(
-        `SELECT COUNT(*) AS c FROM email_messages m WHERE 1=1${accountClause}${userClause}`,
+        `SELECT COUNT(*) AS c FROM email_messages m WHERE 1=1${acct.sql}${userClause}`,
       )
       .get(...params).c;
     const delivered = db
@@ -930,13 +932,13 @@ router.get(
                SELECT 1 FROM email_events e
                WHERE e.email_message_id = m.id AND e.event IN ('delivered', 'request')
              )
-           )${accountClause}${userClause}`,
+           )${acct.sql}${userClause}`,
       )
       .get(...params).c;
     const opened = db
       .prepare(
         `SELECT COUNT(*) AS c FROM email_messages m
-         WHERE COALESCE(m.open_count, 0) > 0${accountClause}${userClause}`,
+         WHERE COALESCE(m.open_count, 0) > 0${acct.sql}${userClause}`,
       )
       .get(...params).c;
     const replies = db
@@ -945,7 +947,7 @@ router.get(
          WHERE EXISTS (
            SELECT 1 FROM email_messages m
            WHERE (m.id = r.email_message_id OR m.lead_id = r.lead_id)
-             ${accountClause}${userClause}
+             ${acct.sql}${userClause}
          )`,
       )
       .get(...params).c;
@@ -955,26 +957,27 @@ router.get(
       : null;
 
     let team = [];
-    if (canTeam && accountId) {
+    if (canTeam && account) {
+      const teamAcct = emailAccountMatch(account, { alias: 'm' });
       team = db
         .prepare(
           `SELECT u.id, u.name,
                   (SELECT COUNT(*) FROM email_messages m
-                     WHERE m.user_id = u.id AND m.email_account_id = ?) AS sent,
+                     WHERE m.user_id = u.id ${teamAcct.sql}) AS sent,
                   (SELECT COUNT(*) FROM email_messages m
-                     WHERE m.user_id = u.id AND m.email_account_id = ?
-                       AND COALESCE(m.open_count, 0) > 0) AS opened,
+                     WHERE m.user_id = u.id AND COALESCE(m.open_count, 0) > 0 ${teamAcct.sql}) AS opened,
                   (SELECT COUNT(*) FROM email_replies r
                      WHERE EXISTS (
                        SELECT 1 FROM email_messages m
-                       WHERE m.user_id = u.id AND m.email_account_id = ?
+                       WHERE m.user_id = u.id
                          AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+                         ${teamAcct.sql}
                      )) AS replies
            FROM users u
            WHERE u.role = 'telesales' AND u.is_active = 1
            ORDER BY u.name COLLATE NOCASE`,
         )
-        .all(accountId, accountId, accountId);
+        .all(...teamAcct.params, ...teamAcct.params, ...teamAcct.params);
     }
 
     res.json({

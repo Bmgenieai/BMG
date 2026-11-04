@@ -31,6 +31,65 @@ export function ensureDefaultAccountFromEnv() {
   ).run(id, envName || envEmail, envEmail, envName || envEmail);
 }
 
+/** Account used before multi-sender (BREVO_SENDER_EMAIL / magic.retouching). */
+export function isLegacySenderAccount(account) {
+  if (!account?.email) return false;
+  const email = String(account.email).trim().toLowerCase();
+  const env = (process.env.BREVO_SENDER_EMAIL || '').trim().toLowerCase();
+  if (env && email === env) return true;
+  return email === 'magic.retouching@bmgenie.ai';
+}
+
+/**
+ * Tag old email_messages (null account) as the Magic / env sender account.
+ * Those were sent before email_accounts existed.
+ */
+export function backfillLegacyEmailAccountIds() {
+  ensureDefaultAccountFromEnv();
+  const envEmail = (
+    process.env.BREVO_SENDER_EMAIL ||
+    'magic.retouching@bmgenie.ai'
+  )
+    .trim()
+    .toLowerCase();
+  const acc = db
+    .prepare(`SELECT id FROM email_accounts WHERE lower(email) = ?`)
+    .get(envEmail);
+  if (!acc) return 0;
+  return db
+    .prepare(
+      `UPDATE email_messages
+       SET email_account_id = ?
+       WHERE email_account_id IS NULL`,
+    )
+    .run(acc.id).changes;
+}
+
+/** SQL fragment + params to match sends for an account (includes legacy nulls for Magic). */
+export function emailAccountMatch(account, { alias = 'm' } = {}) {
+  if (!account?.id) return { sql: '', params: [] };
+  if (isLegacySenderAccount(account)) {
+    return {
+      sql: ` AND (${alias}.email_account_id = ? OR ${alias}.email_account_id IS NULL)`,
+      params: [account.id],
+    };
+  }
+  return {
+    sql: ` AND ${alias}.email_account_id = ?`,
+    params: [account.id],
+  };
+}
+
+/** String form for analytics drilldown templates. */
+export function emailAccountMatchSql(account, { alias = 'm' } = {}) {
+  if (!account?.id) return '';
+  const id = String(account.id).replace(/'/g, "''");
+  if (isLegacySenderAccount(account)) {
+    return ` AND (${alias}.email_account_id = '${id}' OR ${alias}.email_account_id IS NULL)`;
+  }
+  return ` AND ${alias}.email_account_id = '${id}'`;
+}
+
 export function listEmailAccounts({ activeOnly = false } = {}) {
   ensureDefaultAccountFromEnv();
   if (activeOnly) {

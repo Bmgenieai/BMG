@@ -6,6 +6,11 @@ import { LEAD_SOURCES, OPEN_STATUSES, BUSINESS_TYPES, roleHasPermission } from '
 import { fetchBmgenieCrmAnalytics, normalizeUserRows } from '../lib/bmgenieApi.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
 import { resolveWorkingPeriod } from '../lib/periodBounds.js';
+import {
+  backfillLegacyEmailAccountIds,
+  emailAccountMatchSql,
+  getEmailAccount,
+} from '../lib/emailAccounts.js';
 
 const router = Router();
 router.use(authRequired);
@@ -1080,7 +1085,7 @@ router.get(
     const isOverall = bounds.period === 'overall';
 
     const emailAccountId = req.query.emailAccountId
-      ? String(req.query.emailAccountId).replace(/'/g, "''").slice(0, 64)
+      ? String(req.query.emailAccountId).slice(0, 64)
       : null;
     // When filtering by sending account, allow all users unless userId explicitly passed
     const userId = req.query.userId
@@ -1099,9 +1104,19 @@ router.get(
       : stateQ.toLowerCase() === 'unspecified'
         ? " AND (l.state IS NULL OR TRIM(l.state) = '')"
         : ` AND TRIM(l.state) = '${stateQ.replace(/'/g, "''").slice(0, 64)}'`;
-    const accountClause = emailAccountId
-      ? ` AND m.email_account_id = '${emailAccountId}'`
-      : '';
+    let accountClause = '';
+    let replyAccountClause = '';
+    if (emailAccountId) {
+      backfillLegacyEmailAccountIds();
+      const acc = getEmailAccount(emailAccountId) || { id: emailAccountId };
+      accountClause = emailAccountMatchSql(acc, { alias: 'm' });
+      const maMatch = emailAccountMatchSql(acc, { alias: 'ma' });
+      replyAccountClause = ` AND EXISTS (
+             SELECT 1 FROM email_messages ma
+             WHERE (ma.id = r.email_message_id OR ma.lead_id = r.lead_id)
+               ${maMatch.replace(/^\s*AND\s+/i, 'AND ')}
+           )`;
+    }
     const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 500);
 
     const win = (col) =>
@@ -1412,13 +1427,6 @@ router.get(
                SELECT 1 FROM email_messages m2
                WHERE m2.lead_id = r.lead_id AND m2.user_id = '${userId}'
              )
-           )`
-        : '';
-      const replyAccountClause = emailAccountId
-        ? ` AND EXISTS (
-             SELECT 1 FROM email_messages ma
-             WHERE ma.email_account_id = '${emailAccountId}'
-               AND (ma.id = r.email_message_id OR ma.lead_id = r.lead_id)
            )`
         : '';
       items = db
