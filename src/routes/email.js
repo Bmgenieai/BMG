@@ -891,69 +891,97 @@ router.get(
     const canTeam =
       roleHasPermission(req.user.role, 'analytics:view_team') ||
       roleHasPermission(req.user.role, 'analytics:view_all');
-    let userId = req.user.id;
+
+    const accounts = listEmailAccounts({ activeOnly: true });
+    let accountId = req.query.emailAccountId ? String(req.query.emailAccountId) : '';
+    if (!accountId) {
+      accountId = accounts.find((a) => a.is_default)?.id || accounts[0]?.id || '';
+    }
+    const account = accountId ? getEmailAccount(accountId) : null;
+
+    // scope=account → all sends from this From address (default)
+    // scope=me → only current user's sends from that account
+    const scopeRaw = String(req.query.scope || 'account').trim().toLowerCase();
+    let userId = null;
+    if (scopeRaw === 'me') {
+      userId = req.user.id;
+    }
     if (canTeam && req.query.userId) {
       userId = String(req.query.userId);
     }
 
+    const accountClause = accountId ? ' AND m.email_account_id = ?' : '';
+    const userClause = userId ? ' AND m.user_id = ?' : '';
+    const params = [];
+    if (accountId) params.push(accountId);
+    if (userId) params.push(userId);
+
     const sent = db
-      .prepare(`SELECT COUNT(*) AS c FROM email_messages WHERE user_id = ?`)
-      .get(userId).c;
+      .prepare(
+        `SELECT COUNT(*) AS c FROM email_messages m WHERE 1=1${accountClause}${userClause}`,
+      )
+      .get(...params).c;
     const delivered = db
       .prepare(
         `SELECT COUNT(*) AS c FROM email_messages m
-         WHERE m.user_id = ?
-           AND (
+         WHERE (
              m.status IN ('delivered', 'opened', 'replied')
              OR EXISTS (
                SELECT 1 FROM email_events e
                WHERE e.email_message_id = m.id AND e.event IN ('delivered', 'request')
              )
-           )`,
+           )${accountClause}${userClause}`,
       )
-      .get(userId).c;
+      .get(...params).c;
     const opened = db
       .prepare(
-        `SELECT COUNT(*) AS c FROM email_messages
-         WHERE user_id = ? AND COALESCE(open_count, 0) > 0`,
+        `SELECT COUNT(*) AS c FROM email_messages m
+         WHERE COALESCE(m.open_count, 0) > 0${accountClause}${userClause}`,
       )
-      .get(userId).c;
+      .get(...params).c;
     const replies = db
       .prepare(
         `SELECT COUNT(*) AS c FROM email_replies r
          WHERE EXISTS (
            SELECT 1 FROM email_messages m
-           WHERE m.user_id = ?
-             AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+           WHERE (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+             ${accountClause}${userClause}
          )`,
       )
-      .get(userId).c;
+      .get(...params).c;
 
-    const user = db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).get(userId);
+    const user = userId
+      ? db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).get(userId)
+      : null;
 
     let team = [];
-    if (canTeam) {
+    if (canTeam && accountId) {
       team = db
         .prepare(
           `SELECT u.id, u.name,
-                  (SELECT COUNT(*) FROM email_messages m WHERE m.user_id = u.id) AS sent,
                   (SELECT COUNT(*) FROM email_messages m
-                     WHERE m.user_id = u.id AND COALESCE(m.open_count, 0) > 0) AS opened,
+                     WHERE m.user_id = u.id AND m.email_account_id = ?) AS sent,
+                  (SELECT COUNT(*) FROM email_messages m
+                     WHERE m.user_id = u.id AND m.email_account_id = ?
+                       AND COALESCE(m.open_count, 0) > 0) AS opened,
                   (SELECT COUNT(*) FROM email_replies r
                      WHERE EXISTS (
                        SELECT 1 FROM email_messages m
-                       WHERE m.user_id = u.id
+                       WHERE m.user_id = u.id AND m.email_account_id = ?
                          AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
                      )) AS replies
            FROM users u
            WHERE u.role = 'telesales' AND u.is_active = 1
            ORDER BY u.name COLLATE NOCASE`,
         )
-        .all();
+        .all(accountId, accountId, accountId);
     }
 
     res.json({
       user,
+      account,
+      accounts,
+      scope: userId ? 'me' : 'account',
       stats: {
         sent,
         delivered,

@@ -1079,11 +1079,17 @@ router.get(
     const { from, to } = bounds;
     const isOverall = bounds.period === 'overall';
 
+    const emailAccountId = req.query.emailAccountId
+      ? String(req.query.emailAccountId).replace(/'/g, "''").slice(0, 64)
+      : null;
+    // When filtering by sending account, allow all users unless userId explicitly passed
     const userId = req.query.userId
       ? String(req.query.userId)
-      : canViewAll
+      : emailAccountId
         ? null
-        : req.user.id;
+        : canViewAll
+          ? null
+          : req.user.id;
     const stage = req.query.stage ? String(req.query.stage).trim() : null;
     const businessType = req.query.businessType ? String(req.query.businessType).trim() : null;
     const reason = req.query.reason ? String(req.query.reason).trim() : null;
@@ -1093,6 +1099,9 @@ router.get(
       : stateQ.toLowerCase() === 'unspecified'
         ? " AND (l.state IS NULL OR TRIM(l.state) = '')"
         : ` AND TRIM(l.state) = '${stateQ.replace(/'/g, "''").slice(0, 64)}'`;
+    const accountClause = emailAccountId
+      ? ` AND m.email_account_id = '${emailAccountId}'`
+      : '';
     const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 500);
 
     const win = (col) =>
@@ -1292,13 +1301,13 @@ router.get(
            FROM email_messages m
            LEFT JOIN leads l ON l.id = m.lead_id
            LEFT JOIN users u ON u.id = m.user_id
-           WHERE 1=1 ${win('m.sent_at')} ${uClause} ${stateClause}
+           WHERE 1=1 ${win('m.sent_at')} ${uClause} ${accountClause} ${stateClause}
            ORDER BY m.sent_at DESC
            LIMIT ?`,
         )
         .all(limit);
-      if (items.length === 0) {
-        // Fallback to lead_activities for email
+      if (items.length === 0 && !emailAccountId) {
+        // Fallback to lead_activities for email (no account filter available)
         const actUClause = userId ? ` AND a.user_id = '${userId}'` : '';
         items = db
           .prepare(
@@ -1345,12 +1354,14 @@ router.get(
            FROM email_messages m
            LEFT JOIN leads l ON l.id = m.lead_id
            LEFT JOIN users u ON u.id = m.user_id
-           WHERE m.status IN ('delivered', 'opened', 'replied')
-              OR EXISTS (
-                SELECT 1 FROM email_events e
-                WHERE e.email_message_id = m.id AND e.event IN ('delivered', 'request')
-              )
-             ${win('m.sent_at')} ${uClause} ${stateClause}
+           WHERE (
+             m.status IN ('delivered', 'opened', 'replied')
+             OR EXISTS (
+               SELECT 1 FROM email_events e
+               WHERE e.email_message_id = m.id AND e.event IN ('delivered', 'request')
+             )
+           )
+             ${win('m.sent_at')} ${uClause} ${accountClause} ${stateClause}
            ORDER BY m.sent_at DESC
            LIMIT ?`,
         )
@@ -1369,7 +1380,7 @@ router.get(
            LEFT JOIN email_messages m ON m.id = e.email_message_id
            LEFT JOIN users u ON u.id = m.user_id
            WHERE e.event IN ('opened', 'unique_opened', 'uniqueOpened')
-             ${win('e.occurred_at')} ${uClause}
+             ${win('e.occurred_at')} ${uClause} ${accountClause}
            ORDER BY e.occurred_at DESC
            LIMIT ?`,
         )
@@ -1386,7 +1397,7 @@ router.get(
              LEFT JOIN leads l ON l.id = m.lead_id
              LEFT JOIN users u ON u.id = m.user_id
              WHERE COALESCE(m.open_count, 0) > 0
-               ${win('m.sent_at')} ${uClause} ${stateClause}
+               ${win('m.sent_at')} ${uClause} ${accountClause} ${stateClause}
              ORDER BY m.last_opened_at DESC
              LIMIT ?`,
           )
@@ -1403,6 +1414,13 @@ router.get(
              )
            )`
         : '';
+      const replyAccountClause = emailAccountId
+        ? ` AND EXISTS (
+             SELECT 1 FROM email_messages ma
+             WHERE ma.email_account_id = '${emailAccountId}'
+               AND (ma.id = r.email_message_id OR ma.lead_id = r.lead_id)
+           )`
+        : '';
       items = db
         .prepare(
           `SELECT r.id, r.from_name, r.from_email, r.subject, r.received_at AS date,
@@ -1415,7 +1433,7 @@ router.get(
            LEFT JOIN email_messages m ON m.id = r.email_message_id
            LEFT JOIN users u ON u.id = m.user_id
            LEFT JOIN users ua ON ua.id = l.assigned_to
-           WHERE 1=1 ${win('r.received_at')} ${stateClause} ${uClause}
+           WHERE 1=1 ${win('r.received_at')} ${stateClause} ${uClause} ${replyAccountClause}
            ORDER BY r.received_at DESC
            LIMIT ?`,
         )
