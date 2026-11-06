@@ -5,7 +5,7 @@ import { authRequired, requirePermission, requireAnyPermission } from '../middle
 import { LEAD_SOURCES, OPEN_STATUSES, BUSINESS_TYPES, roleHasPermission } from '../lib/permissions.js';
 import { fetchBmgenieCrmAnalytics, normalizeUserRows } from '../lib/bmgenieApi.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
-import { resolveWorkingPeriod } from '../lib/periodBounds.js';
+import { resolveAnalyticsBounds, resolveWorkingPeriod } from '../lib/periodBounds.js';
 import { excludeTestAndPakistanSql } from '../lib/leadFilters.js';
 import {
   backfillLegacyEmailAccountIds,
@@ -294,6 +294,13 @@ router.get(
       params.push(req.user.id);
     }
 
+    const pb = resolveAnalyticsBounds(req.query);
+    const win = (col) =>
+      pb.period === 'overall'
+        ? ''
+        : ` AND ${DT(col)} >= datetime('${pb.from}') AND ${DT(col)} < datetime('${pb.to}')`;
+
+    // Pipeline stock for the selected dates: leads added in range (Overall = live queue).
     const stages = db
       .prepare(
         `SELECT
@@ -309,18 +316,11 @@ router.get(
           SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS paid,
           SUM(CASE WHEN status = 'repeat' THEN 1 ELSE 0 END) AS repeat_customers,
           SUM(CASE WHEN status = 'nurture' THEN 1 ELSE 0 END) AS nurture
-         FROM leads l WHERE 1=1 ${leadFilter}`,
+         FROM leads l WHERE 1=1 ${leadFilter} ${win('l.created_at')}`,
       )
       .get(...params);
 
     const actFilter = `AND a.lead_id IN (SELECT id FROM leads l WHERE 1=1 ${leadFilter})`;
-
-    // Period window for activity counts (stages stay a live snapshot).
-    const pb = resolveWorkingPeriod(req.query.period || 'overall');
-    const win = (col) =>
-      pb.period === 'overall'
-        ? ''
-        : ` AND ${DT(col)} >= datetime('${pb.from}') AND ${DT(col)} < datetime('${pb.to}')`;
 
     const outreach = db
       .prepare(
@@ -656,6 +656,9 @@ router.get(
       byBusinessType,
       byState,
       period: pb.period,
+      periodLabel: pb.label,
+      fromYmd: pb.fromYmd,
+      toYmd: pb.toYmd,
     });
   },
 );
@@ -880,7 +883,7 @@ router.get(
     const isCeo = roleHasPermission(req.user.role, 'analytics:view_all');
     const isManager = roleHasPermission(req.user.role, 'analytics:view_team');
     const canViewTeam = isCeo || isManager;
-    const bounds = resolveWorkingPeriod(req.query.period);
+    const bounds = resolveAnalyticsBounds(req.query);
     const { from, to } = bounds;
 
     let focusUserId = req.query.userId ? String(req.query.userId) : null;
@@ -1281,7 +1284,13 @@ router.get(
     const canViewAll = isCeo || isManager;
 
     const metric = String(req.query.metric || '').trim();
-    const bounds = resolveWorkingPeriod(req.query.period || 'overall');
+    const bounds = resolveAnalyticsBounds({
+      period: req.query.period || 'overall',
+      from: req.query.from,
+      to: req.query.to,
+      fromYmd: req.query.fromYmd,
+      toYmd: req.query.toYmd,
+    });
     const { from, to } = bounds;
     const isOverall = bounds.period === 'overall';
 
@@ -1451,7 +1460,7 @@ router.get(
                   u.name AS user_name
            FROM leads l
            LEFT JOIN users u ON u.id = l.assigned_to
-           WHERE l.status IN (${placeholders}) ${uClause} ${queueScope}
+           WHERE l.status IN (${placeholders}) ${uClause} ${queueScope} ${win('l.created_at')}
            ORDER BY l.created_at DESC
            LIMIT ?`,
         )

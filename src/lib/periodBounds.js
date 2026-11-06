@@ -152,3 +152,40 @@ export function resolveWorkingPeriod(periodRaw, now = new Date()) {
     to,
   };
 }
+
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Custom inclusive calendar range in office timezone (fromYmd → toYmd).
+ * Swaps if from > to.
+ */
+export function resolveCustomDateRange(fromRaw, toRaw) {
+  let fromYmd = String(fromRaw || '').trim().slice(0, 10);
+  let toYmd = String(toRaw || '').trim().slice(0, 10);
+  if (!YMD_RE.test(fromYmd) || !YMD_RE.test(toYmd)) return null;
+  if (fromYmd > toYmd) {
+    const tmp = fromYmd;
+    fromYmd = toYmd;
+    toYmd = tmp;
+  }
+  const toExclusiveYmd = addCalendarDays(toYmd, 1);
+  return {
+    period: 'custom',
+    label: fromYmd === toYmd ? fromYmd : `${fromYmd} → ${toYmd}`,
+    timezone: WORKING_TZ,
+    fromYmd,
+    toYmd,
+    from: toSqliteUtc(zonedStartOfDay(fromYmd)),
+    to: toSqliteUtc(zonedStartOfDay(toExclusiveYmd)),
+  };
+}
+
+/**
+ * Resolve bounds from Express query: custom ?from=&to= wins over ?period=.
+ * @param {Record<string, unknown>} query
+ */
+export function resolveAnalyticsBounds(query = {}) {
+  const custom = resolveCustomDateRange(query.from || query.fromYmd, query.to || query.toYmd);
+  if (custom) return custom;
+  return resolveWorkingPeriod(query.period || 'today');
+}
