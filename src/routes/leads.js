@@ -1114,9 +1114,27 @@ router.delete(
   },
 );
 
+function csvNormKey(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[_\-]+/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+/** Exact then case/spacing-insensitive header match (Zillow sheets use "Verified email", "Agent", …). */
 function csvCell(row, ...keys) {
   for (const k of keys) {
     if (row[k] != null && String(row[k]).trim() !== '') return String(row[k]).trim();
+  }
+  const byNorm = new Map();
+  for (const [k, v] of Object.entries(row || {})) {
+    const nk = csvNormKey(k);
+    if (!byNorm.has(nk)) byNorm.set(nk, v);
+  }
+  for (const k of keys) {
+    const v = byNorm.get(csvNormKey(k));
+    if (v != null && String(v).trim() !== '') return String(v).trim();
   }
   return null;
 }
@@ -1132,6 +1150,12 @@ function csvLeadName(row, email, company) {
     'fullName',
     'contact_name',
     'Contact Name',
+    'Agent',
+    'agent',
+    'Agent Name',
+    'Realtor',
+    'realtor',
+    'Owner',
   );
   if (explicit && !explicit.includes('@')) return explicit;
 
@@ -1169,6 +1193,32 @@ function csvLeadName(row, email, company) {
       .join(' ');
   }
   return explicit || null;
+}
+
+const US_STATE_CODES = new Set([
+  'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA',
+  'ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK',
+  'OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY','DC',
+]);
+
+/** Pull a US state code from addresses like "1615 Poplar St Dallas TX 75215". */
+function stateFromAddress(raw) {
+  if (!raw) return null;
+  const parts = String(raw).trim().split(/\s+/);
+  for (let i = 0; i < parts.length; i += 1) {
+    const token = parts[i].replace(/[^A-Za-z]/g, '').toUpperCase();
+    if (token.length === 2 && US_STATE_CODES.has(token)) return token;
+  }
+  return null;
+}
+
+function sourceDisplayLabel(source) {
+  if (source === 'telesales') return 'BD';
+  if (source === 'linkedin') return 'LinkedIn';
+  if (source === 'facebook') return 'Facebook';
+  if (source === 'instagram') return 'Instagram';
+  if (source === 'csv_import') return 'CSV / Meta';
+  return source || 'CSV';
 }
 
 router.post(
@@ -1225,6 +1275,7 @@ router.post(
     let imported = 0;
     let skipped = 0;
     let duplicates = 0;
+    const skipReasons = { missing_name: 0, duplicate: 0 };
     const insert = db.prepare(
       `INSERT INTO leads (
         id, name, email, phone, company, country, state, job_title, industry, contact_format,
@@ -1236,18 +1287,72 @@ router.post(
     const now = new Date().toISOString();
     const tx = db.transaction(() => {
       for (const row of records) {
-        const email = csvCell(row, 'email', 'Email', 'Email Address', 'email_address');
-        const phone = csvCell(row, 'contact', 'Contact', 'phone', 'Phone', 'mobile', 'Mobile');
-        const company = csvCell(row, 'company', 'Company', 'Company Name', 'company_name', 'companyName');
+        const email = csvCell(
+          row,
+          'email',
+          'Email',
+          'Email Address',
+          'email_address',
+          'Verified email',
+          'verified email',
+          'Work Email',
+          'work email',
+        );
+        const phone = csvCell(
+          row,
+          'contact',
+          'Contact',
+          'phone',
+          'Phone',
+          'mobile',
+          'Mobile',
+          'Agent phone',
+          'Phone Number',
+        );
+        const company = csvCell(
+          row,
+          'company',
+          'Company',
+          'Company Name',
+          'company_name',
+          'companyName',
+          'Brokerage',
+          'Brokerage Name',
+          'Agency',
+          'Office',
+        );
         const name = csvLeadName(row, email, company);
         if (!name) {
           skipped += 1;
+          skipReasons.missing_name += 1;
           continue;
         }
         const country = csvCell(row, 'country', 'Country');
-        const state = csvCell(row, 'state', 'State');
-        const jobTitle = csvCell(row, 'job_title', 'Job Title', 'job title', 'title', 'Title');
-        const industry = csvCell(row, 'industry', 'Industry');
+        const propertyAddress = csvCell(
+          row,
+          'property address',
+          'Property address',
+          'address',
+          'Address',
+          'listing address',
+        );
+        const state =
+          csvCell(row, 'state', 'State', 'US State', 'State Code') ||
+          stateFromAddress(propertyAddress);
+        const jobTitle = csvCell(
+          row,
+          'job_title',
+          'Job Title',
+          'job title',
+          'title',
+          'Title',
+          'Agent Title',
+        );
+        const industry =
+          csvCell(row, 'industry', 'Industry') ||
+          (csvCell(row, 'Agent', 'agent', 'Brokerage', 'Zillow listing')
+            ? 'Real estate'
+            : null);
         const rawBiz = csvCell(
           row,
           'business_type',
@@ -1270,16 +1375,29 @@ router.post(
           else if (s.includes('individual') || s.includes('person') || s.includes('solo')) bizType = 'individual';
           else if (BUSINESS_TYPE_KEYS.includes(s)) bizType = s;
           else bizType = 'other';
+        } else if (
+          csvCell(row, 'Agent', 'agent', 'Brokerage', 'Zillow listing', 'Verified email')
+        ) {
+          // Zillow / realtor list sheets usually omit business_type
+          bizType = 'realtor';
         }
+        const looksLikePersonLead = Boolean(
+          csvCell(row, 'Agent', 'agent', 'first_name', 'First Name', 'full_name', 'Full Name'),
+        );
         const rawFormat = String(
-          csvCell(row, 'contact_format', 'Contact Format', 'format', 'Format') || 'company',
+          csvCell(row, 'contact_format', 'Contact Format', 'format', 'Format') ||
+            (looksLikePersonLead && company ? 'employee' : 'company'),
         )
           .trim()
           .toLowerCase();
         const contactFormat = CONTACT_FORMATS.includes(rawFormat) ? rawFormat : 'company';
-        const notes =
+        const zillowUrl = csvCell(row, 'Zillow listing', 'zillow listing', 'Zillow URL', 'listing url');
+        const baseNotes =
           csvCell(row, 'follow_up_notes', 'Follow up notes', 'notes', 'Notes') ||
           `Imported from ${req.file.originalname}`;
+        const notes = [baseNotes, propertyAddress ? `Property: ${propertyAddress}` : null, zillowUrl ? `Zillow: ${zillowUrl}` : null]
+          .filter(Boolean)
+          .join(' · ');
         const estimated =
           Number(
             csvCell(row, 'estimated_revenue', 'estimated_value', 'Estimated Revenue', 'value') || 0,
@@ -1287,7 +1405,17 @@ router.post(
         const companyVal =
           contactFormat === 'company' ? company || name : company || null;
         const linkedinUrl = normalizeLinkedInUrl(
-          csvCell(row, 'linkedin_url', 'LinkedIn URL', 'linkedin', 'LinkedIn', 'profile_url', 'Profile URL'),
+          csvCell(
+            row,
+            'linkedin_url',
+            'LinkedIn URL',
+            'linkedin',
+            'LinkedIn',
+            'profile_url',
+            'Profile URL',
+            'Agent LinkedIn',
+            'agent linkedin',
+          ),
         );
 
         const existing = findDuplicateLeads({
@@ -1305,6 +1433,7 @@ router.post(
           );
           duplicates += 1;
           skipped += 1;
+          skipReasons.duplicate += 1;
           continue;
         }
 
@@ -1332,16 +1461,7 @@ router.post(
           bizType,
           linkedinUrl,
         );
-        const sourceNoun =
-          source === 'linkedin'
-            ? 'LinkedIn'
-            : source === 'facebook'
-              ? 'Facebook'
-              : source === 'instagram'
-                ? 'Instagram'
-                : source === 'telesales'
-                  ? 'BD'
-                  : 'CSV';
+        const sourceNoun = sourceDisplayLabel(source);
         db.prepare(
           `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
            VALUES (?, ?, ?, 'imported', ?)`,
@@ -1366,6 +1486,8 @@ router.post(
       skipped,
       duplicates,
       source,
+      sourceLabel: sourceDisplayLabel(source),
+      skipReasons,
       dateAdded,
     });
   },
