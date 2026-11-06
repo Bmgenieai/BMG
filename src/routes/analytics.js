@@ -403,6 +403,125 @@ router.get(
       )
       .all(...params);
 
+    /** Period-scoped breakdowns for CEO dashboard (profession + US state). */
+    const btExpr = `CASE WHEN l.business_type IS NULL OR TRIM(l.business_type) = '' THEN 'unspecified' ELSE l.business_type END`;
+    const stExpr = `CASE WHEN l.state IS NULL OR TRIM(l.state) = '' THEN 'Unspecified' ELSE TRIM(l.state) END`;
+
+    const btLeadsAdded = Object.fromEntries(
+      db
+        .prepare(
+          `SELECT ${btExpr} AS k, COUNT(*) AS c
+           FROM leads l WHERE 1=1 ${leadFilter} ${win('l.created_at')}
+           GROUP BY 1`,
+        )
+        .all(...params)
+        .map((r) => [r.k, Number(r.c) || 0]),
+    );
+    const btOutreach = Object.fromEntries(
+      db
+        .prepare(
+          `SELECT ${btExpr} AS k,
+                  SUM(CASE WHEN a.type IN ('email','email_sent','email_followup') THEN 1 ELSE 0 END) AS emails,
+                  SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies
+           FROM lead_activities a
+           JOIN leads l ON l.id = a.lead_id
+           WHERE 1=1 ${actFilter} ${win('a.created_at')}
+           GROUP BY 1`,
+        )
+        .all(...params)
+        .map((r) => [r.k, { emails: Number(r.emails) || 0, replies: Number(r.replies) || 0 }]),
+    );
+    const btPaid = Object.fromEntries(
+      db
+        .prepare(
+          `SELECT ${btExpr} AS k, COUNT(*) AS c
+           FROM leads l
+           WHERE l.status IN ('paid','repeat') ${leadFilter}
+             ${win('COALESCE(l.converted_at, l.updated_at)')}
+           GROUP BY 1`,
+        )
+        .all(...params)
+        .map((r) => [r.k, Number(r.c) || 0]),
+    );
+    const byBusinessType = [
+      ...BUSINESS_TYPES.map((bt) => ({
+        key: bt.key,
+        label: bt.label,
+        leadsAdded: btLeadsAdded[bt.key] || 0,
+        emailsSent: btOutreach[bt.key]?.emails || 0,
+        replies: btOutreach[bt.key]?.replies || 0,
+        paid: btPaid[bt.key] || 0,
+      })),
+      {
+        key: 'unspecified',
+        label: 'Unspecified',
+        leadsAdded: btLeadsAdded.unspecified || 0,
+        emailsSent: btOutreach.unspecified?.emails || 0,
+        replies: btOutreach.unspecified?.replies || 0,
+        paid: btPaid.unspecified || 0,
+      },
+    ]
+      .filter((r) => r.leadsAdded > 0 || r.emailsSent > 0 || r.replies > 0 || r.paid > 0)
+      .sort(
+        (a, b) =>
+          b.emailsSent - a.emailsSent || b.leadsAdded - a.leadsAdded || a.label.localeCompare(b.label),
+      );
+
+    const stLeadsAdded = Object.fromEntries(
+      db
+        .prepare(
+          `SELECT ${stExpr} AS k, COUNT(*) AS c
+           FROM leads l WHERE 1=1 ${leadFilter} ${win('l.created_at')}
+           GROUP BY 1`,
+        )
+        .all(...params)
+        .map((r) => [r.k, Number(r.c) || 0]),
+    );
+    const stOutreach = Object.fromEntries(
+      db
+        .prepare(
+          `SELECT ${stExpr} AS k,
+                  SUM(CASE WHEN a.type IN ('email','email_sent','email_followup') THEN 1 ELSE 0 END) AS emails,
+                  SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies
+           FROM lead_activities a
+           JOIN leads l ON l.id = a.lead_id
+           WHERE 1=1 ${actFilter} ${win('a.created_at')}
+           GROUP BY 1`,
+        )
+        .all(...params)
+        .map((r) => [r.k, { emails: Number(r.emails) || 0, replies: Number(r.replies) || 0 }]),
+    );
+    const stPaid = Object.fromEntries(
+      db
+        .prepare(
+          `SELECT ${stExpr} AS k, COUNT(*) AS c
+           FROM leads l
+           WHERE l.status IN ('paid','repeat') ${leadFilter}
+             ${win('COALESCE(l.converted_at, l.updated_at)')}
+           GROUP BY 1`,
+        )
+        .all(...params)
+        .map((r) => [r.k, Number(r.c) || 0]),
+    );
+    const stateKeys = [
+      ...new Set([...Object.keys(stLeadsAdded), ...Object.keys(stOutreach), ...Object.keys(stPaid)]),
+    ];
+    const byState = stateKeys
+      .map((k) => ({
+        key: k === 'Unspecified' ? 'unspecified' : k,
+        label: k,
+        leadsAdded: stLeadsAdded[k] || 0,
+        emailsSent: stOutreach[k]?.emails || 0,
+        replies: stOutreach[k]?.replies || 0,
+        paid: stPaid[k] || 0,
+      }))
+      .filter((r) => r.leadsAdded > 0 || r.emailsSent > 0 || r.replies > 0 || r.paid > 0)
+      .sort(
+        (a, b) =>
+          b.emailsSent - a.emailsSent || b.leadsAdded - a.leadsAdded || a.label.localeCompare(b.label),
+      )
+      .slice(0, 25);
+
     res.json({
       // Unique leads in each lifecycle stage (one lead = one stage)
       stages: {
@@ -483,6 +602,9 @@ router.get(
         conversionRate: pct(stages.paid || 0, stages.total_leads || 0),
       },
       lostReasons,
+      byBusinessType,
+      byState,
+      period: pb.period,
     });
   },
 );
@@ -1104,6 +1226,11 @@ router.get(
       : stateQ.toLowerCase() === 'unspecified'
         ? " AND (l.state IS NULL OR TRIM(l.state) = '')"
         : ` AND TRIM(l.state) = '${stateQ.replace(/'/g, "''").slice(0, 64)}'`;
+    const businessTypeClause = !businessType
+      ? ''
+      : businessType.toLowerCase() === 'unspecified'
+        ? " AND (l.business_type IS NULL OR TRIM(l.business_type) = '')"
+        : ` AND l.business_type = '${businessType.replace(/'/g, "''").slice(0, 64)}'`;
     let accountClause = '';
     let replyAccountClause = '';
     if (emailAccountId) {
@@ -1129,7 +1256,7 @@ router.get(
 
     if (metric === 'by_state' || metric === 'state') {
       const st = stateQ || req.query.type;
-      title = `Leads in ${st || 'state'}`;
+      title = `Leads added in ${st || 'state'}`;
       const typeFilter =
         !st || st.toLowerCase() === 'unspecified'
           ? " AND (l.state IS NULL OR TRIM(l.state) = '')"
@@ -1143,7 +1270,7 @@ router.get(
                   u.name AS user_name
            FROM leads l
            LEFT JOIN users u ON u.id = l.assigned_to
-           WHERE 1=1 ${typeFilter} ${uClause}
+           WHERE 1=1 ${typeFilter} ${uClause} ${win('l.created_at')}
            ORDER BY l.created_at DESC
            LIMIT ?`,
         )
@@ -1212,8 +1339,30 @@ router.get(
         .all(limit);
     } else if (metric === 'funnel_stage' || metric === 'stage' || stage) {
       const targetStage = stage || req.query.metric;
-      title = `${String(targetStage || 'Stage').replace(/_/g, ' ')} leads`;
+      const cumulative = String(req.query.cumulative || '') === '1';
+      /** Order for “at this stage or further” pipeline drilldowns. */
+      const PIPELINE_CUMULATIVE_ORDER = [
+        'uncontacted',
+        'contacted',
+        'engaged',
+        'qualified',
+        'demo_scheduled',
+        'challenge_offered',
+        'challenge_accepted',
+        'trial',
+        'paid',
+        'repeat',
+      ];
       const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
+      let statusList = [targetStage];
+      if (cumulative && PIPELINE_CUMULATIVE_ORDER.includes(targetStage)) {
+        const idx = PIPELINE_CUMULATIVE_ORDER.indexOf(targetStage);
+        statusList = PIPELINE_CUMULATIVE_ORDER.slice(idx);
+      }
+      title = cumulative
+        ? `${String(targetStage || 'Stage').replace(/_/g, ' ')} or further`
+        : `${String(targetStage || 'Stage').replace(/_/g, ' ')} leads`;
+      const placeholders = statusList.map(() => '?').join(',');
       items = db
         .prepare(
           `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type, l.state,
@@ -1222,11 +1371,11 @@ router.get(
                   u.name AS user_name
            FROM leads l
            LEFT JOIN users u ON u.id = l.assigned_to
-           WHERE l.status = ? ${uClause}
+           WHERE l.status IN (${placeholders}) ${uClause}
            ORDER BY l.created_at DESC
            LIMIT ?`,
         )
-        .all(targetStage, limit);
+        .all(...statusList, limit);
     } else if (metric === 'open_pipeline') {
       title = 'Open pipeline leads';
       const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
@@ -1255,14 +1404,14 @@ router.get(
            FROM leads l
            LEFT JOIN users u ON u.id = l.assigned_to
            WHERE l.status IN ('paid', 'repeat')
-             ${win('COALESCE(l.converted_at, l.updated_at)')} ${uClause}
+             ${win('COALESCE(l.converted_at, l.updated_at)')} ${uClause} ${businessTypeClause} ${stateClause}
            ORDER BY COALESCE(l.converted_at, l.updated_at) DESC
            LIMIT ?`,
         )
         .all(limit);
     } else if (metric === 'business_type') {
       const bType = businessType || req.query.type;
-      title = `Leads: ${bType || 'Business type'}`;
+      title = `Leads added: ${bType || 'Business type'}`;
       const typeFilter =
         bType === 'unspecified'
           ? " AND (l.business_type IS NULL OR TRIM(l.business_type) = '')"
@@ -1276,7 +1425,7 @@ router.get(
                   u.name AS user_name
            FROM leads l
            LEFT JOIN users u ON u.id = l.assigned_to
-           WHERE 1=1 ${typeFilter} ${uClause}
+           WHERE 1=1 ${typeFilter} ${uClause} ${win('l.created_at')}
            ORDER BY l.created_at DESC
            LIMIT ?`,
         )
@@ -1441,7 +1590,7 @@ router.get(
            LEFT JOIN email_messages m ON m.id = r.email_message_id
            LEFT JOIN users u ON u.id = m.user_id
            LEFT JOIN users ua ON ua.id = l.assigned_to
-           WHERE 1=1 ${win('r.received_at')} ${stateClause} ${uClause} ${replyAccountClause}
+           WHERE 1=1 ${win('r.received_at')} ${stateClause} ${businessTypeClause} ${uClause} ${replyAccountClause}
            ORDER BY r.received_at DESC
            LIMIT ?`,
         )
@@ -1456,7 +1605,8 @@ router.get(
              FROM lead_activities a
              LEFT JOIN leads l ON l.id = a.lead_id
              LEFT JOIN users u ON u.id = a.user_id
-             WHERE a.type IN ('reply', 'linkedin_reply') ${win('a.created_at')}
+             WHERE a.type IN ('reply', 'linkedin_reply', 'facebook_reply', 'instagram_reply')
+               ${win('a.created_at')} ${stateClause} ${businessTypeClause}
              ORDER BY a.created_at DESC
              LIMIT ?`,
           )
