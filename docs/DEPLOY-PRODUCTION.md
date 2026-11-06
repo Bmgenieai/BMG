@@ -147,8 +147,11 @@ View product queues in CRM sidebar under **From bmgenie.ai**. CEO **Product anal
 
 | Provider | CRM endpoint |
 |----------|----------------|
-| Calendly (`invitee.created`) | `https://crm-api.bmgenie.ai/api/ingest/calendly` |
+| Calendly (`invitee.created`) | `https://crm-api.bmgenie.ai/api/ingest/calendly` (preferred) |
+| Calendly (alternate) | `https://api.bmgenie.ai/webhooks/calendly` (main API forwards to CRM) |
 | Tawk.to (chat start / transcript) | `https://crm-api.bmgenie.ai/api/ingest/tawk` |
+
+Without a Calendly webhook subscription, demos booked on bmgenie.ai will **not** appear in CRM (except the main-site popup browser backup after API deploy). Configure the webhook once in Calendly → Integrations → Webhooks.
 
 Optional Windows `.env`:
 
