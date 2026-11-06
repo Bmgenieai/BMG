@@ -342,7 +342,6 @@ router.get(
           SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected') THEN 1 ELSE 0 END) AS calls,
           SUM(CASE WHEN a.type = 'call_attempted' THEN 1 ELSE 0 END) AS calls_attempted,
           SUM(CASE WHEN a.type IN ('call','call_connected') THEN 1 ELSE 0 END) AS calls_connected,
-          SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies,
           SUM(CASE WHEN a.type = 'reply' AND a.outcome = 'positive' THEN 1 ELSE 0 END) AS positive_replies,
           SUM(CASE WHEN a.type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings_requested,
           SUM(CASE WHEN a.type = 'demo_shown' THEN 1 ELSE 0 END) AS demos_shown,
@@ -354,6 +353,18 @@ router.get(
          WHERE 1=1 ${actFilter} ${win('a.created_at')}`,
       )
       .get(...params);
+
+    // Brevo inbox replies — same source as dashboard drilldown / Email replies page.
+    const inboxReplies = db
+      .prepare(
+        `SELECT COUNT(*) AS c
+         FROM email_replies r
+         LEFT JOIN leads l ON l.id = r.lead_id
+         WHERE 1=1 ${leadFilter ? `AND r.lead_id IN (SELECT id FROM leads l WHERE 1=1 ${leadFilter})` : ''}
+           ${win('r.received_at')}`,
+      )
+      .get(...params).c;
+    outreach.replies = Number(inboxReplies) || 0;
 
     const leadsAdded = db
       .prepare(`SELECT COUNT(*) AS c FROM leads l WHERE 1=1 ${leadFilter} ${win('l.created_at')}`)
@@ -423,19 +434,36 @@ router.get(
         .all(...params)
         .map((r) => [r.k, Number(r.c) || 0]),
     );
-    const btOutreach = Object.fromEntries(
+    const btEmails = Object.fromEntries(
       db
         .prepare(
           `SELECT ${btExpr} AS k,
-                  SUM(CASE WHEN a.type IN ('email','email_sent','email_followup') THEN 1 ELSE 0 END) AS emails,
-                  SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies
+                  SUM(CASE WHEN a.type IN ('email','email_sent','email_followup') THEN 1 ELSE 0 END) AS emails
            FROM lead_activities a
            JOIN leads l ON l.id = a.lead_id
            WHERE 1=1 ${actFilter} ${win('a.created_at')}
            GROUP BY 1`,
         )
         .all(...params)
-        .map((r) => [r.k, { emails: Number(r.emails) || 0, replies: Number(r.replies) || 0 }]),
+        .map((r) => [r.k, Number(r.emails) || 0]),
+    );
+    const btReplies = Object.fromEntries(
+      db
+        .prepare(
+          `SELECT ${btExpr} AS k, COUNT(*) AS c
+           FROM email_replies r
+           JOIN leads l ON l.id = r.lead_id
+           WHERE 1=1 ${leadFilter} ${win('r.received_at')}
+           GROUP BY 1`,
+        )
+        .all(...params)
+        .map((r) => [r.k, Number(r.c) || 0]),
+    );
+    const btOutreach = Object.fromEntries(
+      [...new Set([...Object.keys(btEmails), ...Object.keys(btReplies)])].map((k) => [
+        k,
+        { emails: btEmails[k] || 0, replies: btReplies[k] || 0 },
+      ]),
     );
     const btPaid = Object.fromEntries(
       db
@@ -483,19 +511,36 @@ router.get(
         .all(...params)
         .map((r) => [r.k, Number(r.c) || 0]),
     );
-    const stOutreach = Object.fromEntries(
+    const stEmails = Object.fromEntries(
       db
         .prepare(
           `SELECT ${stExpr} AS k,
-                  SUM(CASE WHEN a.type IN ('email','email_sent','email_followup') THEN 1 ELSE 0 END) AS emails,
-                  SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies
+                  SUM(CASE WHEN a.type IN ('email','email_sent','email_followup') THEN 1 ELSE 0 END) AS emails
            FROM lead_activities a
            JOIN leads l ON l.id = a.lead_id
            WHERE 1=1 ${actFilter} ${win('a.created_at')}
            GROUP BY 1`,
         )
         .all(...params)
-        .map((r) => [r.k, { emails: Number(r.emails) || 0, replies: Number(r.replies) || 0 }]),
+        .map((r) => [r.k, Number(r.emails) || 0]),
+    );
+    const stReplies = Object.fromEntries(
+      db
+        .prepare(
+          `SELECT ${stExpr} AS k, COUNT(*) AS c
+           FROM email_replies r
+           JOIN leads l ON l.id = r.lead_id
+           WHERE 1=1 ${leadFilter} ${win('r.received_at')}
+           GROUP BY 1`,
+        )
+        .all(...params)
+        .map((r) => [r.k, Number(r.c) || 0]),
+    );
+    const stOutreach = Object.fromEntries(
+      [...new Set([...Object.keys(stEmails), ...Object.keys(stReplies)])].map((k) => [
+        k,
+        { emails: stEmails[k] || 0, replies: stReplies[k] || 0 },
+      ]),
     );
     const stPaid = Object.fromEntries(
       db
@@ -900,7 +945,6 @@ router.get(
            SUM(CASE WHEN a.type IN ('instagram','instagram_message') THEN 1 ELSE 0 END) AS instagram_messages,
            SUM(CASE WHEN a.type = 'instagram_reply' THEN 1 ELSE 0 END) AS instagram_replies,
            SUM(CASE WHEN a.type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings,
-           SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies,
            SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','facebook','facebook_message','instagram','instagram_message','note') THEN 1 ELSE 0 END) AS total_outreach,
            COUNT(DISTINCT CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','facebook','facebook_message','instagram','instagram_message','note','reply','linkedin_reply','facebook_reply','instagram_reply') THEN a.lead_id END) AS leads_touched
          FROM lead_activities a
@@ -912,6 +956,33 @@ router.get(
          GROUP BY a.user_id`,
       )
       .all(from, to);
+
+    /**
+     * Inbox email replies (Brevo) — same source as drilldown / Email replies page.
+     * Attribute to the outbound sender, else the lead owner.
+     */
+    const emailReplyAgg = db
+      .prepare(
+        `SELECT COALESCE(m.user_id, l.assigned_to) AS user_id, COUNT(*) AS replies
+         FROM email_replies r
+         LEFT JOIN email_messages m ON m.id = r.email_message_id
+         LEFT JOIN leads l ON l.id = r.lead_id
+         WHERE ${DT('r.received_at')} >= datetime(?)
+           AND ${DT('r.received_at')} < datetime(?)
+           ${stateFilter}
+         GROUP BY 1`,
+      )
+      .all(from, to);
+    const emailRepliesTotal = db
+      .prepare(
+        `SELECT COUNT(*) AS c
+         FROM email_replies r
+         LEFT JOIN leads l ON l.id = r.lead_id
+         WHERE ${DT('r.received_at')} >= datetime(?)
+           AND ${DT('r.received_at')} < datetime(?)
+           ${stateFilter}`,
+      )
+      .get(from, to).c;
 
     const statusMoves = db
       .prepare(
@@ -981,6 +1052,7 @@ router.get(
     };
     const addsMap = byId(leadAdds);
     const actMap = byId(activityAgg);
+    const replyMap = byId(emailReplyAgg);
     const moveMap = byId(statusMoves);
     const paidMap = byId(paidInPeriod);
     const fuMap = byId(followUpsDone);
@@ -1020,7 +1092,7 @@ router.get(
         instagramMessages: num(act.instagram_messages),
         instagramReplies: num(act.instagram_replies),
         meetings: num(act.meetings),
-        replies: num(act.replies),
+        replies: num(replyMap.get(u.id)?.replies),
         totalOutreach: num(act.total_outreach),
         leadsTouched,
         toContacted: num(mv.to_contacted),
@@ -1070,7 +1142,8 @@ router.get(
       instagramMessages: sumField('instagramMessages'),
       instagramReplies: sumField('instagramReplies'),
       meetings: sumField('meetings'),
-      replies: sumField('replies'),
+      // Prefer full inbox count (matches drilldown); rep rows may miss unattributed replies.
+      replies: Number(emailRepliesTotal) || 0,
       totalOutreach: sumField('totalOutreach'),
       leadsTouched: sumField('leadsTouched'),
       toContacted: sumField('toContacted'),
