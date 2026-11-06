@@ -6,11 +6,18 @@ import { LEAD_SOURCES, OPEN_STATUSES, BUSINESS_TYPES, roleHasPermission } from '
 import { fetchBmgenieCrmAnalytics, normalizeUserRows } from '../lib/bmgenieApi.js';
 import { cohortSql, normalizeCohort, cohortRefDate, COHORT_DEFINITIONS } from '../lib/cohort.js';
 import { resolveWorkingPeriod } from '../lib/periodBounds.js';
+import { excludeTestAndPakistanSql } from '../lib/leadFilters.js';
 import {
   backfillLegacyEmailAccountIds,
   emailAccountMatchSql,
   getEmailAccount,
 } from '../lib/emailAccounts.js';
+
+/** Same queue as /leads list + sidebar counts (active, no test/Pakistan). */
+function activeLeadQueueSql(alias = 'l') {
+  const arch = alias ? `${alias}.archived_at` : 'archived_at';
+  return `(${arch} IS NULL OR ${arch} = '') AND ${excludeTestAndPakistanSql(alias)}`;
+}
 
 const router = Router();
 router.use(authRequired);
@@ -279,10 +286,11 @@ router.get(
     const isCeo = roleHasPermission(req.user.role, 'analytics:view_all');
     const isManager = roleHasPermission(req.user.role, 'analytics:view_team');
 
-    let leadFilter = '';
+    // Match sidebar / Leads page: active only, exclude test + Pakistan.
+    let leadFilter = `AND ${activeLeadQueueSql('l')}`;
     const params = [];
     if (!isCeo && !isManager) {
-      leadFilter = 'AND l.assigned_to = ?';
+      leadFilter += ' AND l.assigned_to = ?';
       params.push(req.user.id);
     }
 
@@ -305,9 +313,7 @@ router.get(
       )
       .get(...params);
 
-    const actFilter = leadFilter
-      ? `AND a.lead_id IN (SELECT id FROM leads l WHERE 1=1 ${leadFilter})`
-      : '';
+    const actFilter = `AND a.lead_id IN (SELECT id FROM leads l WHERE 1=1 ${leadFilter})`;
 
     // Period window for activity counts (stages stay a live snapshot).
     const pb = resolveWorkingPeriod(req.query.period || 'overall');
@@ -1354,6 +1360,7 @@ router.get(
         'repeat',
       ];
       const uClause = userId ? ` AND l.assigned_to = '${userId}'` : '';
+      const queueScope = ` AND ${activeLeadQueueSql('l')}`;
       let statusList = [targetStage];
       if (cumulative && PIPELINE_CUMULATIVE_ORDER.includes(targetStage)) {
         const idx = PIPELINE_CUMULATIVE_ORDER.indexOf(targetStage);
@@ -1371,7 +1378,7 @@ router.get(
                   u.name AS user_name
            FROM leads l
            LEFT JOIN users u ON u.id = l.assigned_to
-           WHERE l.status IN (${placeholders}) ${uClause}
+           WHERE l.status IN (${placeholders}) ${uClause} ${queueScope}
            ORDER BY l.created_at DESC
            LIMIT ?`,
         )
@@ -1387,7 +1394,7 @@ router.get(
                   u.name AS user_name
            FROM leads l
            LEFT JOIN users u ON u.id = l.assigned_to
-           WHERE l.status IN (${OPEN_LIST}) ${uClause}
+           WHERE l.status IN (${OPEN_LIST}) ${uClause} AND ${activeLeadQueueSql('l')}
            ORDER BY l.created_at DESC
            LIMIT ?`,
         )
