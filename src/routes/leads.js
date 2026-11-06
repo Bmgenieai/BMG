@@ -1128,10 +1128,20 @@ router.post(
   (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'CSV file required (field: file)' });
     const sourceLabel = req.body?.source_label || 'csv_import';
-    // Telesales CSV rows are their own generated leads (same as New lead):
-    // created_by + assigned_to = uploader, source = telesales.
+    // BD can import as BD / LinkedIn / Instagram / Facebook (same as New lead sources).
     const isTelesales = req.user.role === 'telesales';
-    const source = isTelesales ? 'telesales' : 'csv_import';
+    const BD_CSV_SOURCES = new Set(['telesales', 'linkedin', 'facebook', 'instagram']);
+    const rawSource = String(req.body?.source || '').trim().toLowerCase();
+    let source;
+    if (BD_CSV_SOURCES.has(rawSource)) {
+      source = rawSource;
+    } else if (isTelesales) {
+      source = 'telesales';
+    } else if (rawSource === 'csv_import') {
+      source = 'csv_import';
+    } else {
+      source = isTelesales ? 'telesales' : 'csv_import';
+    }
 
     // Optional batch "Date Added" from upload form (YYYY-MM-DD or ISO). Defaults to now.
     let dateAdded = new Date().toISOString();
@@ -1169,8 +1179,8 @@ router.post(
       `INSERT INTO leads (
         id, name, email, phone, company, country, state, job_title, industry, contact_format,
         source, status, notes, estimated_value, import_batch_id, created_by, assigned_to, assigned_at, assigned_by,
-        date_added, business_type, times_added
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+        date_added, business_type, linkedin_url, times_added
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uncontacted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
     );
 
     const now = new Date().toISOString();
@@ -1234,10 +1244,14 @@ router.post(
           ) || 0;
         const companyVal =
           contactFormat === 'company' ? company || name : company || null;
+        const linkedinUrl = normalizeLinkedInUrl(
+          csvCell(row, 'linkedin_url', 'LinkedIn URL', 'linkedin', 'LinkedIn', 'profile_url', 'Profile URL'),
+        );
 
         const existing = findDuplicateLeads({
           email,
           phone,
+          linkedin_url: linkedinUrl,
           name,
           company: companyVal,
         });
@@ -1274,7 +1288,18 @@ router.post(
           req.user.id,
           dateAdded,
           bizType,
+          linkedinUrl,
         );
+        const sourceNoun =
+          source === 'linkedin'
+            ? 'LinkedIn'
+            : source === 'facebook'
+              ? 'Facebook'
+              : source === 'instagram'
+                ? 'Instagram'
+                : source === 'telesales'
+                  ? 'BD'
+                  : 'CSV';
         db.prepare(
           `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
            VALUES (?, ?, ?, 'imported', ?)`,
@@ -1282,7 +1307,7 @@ router.post(
           uuid(),
           id,
           req.user.id,
-          `CSV / Google Sheet import by ${req.user.name} (${sourceLabel}) · Date added ${dateAdded.slice(0, 10)}`,
+          `${sourceNoun} CSV import by ${req.user.name} · Date added ${dateAdded.slice(0, 10)}`,
         );
         imported += 1;
       }

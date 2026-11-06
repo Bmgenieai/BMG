@@ -215,6 +215,7 @@ export const LEAD_STATUSES = [
   'trial',
   'paid',
   'repeat',
+  'completed',
   'nurture',
 ];
 
@@ -249,6 +250,7 @@ export const STATUS_LABELS = {
   trial: 'Test completed',
   paid: 'Paid customer',
   repeat: 'Repeat',
+  completed: 'Completed',
   nurture: 'Not interested',
   // legacy display
   conversation: 'Engaged / Replied',
@@ -269,6 +271,7 @@ export const LEAD_STATUS_TABS = [
   { slug: 'challenge-offered', status: 'challenge_offered', label: 'Challenge offered' },
   { slug: 'paid', status: 'paid', label: 'Paid' },
   { slug: 'repeat', status: 'repeat', label: 'Repeat' },
+  { slug: 'completed', status: 'completed', label: 'Completed' },
   { slug: 'nurture', status: 'nurture', label: 'Not interested' },
 ];
 
@@ -393,7 +396,7 @@ export const OPEN_STATUSES = [
   'trial',
 ];
 
-export const END_STATUSES = ['paid', 'repeat', 'nurture'];
+export const END_STATUSES = ['paid', 'repeat', 'completed', 'nurture'];
 
 /** Stages that should stop automated email sequences. */
 export const STOP_OUTREACH_STATUSES = [
@@ -405,6 +408,7 @@ export const STOP_OUTREACH_STATUSES = [
   'trial',
   'paid',
   'repeat',
+  'completed',
   'nurture',
 ];
 

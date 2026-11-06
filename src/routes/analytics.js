@@ -315,6 +315,7 @@ router.get(
           SUM(CASE WHEN status = 'trial' THEN 1 ELSE 0 END) AS trials,
           SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS paid,
           SUM(CASE WHEN status = 'repeat' THEN 1 ELSE 0 END) AS repeat_customers,
+          SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
           SUM(CASE WHEN status = 'nurture' THEN 1 ELSE 0 END) AS nurture
          FROM leads l WHERE 1=1 ${leadFilter} ${win('l.created_at')}`,
       )
@@ -587,6 +588,7 @@ router.get(
         trials: stages.trials,
         paid: stages.paid,
         repeat: stages.repeat_customers,
+        completed: stages.completed,
         nurture: stages.nurture,
         // Back-compat aliases for older UI
         qualifiedProspects: stages.total_leads,
@@ -1243,6 +1245,262 @@ router.get(
       feed,
       leadsCreated,
     });
+  },
+);
+
+/**
+ * Downloadable daily (or period) BD activity report for seniors.
+ * Query: same as telesales-working (?period= / ?from=&to= / optional ?userId=)
+ * Returns text/csv attachment.
+ */
+router.get(
+  '/daily-report',
+  requireAnyPermission('analytics:view_all', 'analytics:view_team', 'analytics:view_own'),
+  (req, res) => {
+    const isCeo = roleHasPermission(req.user.role, 'analytics:view_all');
+    const isManager = roleHasPermission(req.user.role, 'analytics:view_team');
+    const canViewTeam = isCeo || isManager;
+    const bounds = resolveAnalyticsBounds(req.query);
+    const { from, to, fromYmd, toYmd, label } = bounds;
+
+    let focusUserId = req.query.userId ? String(req.query.userId) : null;
+    if (!canViewTeam) focusUserId = req.user.id;
+    if (!focusUserId) {
+      // CEO without userId: if only one BD row requested for “team day”, require pick —
+      // default to self when CEO wants own; otherwise first active telesales is confusing.
+      // Prefer explicit: if CEO and no userId, return 400 unless they pass userId=all later.
+      focusUserId = req.user.id;
+    }
+
+    const user = db
+      .prepare(`SELECT id, name, email, role FROM users WHERE id = ?`)
+      .get(focusUserId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!canViewTeam && user.id !== req.user.id) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+
+    const csvEsc = (v) => {
+      const s = v == null ? '' : String(v);
+      if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const row = (...cells) => cells.map(csvEsc).join(',');
+
+    const act = db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN a.type IN ('email','email_sent') THEN 1 ELSE 0 END) AS emails,
+           SUM(CASE WHEN a.type = 'email_followup' THEN 1 ELSE 0 END) AS email_followups,
+           SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected') THEN 1 ELSE 0 END) AS calls,
+           SUM(CASE WHEN a.type = 'whatsapp' THEN 1 ELSE 0 END) AS whatsapp,
+           SUM(CASE WHEN a.type = 'note' THEN 1 ELSE 0 END) AS notes,
+           SUM(CASE WHEN ${LI_ACTION} THEN 1 ELSE 0 END) AS linkedin,
+           SUM(CASE WHEN ${LI_TYPE('linkedin_connection_sent')} THEN 1 ELSE 0 END) AS linkedin_connection_sent,
+           SUM(CASE WHEN ${LI_MSG} THEN 1 ELSE 0 END) AS linkedin_messages,
+           SUM(CASE WHEN ${LI_TYPE('linkedin_reply')} THEN 1 ELSE 0 END) AS linkedin_replies,
+           SUM(CASE WHEN ${FB_ACTION} THEN 1 ELSE 0 END) AS facebook,
+           SUM(CASE WHEN ${IG_ACTION} THEN 1 ELSE 0 END) AS instagram,
+           SUM(CASE WHEN a.type IN ('reply','linkedin_reply','facebook_reply','instagram_reply') THEN 1 ELSE 0 END) AS replies,
+           COUNT(*) AS total_activities
+         FROM lead_activities a
+         LEFT JOIN leads l ON l.id = a.lead_id
+         WHERE a.user_id = ?
+           AND ${DT('a.created_at')} >= datetime(?)
+           AND ${DT('a.created_at')} < datetime(?)`,
+      )
+      .get(focusUserId, from, to);
+
+    const leadsAdded = db
+      .prepare(
+        `SELECT
+           COUNT(*) AS total,
+           SUM(CASE WHEN import_batch_id IS NULL OR import_batch_id = '' THEN 1 ELSE 0 END) AS manual,
+           SUM(CASE WHEN import_batch_id IS NOT NULL AND import_batch_id != '' THEN 1 ELSE 0 END) AS csv,
+           SUM(CASE WHEN source = 'linkedin' THEN 1 ELSE 0 END) AS linkedin_source,
+           SUM(CASE WHEN source = 'instagram' THEN 1 ELSE 0 END) AS instagram_source,
+           SUM(CASE WHEN source = 'facebook' THEN 1 ELSE 0 END) AS facebook_source
+         FROM leads
+         WHERE created_by = ?
+           AND ${DT('created_at')} >= datetime(?)
+           AND ${DT('created_at')} < datetime(?)`,
+      )
+      .get(focusUserId, from, to);
+
+    const inboxReplies = db
+      .prepare(
+        `SELECT COUNT(*) AS c
+         FROM email_replies r
+         LEFT JOIN email_messages m ON m.id = r.email_message_id
+         LEFT JOIN leads l ON l.id = r.lead_id
+         WHERE ${DT('r.received_at')} >= datetime(?)
+           AND ${DT('r.received_at')} < datetime(?)
+           AND (m.user_id = ? OR l.assigned_to = ?)`,
+      )
+      .get(from, to, focusUserId, focusUserId).c;
+
+    const paid = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM leads l
+         WHERE l.status IN ('paid','repeat')
+           AND l.assigned_to = ?
+           AND ${DT('COALESCE(l.converted_at, l.updated_at)')} >= datetime(?)
+           AND ${DT('COALESCE(l.converted_at, l.updated_at)')} < datetime(?)`,
+      )
+      .get(focusUserId, from, to).c;
+
+    const followupsDone = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM follow_ups
+         WHERE assigned_to = ? AND status = 'completed'
+           AND ${DT('COALESCE(completed_at, updated_at)')} >= datetime(?)
+           AND ${DT('COALESCE(completed_at, updated_at)')} < datetime(?)`,
+      )
+      .get(focusUserId, from, to).c;
+
+    const feed = db
+      .prepare(
+        `SELECT a.created_at, a.type, a.summary, a.outcome,
+                l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                l.source AS lead_source, l.state AS lead_state, l.status AS lead_status
+         FROM lead_activities a
+         LEFT JOIN leads l ON l.id = a.lead_id
+         WHERE a.user_id = ?
+           AND ${DT('a.created_at')} >= datetime(?)
+           AND ${DT('a.created_at')} < datetime(?)
+           AND a.type IN (
+             'call','call_attempted','call_connected','whatsapp',
+             'email','email_sent','email_followup','note','imported',
+             'linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','linkedin_reply','linkedin_connection_accepted',
+             'facebook','facebook_message','facebook_reply',
+             'instagram','instagram_message','instagram_reply',
+             'reply','status_change','meeting_scheduled'
+           )
+         ORDER BY a.created_at ASC
+         LIMIT 2000`,
+      )
+      .all(focusUserId, from, to);
+
+    const createdLeads = db
+      .prepare(
+        `SELECT l.created_at, l.name, l.email, l.company, l.source, l.state, l.status,
+                l.business_type, l.linkedin_url,
+                CASE WHEN l.import_batch_id IS NULL OR l.import_batch_id = '' THEN 'manual' ELSE 'csv' END AS add_method
+         FROM leads l
+         WHERE l.created_by = ?
+           AND ${DT('l.created_at')} >= datetime(?)
+           AND ${DT('l.created_at')} < datetime(?)
+         ORDER BY l.created_at ASC
+         LIMIT 2000`,
+      )
+      .all(focusUserId, from, to);
+
+    const n = (v) => Number(v) || 0;
+    const emailsTotal = n(act.emails) + n(act.email_followups);
+    const datePart = fromYmd === toYmd ? fromYmd : `${fromYmd}_to_${toYmd}`;
+    const safeName = String(user.name || 'BD').replace(/[^\w\-]+/g, '_');
+    const filename = `BD_daily_report_${safeName}_${datePart}.csv`;
+
+    const lines = [];
+    lines.push(row('BMGenie CRM — BD daily activity report'));
+    lines.push(row('BD name', user.name));
+    lines.push(row('BD email', user.email));
+    lines.push(row('Period', label));
+    lines.push(row('Date range', fromYmd === toYmd ? fromYmd : `${fromYmd} → ${toYmd}`));
+    lines.push(row('Generated at', new Date().toISOString()));
+    lines.push('');
+    lines.push(row('SUMMARY'));
+    lines.push(row('Metric', 'Count'));
+    lines.push(row('Leads added (total)', n(leadsAdded.total)));
+    lines.push(row('  · Manual / New lead', n(leadsAdded.manual)));
+    lines.push(row('  · CSV upload', n(leadsAdded.csv)));
+    lines.push(row('  · LinkedIn source', n(leadsAdded.linkedin_source)));
+    lines.push(row('  · Instagram source', n(leadsAdded.instagram_source)));
+    lines.push(row('  · Facebook source', n(leadsAdded.facebook_source)));
+    lines.push(row('Emails sent (incl. follow-ups)', emailsTotal));
+    lines.push(row('  · First emails', n(act.emails)));
+    lines.push(row('  · Email follow-ups', n(act.email_followups)));
+    lines.push(row('Inbox replies received', n(inboxReplies)));
+    lines.push(row('Calls', n(act.calls)));
+    lines.push(row('WhatsApp', n(act.whatsapp)));
+    lines.push(row('LinkedIn touches', n(act.linkedin)));
+    lines.push(row('  · Connection requests', n(act.linkedin_connection_sent)));
+    lines.push(row('  · LinkedIn messages', n(act.linkedin_messages)));
+    lines.push(row('  · LinkedIn replies logged', n(act.linkedin_replies)));
+    lines.push(row('Facebook / Instagram touches', n(act.facebook) + n(act.instagram)));
+    lines.push(row('Notes / prospect research', n(act.notes)));
+    lines.push(row('Follow-ups completed', n(followupsDone)));
+    lines.push(row('Paid / repeat in period', n(paid)));
+    lines.push(row('Total logged activities', n(act.total_activities)));
+    lines.push('');
+    lines.push(row('ACTIVITY LOG'));
+    lines.push(
+      row(
+        'Time',
+        'Type',
+        'Summary',
+        'Outcome',
+        'Lead',
+        'Lead email',
+        'Company',
+        'Source',
+        'State',
+        'Lead status',
+      ),
+    );
+    for (const a of feed) {
+      lines.push(
+        row(
+          a.created_at,
+          a.type,
+          a.summary,
+          a.outcome,
+          a.lead_name,
+          a.lead_email,
+          a.lead_company,
+          a.lead_source,
+          a.lead_state,
+          a.lead_status,
+        ),
+      );
+    }
+    lines.push('');
+    lines.push(row('LEADS ADDED'));
+    lines.push(
+      row(
+        'Time',
+        'Name',
+        'Email',
+        'Company',
+        'Source',
+        'Add method',
+        'State',
+        'Status',
+        'Business type',
+        'LinkedIn URL',
+      ),
+    );
+    for (const l of createdLeads) {
+      lines.push(
+        row(
+          l.created_at,
+          l.name,
+          l.email,
+          l.company,
+          l.source,
+          l.add_method,
+          l.state,
+          l.status,
+          l.business_type,
+          l.linkedin_url,
+        ),
+      );
+    }
+
+    const body = `\uFEFF${lines.join('\n')}`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(body);
   },
 );
 
