@@ -10,6 +10,28 @@ function sqlDate(d) {
   return d.toISOString().slice(0, 19).replace('T', ' ');
 }
 
+/** Prefer a real name over a stored email (common after CSV imports without Name). */
+export function displayLeadName(name, email, company) {
+  const n = String(name || '').trim();
+  const e = String(email || '').trim();
+  const c = String(company || '').trim();
+  const looksLikeEmail =
+    !n || (e && n.toLowerCase() === e.toLowerCase()) || n.includes('@');
+  if (!looksLikeEmail) return n;
+  if (c) return c;
+  const local = e.split('@')[0] || '';
+  if (!local) return n || null;
+  const human = local
+    .replace(/[._+-]+/g, ' ')
+    .replace(/\d+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
+  return human || n || null;
+}
+
 export function listCampaigns() {
   return db
     .prepare(
@@ -58,7 +80,11 @@ export function getCampaign(id) {
        WHERE cl.campaign_id = ?
        ORDER BY cl.enrolled_at DESC`,
     )
-    .all(id);
+    .all(id)
+    .map((row) => ({
+      ...row,
+      lead_name: displayLeadName(row.lead_name, row.lead_email, row.lead_company),
+    }));
 
   const counts = db
     .prepare(

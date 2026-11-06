@@ -1121,6 +1121,56 @@ function csvCell(row, ...keys) {
   return null;
 }
 
+/** Prefer real person/company name — never store a raw email address as `name`. */
+function csvLeadName(row, email, company) {
+  const explicit = csvCell(
+    row,
+    'name',
+    'Name',
+    'full_name',
+    'Full Name',
+    'fullName',
+    'contact_name',
+    'Contact Name',
+  );
+  if (explicit && !explicit.includes('@')) return explicit;
+
+  const first = csvCell(
+    row,
+    'first_name',
+    'First Name',
+    'FirstName',
+    'firstname',
+    'first',
+  );
+  const last = csvCell(
+    row,
+    'last_name',
+    'Last Name',
+    'LastName',
+    'lastname',
+    'last',
+  );
+  const combined = [first, last].filter(Boolean).join(' ').trim();
+  if (combined) return combined;
+
+  if (company) return company;
+
+  const local = String(email || '')
+    .split('@')[0]
+    .replace(/[._+-]+/g, ' ')
+    .replace(/\d+/g, ' ')
+    .trim();
+  if (local) {
+    return local
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+      .join(' ');
+  }
+  return explicit || null;
+}
+
 router.post(
   '/import/csv',
   requirePermission('leads:import'),
@@ -1186,22 +1236,14 @@ router.post(
     const now = new Date().toISOString();
     const tx = db.transaction(() => {
       for (const row of records) {
-        const name = csvCell(
-          row,
-          'name',
-          'Name',
-          'full_name',
-          'Full Name',
-          'email',
-          'Email',
-        );
+        const email = csvCell(row, 'email', 'Email', 'Email Address', 'email_address');
+        const phone = csvCell(row, 'contact', 'Contact', 'phone', 'Phone', 'mobile', 'Mobile');
+        const company = csvCell(row, 'company', 'Company', 'Company Name', 'company_name', 'companyName');
+        const name = csvLeadName(row, email, company);
         if (!name) {
           skipped += 1;
           continue;
         }
-        const email = csvCell(row, 'email', 'Email');
-        const phone = csvCell(row, 'contact', 'Contact', 'phone', 'Phone', 'mobile', 'Mobile');
-        const company = csvCell(row, 'company', 'Company');
         const country = csvCell(row, 'country', 'Country');
         const state = csvCell(row, 'state', 'State');
         const jobTitle = csvCell(row, 'job_title', 'Job Title', 'job title', 'title', 'Title');
