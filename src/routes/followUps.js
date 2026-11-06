@@ -16,7 +16,7 @@ function markOverdue() {
 
 router.get('/', requireAnyPermission('followups:view_all', 'followups:view_own'), (req, res) => {
   markOverdue();
-  const { status, mine } = req.query;
+  const { status, mine, q, dueFrom, dueTo, createdFrom, createdTo } = req.query;
   const clauses = [];
   const params = [];
 
@@ -28,12 +28,36 @@ router.get('/', requireAnyPermission('followups:view_all', 'followups:view_own')
     clauses.push('f.status = ?');
     params.push(status);
   }
+  if (q && String(q).trim()) {
+    const like = `%${String(q).trim().toLowerCase()}%`;
+    clauses.push(
+      `(LOWER(COALESCE(l.name,'')) LIKE ? OR LOWER(COALESCE(l.email,'')) LIKE ? OR LOWER(COALESCE(l.company,'')) LIKE ? OR LOWER(COALESCE(f.note,'')) LIKE ? OR LOWER(COALESCE(u.name,'')) LIKE ?)`,
+    );
+    params.push(like, like, like, like, like);
+  }
+  if (dueFrom) {
+    clauses.push(`date(f.due_at) >= date(?)`);
+    params.push(dueFrom);
+  }
+  if (dueTo) {
+    clauses.push(`date(f.due_at) <= date(?)`);
+    params.push(dueTo);
+  }
+  if (createdFrom) {
+    clauses.push(`date(COALESCE(l.date_added, l.created_at)) >= date(?)`);
+    params.push(createdFrom);
+  }
+  if (createdTo) {
+    clauses.push(`date(COALESCE(l.date_added, l.created_at)) <= date(?)`);
+    params.push(createdTo);
+  }
 
   const where = clauses.length ? clauses.join(' AND ') : '1=1';
   const rows = db
     .prepare(
       `SELECT f.*,
         l.name AS lead_name, l.email AS lead_email, l.status AS lead_status, l.source AS lead_source,
+        COALESCE(l.date_added, l.created_at) AS lead_created_at,
         u.name AS assignee_name
        FROM follow_ups f
        JOIN leads l ON l.id = f.lead_id
