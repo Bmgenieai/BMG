@@ -248,12 +248,12 @@ export const STATUS_LABELS = {
   challenge_accepted: 'Shoot Challenge accepted',
   trial: 'Test completed',
   paid: 'Paid customer',
-  repeat: 'Repeat / expanded',
-  nurture: 'Nurture / Disqualified',
+  repeat: 'Repeat',
+  nurture: 'Not interested',
   // legacy display
   conversation: 'Engaged / Replied',
   demo_booked: 'Demo scheduled',
-  lost: 'Nurture / Disqualified',
+  lost: 'Not interested',
   new: 'New / Uncontacted',
   interested: 'Engaged / Replied',
   converted: 'Paid customer',
@@ -267,18 +267,18 @@ export const LEAD_STATUS_TABS = [
   { slug: 'qualified', status: 'qualified', label: 'Qualified' },
   { slug: 'demo-scheduled', status: 'demo_scheduled', label: 'Demo scheduled' },
   { slug: 'challenge-offered', status: 'challenge_offered', label: 'Challenge offered' },
-  { slug: 'challenge-accepted', status: 'challenge_accepted', label: 'Challenge accepted' },
-  { slug: 'trial', status: 'trial', label: 'Test completed' },
   { slug: 'paid', status: 'paid', label: 'Paid' },
   { slug: 'repeat', status: 'repeat', label: 'Repeat' },
-  { slug: 'nurture', status: 'nurture', label: 'Nurture / DQ' },
+  { slug: 'nurture', status: 'nurture', label: 'Not interested' },
 ];
 
 /** Legacy URL slugs still resolve via resolveLeadFilter. */
 export const LEGACY_STATUS_TABS = [
   { slug: 'conversation', status: 'engaged', label: 'Engaged' },
   { slug: 'demo-booked', status: 'demo_scheduled', label: 'Demo scheduled' },
-  { slug: 'lost', status: 'nurture', label: 'Nurture / DQ' },
+  { slug: 'challenge-accepted', status: 'challenge_accepted', label: 'Challenge accepted' },
+  { slug: 'trial', status: 'trial', label: 'Test completed' },
+  { slug: 'lost', status: 'nurture', label: 'Not interested' },
 ];
 
 export const LOST_REASONS = [
