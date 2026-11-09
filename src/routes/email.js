@@ -51,8 +51,10 @@ function resolveEmailContent({
   emailAccountId = null,
 }) {
   const { sender } = resolveSendAccount(emailAccountId);
+  // Prefer From-account display name so {{sender_name}} matches the selected sender
+  // (same order as scheduledEmailWorker / campaign sends).
   const mergeSender = {
-    name: user?.name || sender.name,
+    name: sender.name || user?.name,
     email: sender.email,
   };
   if (templateId) {
@@ -618,6 +620,7 @@ router.post(
       sampleLead,
       sampleName,
       sampleCompany,
+      emailAccountId,
     } = req.body || {};
 
     let lead = null;
@@ -647,6 +650,7 @@ router.post(
         templateId,
         lead,
         user: req.user,
+        emailAccountId: emailAccountId || null,
       });
       res.json({
         ...content,
