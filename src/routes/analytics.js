@@ -902,6 +902,12 @@ router.get(
           : ` AND TRIM(l.state) = '${rawState.replace(/'/g, "''").slice(0, 64)}'`;
     const stateLabel = rawState || null;
 
+    const rawSource = req.query.source ? String(req.query.source).trim().toLowerCase() : '';
+    const sourceFilter = rawSource
+      ? ` AND lower(COALESCE(l.source, '')) = '${rawSource.replace(/'/g, "''").slice(0, 64)}'`
+      : '';
+    const sourceLabel = rawSource || null;
+
     const reps = canViewTeam
       ? db
           .prepare(
@@ -925,6 +931,7 @@ router.get(
            AND ${DT('l.created_at')} >= datetime(?)
            AND ${DT('l.created_at')} < datetime(?)
            ${stateFilter}
+           ${sourceFilter}
          GROUP BY l.created_by`,
       )
       .all(from, to);
@@ -937,11 +944,13 @@ router.get(
            SUM(CASE WHEN a.type IN ('call','call_connected') THEN 1 ELSE 0 END) AS calls_connected,
            SUM(CASE WHEN a.type = 'whatsapp' THEN 1 ELSE 0 END) AS messages,
            SUM(CASE WHEN a.type IN ('email', 'email_sent') THEN 1 ELSE 0 END) AS emails,
+           SUM(CASE WHEN a.type = 'email' THEN 1 ELSE 0 END) AS manual_emails,
            SUM(CASE WHEN a.type = 'email_followup' THEN 1 ELSE 0 END) AS email_followups,
            SUM(CASE WHEN a.type = 'note' THEN 1 ELSE 0 END) AS notes,
            SUM(CASE WHEN ${LI_ACTION} THEN 1 ELSE 0 END) AS linkedin,
            SUM(CASE WHEN ${LI_TYPE('linkedin_connection_sent')} THEN 1 ELSE 0 END) AS linkedin_connection_sent,
-           SUM(CASE WHEN ${LI_TYPE('linkedin_message')} THEN 1 ELSE 0 END) AS linkedin_messages,
+           SUM(CASE WHEN ${LI_TYPE('linkedin_message')} OR ${LI_MSG} THEN 1 ELSE 0 END) AS linkedin_messages,
+           SUM(CASE WHEN ${LI_TYPE('linkedin_followup')} THEN 1 ELSE 0 END) AS linkedin_followups,
            SUM(CASE WHEN ${LI_TYPE('linkedin_reply')} THEN 1 ELSE 0 END) AS linkedin_replies,
            SUM(CASE WHEN ${FB_ACTION} THEN 1 ELSE 0 END) AS facebook,
            SUM(CASE WHEN a.type IN ('facebook','facebook_message') THEN 1 ELSE 0 END) AS facebook_messages,
@@ -950,6 +959,7 @@ router.get(
            SUM(CASE WHEN a.type IN ('instagram','instagram_message') THEN 1 ELSE 0 END) AS instagram_messages,
            SUM(CASE WHEN a.type = 'instagram_reply' THEN 1 ELSE 0 END) AS instagram_replies,
            SUM(CASE WHEN a.type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings,
+           SUM(CASE WHEN a.type = 'reply' AND a.outcome = 'positive' THEN 1 ELSE 0 END) AS positive_replies,
            SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','facebook','facebook_message','instagram','instagram_message','note') THEN 1 ELSE 0 END) AS total_outreach,
            COUNT(DISTINCT CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','facebook','facebook_message','instagram','instagram_message','note','reply','linkedin_reply','facebook_reply','instagram_reply') THEN a.lead_id END) AS leads_touched
          FROM lead_activities a
@@ -958,7 +968,24 @@ router.get(
            AND ${DT('a.created_at')} >= datetime(?)
            AND ${DT('a.created_at')} < datetime(?)
            ${stateFilter}
+           ${sourceFilter}
          GROUP BY a.user_id`,
+      )
+      .all(from, to);
+
+    const crmEmailAgg = db
+      .prepare(
+        `SELECT m.user_id,
+           COUNT(*) AS crm_emails_sent,
+           SUM(CASE WHEN COALESCE(m.open_count, 0) > 0 THEN 1 ELSE 0 END) AS crm_emails_opened
+         FROM email_messages m
+         LEFT JOIN leads l ON l.id = m.lead_id
+         WHERE m.user_id IS NOT NULL
+           AND ${DT('m.sent_at')} >= datetime(?)
+           AND ${DT('m.sent_at')} < datetime(?)
+           ${stateFilter}
+           ${sourceFilter}
+         GROUP BY m.user_id`,
       )
       .all(from, to);
 
@@ -975,6 +1002,7 @@ router.get(
          WHERE ${DT('r.received_at')} >= datetime(?)
            AND ${DT('r.received_at')} < datetime(?)
            ${stateFilter}
+           ${sourceFilter}
          GROUP BY 1`,
       )
       .all(from, to);
@@ -985,7 +1013,8 @@ router.get(
          LEFT JOIN leads l ON l.id = r.lead_id
          WHERE ${DT('r.received_at')} >= datetime(?)
            AND ${DT('r.received_at')} < datetime(?)
-           ${stateFilter}`,
+           ${stateFilter}
+           ${sourceFilter}`,
       )
       .get(from, to).c;
 
@@ -1005,6 +1034,7 @@ router.get(
            AND ${DT('a.created_at')} >= datetime(?)
            AND ${DT('a.created_at')} < datetime(?)
            ${stateFilter}
+           ${sourceFilter}
          GROUP BY a.user_id`,
       )
       .all(from, to);
@@ -1057,6 +1087,7 @@ router.get(
     };
     const addsMap = byId(leadAdds);
     const actMap = byId(activityAgg);
+    const crmMap = byId(crmEmailAgg);
     const replyMap = byId(emailReplyAgg);
     const moveMap = byId(statusMoves);
     const paidMap = byId(paidInPeriod);
@@ -1068,17 +1099,50 @@ router.get(
     const repRows = reps.map((u) => {
       const a = addsMap.get(u.id) || {};
       const act = actMap.get(u.id) || {};
+      const crm = crmMap.get(u.id) || {};
       const mv = moveMap.get(u.id) || {};
       const paid = num(paidMap.get(u.id)?.paid);
       const leadsAdded = num(a.leads_added);
       const leadsTouched = num(act.leads_touched);
+      const prospectsScraped = num(a.leads_manual);
+      const emailsUploaded = num(a.leads_csv);
+      const crmEmailsSent = num(crm.crm_emails_sent);
+      const crmEmailsOpened = num(crm.crm_emails_opened);
+      const manualEmailsSent = num(act.manual_emails);
+      const linkedinConnectionSent = num(act.linkedin_connection_sent);
+      const linkedinMessages = num(act.linkedin_messages);
+      const linkedinFollowups = num(act.linkedin_followups);
+      const totalEmailOutreach = crmEmailsSent + manualEmailsSent;
+      const totalLinkedinOutreach =
+        linkedinConnectionSent + linkedinMessages + linkedinFollowups;
+      const openRate =
+        crmEmailsSent > 0
+          ? Math.round((crmEmailsOpened / crmEmailsSent) * 1000) / 10
+          : 0;
+      const emailReplies = num(replyMap.get(u.id)?.replies);
+      const positiveReplies = num(act.positive_replies);
+      const meetingsBooked = num(act.meetings) + num(mv.to_demo);
       return {
         id: u.id,
         name: u.name,
         email: u.email,
-        leadsManual: num(a.leads_manual),
-        leadsCsv: num(a.leads_csv),
+        leadsManual: prospectsScraped,
+        leadsCsv: emailsUploaded,
         leadsAdded,
+        prospectsScraped,
+        emailsUploaded,
+        crmEmailsSent,
+        crmEmailsOpened,
+        manualEmailsSent,
+        linkedinConnectionSent,
+        linkedinMessages,
+        linkedinFollowups,
+        totalEmailOutreach,
+        totalLinkedinOutreach,
+        openRate,
+        emailReplies,
+        positiveReplies,
+        meetingsBooked,
         calls: num(act.calls),
         callsAttempted: num(act.calls_attempted),
         callsConnected: num(act.calls_connected),
@@ -1087,8 +1151,6 @@ router.get(
         emailFollowups: num(act.email_followups),
         notes: num(act.notes),
         linkedin: num(act.linkedin),
-        linkedinConnectionSent: num(act.linkedin_connection_sent),
-        linkedinMessages: num(act.linkedin_messages),
         linkedinReplies: num(act.linkedin_replies),
         facebook: num(act.facebook),
         facebookMessages: num(act.facebook_messages),
@@ -1097,7 +1159,7 @@ router.get(
         instagramMessages: num(act.instagram_messages),
         instagramReplies: num(act.instagram_replies),
         meetings: num(act.meetings),
-        replies: num(replyMap.get(u.id)?.replies),
+        replies: emailReplies,
         totalOutreach: num(act.total_outreach),
         leadsTouched,
         toContacted: num(mv.to_contacted),
@@ -1125,10 +1187,27 @@ router.get(
     );
 
     const sumField = (field) => repRows.reduce((s, r) => s + (r[field] || 0), 0);
+    const totalCrmSent = sumField('crmEmailsSent');
+    const totalCrmOpened = sumField('crmEmailsOpened');
     const totals = {
       leadsManual: sumField('leadsManual'),
       leadsCsv: sumField('leadsCsv'),
       leadsAdded: sumField('leadsAdded'),
+      prospectsScraped: sumField('prospectsScraped'),
+      emailsUploaded: sumField('emailsUploaded'),
+      crmEmailsSent: totalCrmSent,
+      crmEmailsOpened: totalCrmOpened,
+      manualEmailsSent: sumField('manualEmailsSent'),
+      linkedinConnectionSent: sumField('linkedinConnectionSent'),
+      linkedinMessages: sumField('linkedinMessages'),
+      linkedinFollowups: sumField('linkedinFollowups'),
+      totalEmailOutreach: sumField('totalEmailOutreach'),
+      totalLinkedinOutreach: sumField('totalLinkedinOutreach'),
+      openRate:
+        totalCrmSent > 0 ? Math.round((totalCrmOpened / totalCrmSent) * 1000) / 10 : 0,
+      emailReplies: Number(emailRepliesTotal) || sumField('emailReplies'),
+      positiveReplies: sumField('positiveReplies'),
+      meetingsBooked: sumField('meetingsBooked'),
       calls: sumField('calls'),
       callsAttempted: sumField('callsAttempted'),
       callsConnected: sumField('callsConnected'),
@@ -1137,8 +1216,6 @@ router.get(
       emailFollowups: sumField('emailFollowups'),
       notes: sumField('notes'),
       linkedin: sumField('linkedin'),
-      linkedinConnectionSent: sumField('linkedinConnectionSent'),
-      linkedinMessages: sumField('linkedinMessages'),
       linkedinReplies: sumField('linkedinReplies'),
       facebook: sumField('facebook'),
       facebookMessages: sumField('facebookMessages'),
@@ -1177,6 +1254,7 @@ router.get(
              AND ${DT('a.created_at')} < datetime(?)
              AND a.type IN ('call','whatsapp','email','email_sent','note','linkedin','reply','status_change')
              ${stateFilter}
+             ${sourceFilter}
            ORDER BY a.created_at DESC
            LIMIT 100`,
         )
@@ -1190,6 +1268,7 @@ router.get(
              AND ${DT('l.created_at')} >= datetime(?)
              AND ${DT('l.created_at')} < datetime(?)
              ${stateFilter}
+             ${sourceFilter}
            ORDER BY l.created_at DESC
            LIMIT 100`,
         )
@@ -1234,11 +1313,15 @@ router.get(
           }))
       : [];
 
+    const sources = Object.values(LEAD_SOURCES).map((s) => ({ key: s.key, label: s.label }));
+
     res.json({
       ...bounds,
       canViewTeam,
       focusUserId: detailId,
       state: stateLabel,
+      source: sourceLabel,
+      sources,
       reps: repRows,
       totals,
       byState,
@@ -1799,8 +1882,18 @@ router.get(
            LIMIT ?`,
         )
         .all(limit);
-    } else if (metric === 'emails_sent' || metric === 'emails') {
-      title = 'Emails sent';
+    } else if (
+      metric === 'emails_sent' ||
+      metric === 'emails' ||
+      metric === 'crm_emails_sent' ||
+      metric === 'total_email_outreach'
+    ) {
+      title =
+        metric === 'crm_emails_sent'
+          ? 'CRM emails sent'
+          : metric === 'total_email_outreach'
+            ? 'Total email outreach'
+            : 'Emails sent';
       const uClause = userId ? ` AND m.user_id = '${userId}'` : '';
       items = db
         .prepare(
@@ -1817,7 +1910,7 @@ router.get(
            LIMIT ?`,
         )
         .all(limit);
-      if (items.length === 0 && !emailAccountId) {
+      if (items.length === 0 && !emailAccountId && metric !== 'crm_emails_sent') {
         // Fallback to lead_activities for email (no account filter available)
         const actUClause = userId ? ` AND a.user_id = '${userId}'` : '';
         items = db
@@ -1835,6 +1928,56 @@ router.get(
           )
           .all(limit);
       }
+    } else if (metric === 'manual_emails_sent' || metric === 'manual_emails') {
+      title = 'Manual emails sent';
+      const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type, l.state,
+                  u.name AS user_name
+           FROM lead_activities a
+           LEFT JOIN leads l ON l.id = a.lead_id
+           LEFT JOIN users u ON u.id = a.user_id
+           WHERE a.type = 'email' ${win('a.created_at')} ${uClause} ${stateClause}
+           ORDER BY a.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'prospects_scraped' || metric === 'prospects_researched') {
+      title = 'Prospects scraped / researched';
+      const uClause = userId ? ` AND l.created_by = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type, l.state, l.source, l.created_at AS date,
+                  u.name AS user_name
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.created_by
+           WHERE (l.import_batch_id IS NULL OR l.import_batch_id = '')
+             ${win('l.created_at')} ${uClause} ${stateClause}
+           ORDER BY l.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+    } else if (metric === 'emails_uploaded') {
+      title = 'Emails uploaded to CRM';
+      const uClause = userId ? ` AND l.created_by = '${userId}'` : '';
+      items = db
+        .prepare(
+          `SELECT l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type, l.state, l.source, l.created_at AS date,
+                  u.name AS user_name, b.filename AS import_batch_filename
+           FROM leads l
+           LEFT JOIN users u ON u.id = l.created_by
+           LEFT JOIN import_batches b ON b.id = l.import_batch_id
+           WHERE l.import_batch_id IS NOT NULL AND l.import_batch_id != ''
+             ${win('l.created_at')} ${uClause} ${stateClause}
+           ORDER BY l.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
     } else if (metric === 'email_followups') {
       title = 'Email follow-ups sent';
       const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
