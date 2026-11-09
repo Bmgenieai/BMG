@@ -52,6 +52,8 @@ export function recordEmailSend({
   textContent = null,
   parentReplyId = null,
   emailAccountId = null,
+  campaignId = null,
+  campaignStepId = null,
 }) {
   const id = uuid();
   const now = new Date().toISOString();
@@ -60,8 +62,8 @@ export function recordEmailSend({
   db.prepare(
     `INSERT INTO email_messages (
        id, lead_id, user_id, brevo_message_id, subject, to_email, template_id, source, status,
-       html_content, text_content, parent_reply_id, email_account_id, sent_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?)`,
+       html_content, text_content, parent_reply_id, email_account_id, campaign_id, campaign_step_id, sent_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     leadId,
@@ -75,6 +77,8 @@ export function recordEmailSend({
     textContent ? String(textContent).slice(0, 100_000) : null,
     parentReplyId || null,
     emailAccountId || null,
+    campaignId || null,
+    campaignStepId || null,
     now,
   );
 

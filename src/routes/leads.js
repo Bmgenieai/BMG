@@ -115,7 +115,7 @@ router.get('/meta', (_req, res) => {
        FROM import_batches b
        LEFT JOIN users u ON u.id = b.uploaded_by
        ORDER BY b.created_at DESC
-       LIMIT 50`,
+       LIMIT 100`,
     )
     .all();
 

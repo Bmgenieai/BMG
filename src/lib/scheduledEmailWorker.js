@@ -112,6 +112,8 @@ async function processOne(row) {
       htmlContent: content.htmlContent || null,
       textContent: content.textContent || null,
       emailAccountId: accountId,
+      campaignId: row.campaign_id || null,
+      campaignStepId: row.campaign_step_id || null,
     });
 
     claimLeadIfUnassigned(lead.id, row.user_id);

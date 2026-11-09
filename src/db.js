@@ -687,6 +687,66 @@ export function migrate() {
     /* exists */
   }
 
+  const messageCampaignAlters = [
+    `ALTER TABLE email_messages ADD COLUMN campaign_id TEXT`,
+    `ALTER TABLE email_messages ADD COLUMN campaign_step_id TEXT`,
+  ];
+  for (const sql of messageCampaignAlters) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* column already exists */
+    }
+  }
+  try {
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_email_messages_campaign
+         ON email_messages(campaign_id, sent_at)`,
+    );
+  } catch {
+    /* ignore */
+  }
+
+  // Link historical campaign sends (scheduled → email_messages) when possible.
+  if (!metaGet.get('email_messages_campaign_backfill_v1')?.value) {
+    try {
+      db.exec(`
+        UPDATE email_messages AS m
+        SET
+          campaign_id = (
+            SELECT s.campaign_id
+            FROM scheduled_emails s
+            WHERE s.lead_id = m.lead_id
+              AND s.campaign_id IS NOT NULL
+              AND s.status = 'sent'
+              AND COALESCE(s.subject, '') = COALESCE(m.subject, '')
+            ORDER BY s.sent_at DESC
+            LIMIT 1
+          ),
+          campaign_step_id = (
+            SELECT s.campaign_step_id
+            FROM scheduled_emails s
+            WHERE s.lead_id = m.lead_id
+              AND s.campaign_id IS NOT NULL
+              AND s.status = 'sent'
+              AND COALESCE(s.subject, '') = COALESCE(m.subject, '')
+            ORDER BY s.sent_at DESC
+            LIMIT 1
+          )
+        WHERE m.campaign_id IS NULL
+          AND m.source = 'campaign'
+      `);
+      metaSet.run('email_messages_campaign_backfill_v1', '1');
+    } catch (err) {
+      console.warn('[migrate] email_messages_campaign_backfill_v1:', err.message);
+      try {
+        metaSet.run('email_messages_campaign_backfill_v1', '1');
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   // Seed default account from BREVO_SENDER_EMAIL once
   if (!metaGet.get('email_accounts_seed_v1')?.value) {
     try {

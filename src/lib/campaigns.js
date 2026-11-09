@@ -32,21 +32,121 @@ export function displayLeadName(name, email, company) {
   return human || n || null;
 }
 
+/** Engagement stats for one campaign (any From account). */
+export function getCampaignStats(campaignId) {
+  const sent = db
+    .prepare(`SELECT COUNT(*) AS c FROM email_messages WHERE campaign_id = ?`)
+    .get(campaignId).c;
+  const delivered = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM email_messages m
+       WHERE m.campaign_id = ?
+         AND (
+           m.status IN ('delivered', 'opened', 'replied')
+           OR EXISTS (
+             SELECT 1 FROM email_events e
+             WHERE e.email_message_id = m.id AND e.event IN ('delivered', 'request')
+           )
+         )`,
+    )
+    .get(campaignId).c;
+  const opened = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM email_messages
+       WHERE campaign_id = ? AND COALESCE(open_count, 0) > 0`,
+    )
+    .get(campaignId).c;
+  const bounced = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM email_messages
+       WHERE campaign_id = ? AND status = 'bounced'`,
+    )
+    .get(campaignId).c;
+  const replies = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM email_replies r
+       WHERE EXISTS (
+         SELECT 1 FROM email_messages m
+         WHERE m.campaign_id = ?
+           AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+       )`,
+    )
+    .get(campaignId).c;
+
+  const byStep = db
+    .prepare(
+      `SELECT
+         cs.id AS step_id,
+         cs.step_order,
+         cs.delay_days,
+         cs.subject,
+         (SELECT COUNT(*) FROM email_messages m WHERE m.campaign_step_id = cs.id) AS sent,
+         (SELECT COUNT(*) FROM email_messages m
+            WHERE m.campaign_step_id = cs.id AND COALESCE(m.open_count, 0) > 0) AS opened,
+         (SELECT COUNT(*) FROM email_messages m
+            WHERE m.campaign_step_id = cs.id AND m.status = 'bounced') AS bounced,
+         (SELECT COUNT(*) FROM email_replies r
+            WHERE EXISTS (
+              SELECT 1 FROM email_messages m
+              WHERE m.campaign_step_id = cs.id
+                AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+            )) AS replies
+       FROM email_campaign_steps cs
+       WHERE cs.campaign_id = ?
+       ORDER BY cs.step_order ASC`,
+    )
+    .all(campaignId)
+    .map((row) => ({
+      ...row,
+      openRate: row.sent ? Math.round((row.opened / row.sent) * 1000) / 10 : 0,
+      replyRate: row.sent ? Math.round((row.replies / row.sent) * 1000) / 10 : 0,
+    }));
+
+  return {
+    sent,
+    delivered,
+    opened,
+    replies,
+    bounced,
+    openRate: sent ? Math.round((opened / sent) * 1000) / 10 : 0,
+    replyRate: sent ? Math.round((replies / sent) * 1000) / 10 : 0,
+    bounceRate: sent ? Math.round((bounced / sent) * 1000) / 10 : 0,
+    deliveryRate: sent ? Math.round((delivered / sent) * 1000) / 10 : 0,
+    byStep,
+  };
+}
+
 export function listCampaigns() {
-  return db
+  const rows = db
     .prepare(
       `SELECT c.*,
               a.label AS account_label,
               a.email AS account_email,
               u.name AS created_by_name,
               (SELECT COUNT(*) FROM email_campaign_leads cl WHERE cl.campaign_id = c.id) AS lead_count,
-              (SELECT COUNT(*) FROM email_campaign_steps cs WHERE cs.campaign_id = c.id) AS step_count
+              (SELECT COUNT(*) FROM email_campaign_steps cs WHERE cs.campaign_id = c.id) AS step_count,
+              (SELECT COUNT(*) FROM email_messages m WHERE m.campaign_id = c.id) AS sent_count,
+              (SELECT COUNT(*) FROM email_messages m
+                 WHERE m.campaign_id = c.id AND COALESCE(m.open_count, 0) > 0) AS opened_count,
+              (SELECT COUNT(*) FROM email_messages m
+                 WHERE m.campaign_id = c.id AND m.status = 'bounced') AS bounced_count,
+              (SELECT COUNT(*) FROM email_replies r
+                 WHERE EXISTS (
+                   SELECT 1 FROM email_messages m
+                   WHERE m.campaign_id = c.id
+                     AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+                 )) AS reply_count
        FROM email_campaigns c
        LEFT JOIN email_accounts a ON a.id = c.email_account_id
        LEFT JOIN users u ON u.id = c.created_by
        ORDER BY c.created_at DESC`,
     )
     .all();
+  return rows.map((r) => ({
+    ...r,
+    open_rate: r.sent_count ? Math.round((r.opened_count / r.sent_count) * 1000) / 10 : 0,
+    reply_rate: r.sent_count ? Math.round((r.reply_count / r.sent_count) * 1000) / 10 : 0,
+  }));
 }
 
 export function getCampaign(id) {
@@ -100,7 +200,9 @@ export function getCampaign(id) {
     )
     .get(id);
 
-  return { ...campaign, steps, leads, counts };
+  const stats = getCampaignStats(id);
+
+  return { ...campaign, steps, leads, counts, stats };
 }
 
 export function createCampaign(body, { userId }) {

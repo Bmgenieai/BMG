@@ -597,18 +597,48 @@ router.post(
   },
 );
 
-/** Preview merged template for a lead (no send). */
+/** Preview merged template for a lead (no send). Supports sample lead for campaign drafts. */
 router.post(
   '/preview',
   authRequired,
-  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  requireAnyPermission(
+    'leads:update_any',
+    'leads:update_own',
+    'email:bulk_send',
+    'email:manage_campaigns',
+  ),
   (req, res) => {
-    const { leadId, templateId, subject, htmlContent, textContent } = req.body || {};
-    const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(leadId);
-    if (!lead) return res.status(404).json({ error: 'Lead not found' });
-    if (!canUpdateLead(req.user, lead)) {
-      return res.status(403).json({ error: 'Permission denied' });
+    const {
+      leadId,
+      templateId,
+      subject,
+      htmlContent,
+      textContent,
+      sample,
+      sampleLead,
+      sampleName,
+      sampleCompany,
+    } = req.body || {};
+
+    let lead = null;
+    let previewMode = 'lead';
+    if (sample || sampleLead || !leadId) {
+      lead = {
+        name: String(sampleName || 'Alex Rivera').trim() || 'Alex Rivera',
+        company: String(sampleCompany || 'Horizon Realty').trim() || 'Horizon Realty',
+        email: 'alex.rivera@example.com',
+        country: 'US',
+        source: 'telesales',
+      };
+      previewMode = 'sample';
+    } else {
+      lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(leadId);
+      if (!lead) return res.status(404).json({ error: 'Lead not found' });
+      if (!canUpdateLead(req.user, lead) && !roleHasPermission(req.user.role, 'email:manage_campaigns')) {
+        return res.status(403).json({ error: 'Permission denied' });
+      }
     }
+
     try {
       const content = resolveEmailContent({
         subject,
@@ -618,7 +648,13 @@ router.post(
         lead,
         user: req.user,
       });
-      res.json(content);
+      res.json({
+        ...content,
+        previewMode,
+        sampleLead: previewMode === 'sample'
+          ? { name: lead.name, company: lead.company, email: lead.email }
+          : undefined,
+      });
     } catch (err) {
       res.status(err.status || 400).json({ error: err.message });
     }

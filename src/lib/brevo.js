@@ -82,10 +82,15 @@ export function firstName(fullName) {
  */
 export function applyMergeTags(text, lead, sender) {
   const sourceLabel = LEAD_SOURCES[lead.source]?.label || lead.source || '';
+  const first = firstName(lead.name);
+  const company = lead.company || 'your studio';
   const tags = {
     name: lead.name || 'there',
-    first_name: firstName(lead.name),
-    company: lead.company || 'your studio',
+    first_name: first,
+    firstName: first,
+    company,
+    company_name: company,
+    companyName: company,
     country: lead.country || '',
     email: lead.email || '',
     source: lead.source || '',
