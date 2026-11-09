@@ -958,7 +958,8 @@ router.get(
            SUM(CASE WHEN ${IG_ACTION} THEN 1 ELSE 0 END) AS instagram,
            SUM(CASE WHEN a.type IN ('instagram','instagram_message') THEN 1 ELSE 0 END) AS instagram_messages,
            SUM(CASE WHEN a.type = 'instagram_reply' THEN 1 ELSE 0 END) AS instagram_replies,
-           SUM(CASE WHEN a.type = 'meeting_scheduled' THEN 1 ELSE 0 END) AS meetings,
+           SUM(CASE WHEN a.type IN ('meeting_scheduled', 'demo_shown') THEN 1 ELSE 0 END) AS meetings,
+           SUM(CASE WHEN a.type = 'prospect_researched' THEN 1 ELSE 0 END) AS prospects_researched,
            SUM(CASE WHEN a.type = 'reply' AND a.outcome = 'positive' THEN 1 ELSE 0 END) AS positive_replies,
            SUM(CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','linkedin_followup','facebook','facebook_message','instagram','instagram_message','note') THEN 1 ELSE 0 END) AS total_outreach,
            COUNT(DISTINCT CASE WHEN a.type IN ('call','call_attempted','call_connected','whatsapp','email','email_sent','email_followup','linkedin','linkedin_connection_sent','linkedin_message','facebook','facebook_message','instagram','instagram_message','note','reply','linkedin_reply','facebook_reply','instagram_reply') THEN a.lead_id END) AS leads_touched
@@ -1104,7 +1105,8 @@ router.get(
       const paid = num(paidMap.get(u.id)?.paid);
       const leadsAdded = num(a.leads_added);
       const leadsTouched = num(act.leads_touched);
-      const prospectsScraped = num(a.leads_manual);
+      // Manual new leads + explicit "prospect researched" logs (Sendio scrape, etc.)
+      const prospectsScraped = num(a.leads_manual) + num(act.prospects_researched);
       const emailsUploaded = num(a.leads_csv);
       const crmEmailsSent = num(crm.crm_emails_sent);
       const crmEmailsOpened = num(crm.crm_emails_opened);
@@ -1121,6 +1123,7 @@ router.get(
           : 0;
       const emailReplies = num(replyMap.get(u.id)?.replies);
       const positiveReplies = num(act.positive_replies);
+      // Meeting booked log, demo shown, or stage moved to demo
       const meetingsBooked = num(act.meetings) + num(mv.to_demo);
       return {
         id: u.id,
@@ -1947,20 +1950,38 @@ router.get(
         .all(limit);
     } else if (metric === 'prospects_scraped' || metric === 'prospects_researched') {
       title = 'Prospects scraped / researched';
-      const uClause = userId ? ` AND l.created_by = '${userId}'` : '';
-      items = db
+      const uLead = userId ? ` AND l.created_by = '${userId}'` : '';
+      const uAct = userId ? ` AND a.user_id = '${userId}'` : '';
+      const leadRows = db
         .prepare(
           `SELECT l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
                   l.status AS lead_status, l.business_type, l.state, l.source, l.created_at AS date,
-                  u.name AS user_name
+                  u.name AS user_name, 'new_lead' AS subject
            FROM leads l
            LEFT JOIN users u ON u.id = l.created_by
            WHERE (l.import_batch_id IS NULL OR l.import_batch_id = '')
-             ${win('l.created_at')} ${uClause} ${stateClause}
+             ${win('l.created_at')} ${uLead} ${stateClause}
            ORDER BY l.created_at DESC
            LIMIT ?`,
         )
         .all(limit);
+      const actRows = db
+        .prepare(
+          `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
+                  l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                  l.status AS lead_status, l.business_type, l.state,
+                  u.name AS user_name
+           FROM lead_activities a
+           LEFT JOIN leads l ON l.id = a.lead_id
+           LEFT JOIN users u ON u.id = a.user_id
+           WHERE a.type = 'prospect_researched' ${win('a.created_at')} ${uAct} ${stateClause}
+           ORDER BY a.created_at DESC
+           LIMIT ?`,
+        )
+        .all(limit);
+      items = [...leadRows, ...actRows]
+        .sort((x, y) => String(y.date || '').localeCompare(String(x.date || '')))
+        .slice(0, limit);
     } else if (metric === 'emails_uploaded') {
       title = 'Emails uploaded to CRM';
       const uClause = userId ? ` AND l.created_by = '${userId}'` : '';
@@ -2224,8 +2245,9 @@ router.get(
         to_demo: "(a.outcome IN ('demo_scheduled','demo_booked') OR a.summary LIKE '%→ demo_scheduled%' OR a.summary LIKE '%→ demo_booked%')",
         demos_booked: "(a.outcome IN ('demo_scheduled','demo_booked') OR a.summary LIKE '%→ demo_scheduled%' OR a.summary LIKE '%→ demo_booked%')",
         to_trial: "(a.outcome = 'trial' OR a.summary LIKE '%→ trial%')",
-        meetings: "a.type = 'meeting_scheduled'",
-        meetings_requested: "(a.type = 'meeting_scheduled' OR a.summary LIKE '%meeting%')",
+        meetings: "a.type IN ('meeting_scheduled','demo_shown')",
+        meetings_requested: "a.type IN ('meeting_scheduled','demo_shown')",
+        meetings_booked: "a.type IN ('meeting_scheduled','demo_shown')",
       };
       const clause = map[metric] || "a.type = 'status_change'";
       title = String(metric).replace(/_/g, ' ');

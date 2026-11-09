@@ -318,6 +318,7 @@ export const ACTIVITY_TYPES = [
   'meeting_scheduled',
   'reply',
   'demo_shown',
+  'prospect_researched',
   'note',
   'whatsapp',
   'follow_up_scheduled',
