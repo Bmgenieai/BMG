@@ -693,9 +693,49 @@ export function migrate() {
     /* exists */
   }
 
+  try {
+    db.exec(`ALTER TABLE email_campaign_leads ADD COLUMN variant_key TEXT`);
+  } catch {
+    /* exists */
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS email_campaign_step_variants (
+      id TEXT PRIMARY KEY,
+      campaign_step_id TEXT NOT NULL REFERENCES email_campaign_steps(id) ON DELETE CASCADE,
+      variant_key TEXT NOT NULL,
+      label TEXT,
+      content_category TEXT,
+      subject TEXT,
+      html_content TEXT,
+      text_content TEXT,
+      template_id TEXT,
+      weight_pct REAL NOT NULL DEFAULT 0,
+      sort_order INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(campaign_step_id, variant_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_campaign_step_variants_step
+      ON email_campaign_step_variants(campaign_step_id, sort_order);
+  `);
+
+  const scheduledVariantAlters = [
+    `ALTER TABLE scheduled_emails ADD COLUMN campaign_variant_id TEXT`,
+    `ALTER TABLE scheduled_emails ADD COLUMN variant_key TEXT`,
+  ];
+  for (const sql of scheduledVariantAlters) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* exists */
+    }
+  }
+
   const messageCampaignAlters = [
     `ALTER TABLE email_messages ADD COLUMN campaign_id TEXT`,
     `ALTER TABLE email_messages ADD COLUMN campaign_step_id TEXT`,
+    `ALTER TABLE email_messages ADD COLUMN campaign_variant_id TEXT`,
+    `ALTER TABLE email_messages ADD COLUMN variant_key TEXT`,
   ];
   for (const sql of messageCampaignAlters) {
     try {

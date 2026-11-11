@@ -1193,6 +1193,7 @@ router.get(
         key,
         label: campaigns.CONTENT_CATEGORY_LABELS[key],
       })),
+      variantKeys: campaigns.VARIANT_KEYS,
     });
   },
 );

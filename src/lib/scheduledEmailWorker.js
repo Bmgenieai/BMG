@@ -113,6 +113,11 @@ async function processOne(row) {
       }
     }
 
+    const variantLabel = row.variant_key ? ` (variant ${row.variant_key})` : '';
+    if (row.campaign_id) {
+      summaryPrefix = `${summaryPrefix}${variantLabel}`;
+    }
+
     recordEmailSend({
       leadId: lead.id,
       userId: row.user_id,
@@ -127,6 +132,8 @@ async function processOne(row) {
       emailAccountId: accountId,
       campaignId: row.campaign_id || null,
       campaignStepId: row.campaign_step_id || null,
+      campaignVariantId: row.campaign_variant_id || null,
+      variantKey: row.variant_key || null,
     });
 
     claimLeadIfUnassigned(lead.id, row.user_id);
