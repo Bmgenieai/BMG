@@ -974,13 +974,17 @@ router.get(
       )
       .all(from, to);
 
+    // First = non-campaign or campaign email 1; Follow-up = campaign email 2+
     const crmEmailAgg = db
       .prepare(
         `SELECT m.user_id,
            COUNT(*) AS crm_emails_sent,
-           SUM(CASE WHEN COALESCE(m.open_count, 0) > 0 THEN 1 ELSE 0 END) AS crm_emails_opened
+           SUM(CASE WHEN COALESCE(m.open_count, 0) > 0 THEN 1 ELSE 0 END) AS crm_emails_opened,
+           SUM(CASE WHEN cs.step_order IS NULL OR cs.step_order <= 1 THEN 1 ELSE 0 END) AS crm_first_emails,
+           SUM(CASE WHEN cs.step_order > 1 THEN 1 ELSE 0 END) AS crm_followup_emails
          FROM email_messages m
          LEFT JOIN leads l ON l.id = m.lead_id
+         LEFT JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
          WHERE m.user_id IS NOT NULL
            AND ${DT('m.sent_at')} >= datetime(?)
            AND ${DT('m.sent_at')} < datetime(?)
@@ -1110,6 +1114,8 @@ router.get(
       const emailsUploaded = num(a.leads_csv);
       const crmEmailsSent = num(crm.crm_emails_sent);
       const crmEmailsOpened = num(crm.crm_emails_opened);
+      const crmFirstEmails = num(crm.crm_first_emails);
+      const crmFollowupEmails = num(crm.crm_followup_emails);
       const manualEmailsSent = num(act.manual_emails);
       const linkedinConnectionSent = num(act.linkedin_connection_sent);
       const linkedinMessages = num(act.linkedin_messages);
@@ -1136,6 +1142,8 @@ router.get(
         emailsUploaded,
         crmEmailsSent,
         crmEmailsOpened,
+        crmFirstEmails,
+        crmFollowupEmails,
         manualEmailsSent,
         linkedinConnectionSent,
         linkedinMessages,
@@ -1200,6 +1208,8 @@ router.get(
       emailsUploaded: sumField('emailsUploaded'),
       crmEmailsSent: totalCrmSent,
       crmEmailsOpened: totalCrmOpened,
+      crmFirstEmails: sumField('crmFirstEmails'),
+      crmFollowupEmails: sumField('crmFollowupEmails'),
       manualEmailsSent: sumField('manualEmailsSent'),
       linkedinConnectionSent: sumField('linkedinConnectionSent'),
       linkedinMessages: sumField('linkedinMessages'),

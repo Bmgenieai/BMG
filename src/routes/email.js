@@ -38,8 +38,14 @@ import {
   recordEmailSend,
   sendCrmReplyToInbound,
 } from '../lib/emailLog.js';
+import { resolveAnalyticsBounds } from '../lib/periodBounds.js';
 
 const router = Router();
+
+/** Normalize ISO timestamps for SQLite datetime() comparisons. */
+const DT = (col) => `datetime(REPLACE(REPLACE(${col}, 'T', ' '), 'Z', ''))`;
+/** Calendar day in Asia/Karachi (UTC+5, no DST) for daily rollups. */
+const DAY_KARACHI = (col) => `date(datetime(REPLACE(REPLACE(${col}, 'T', ' '), 'Z', ''), '+5 hours'))`;
 
 function resolveEmailContent({
   subject,
@@ -953,16 +959,33 @@ router.get(
       userId = String(req.query.userId);
     }
 
+    // Default overall (all-time) so existing totals stay until a period/range is chosen.
+    const bounds = resolveAnalyticsBounds({
+      period: req.query.period || 'overall',
+      from: req.query.from,
+      to: req.query.to,
+      fromYmd: req.query.fromYmd,
+      toYmd: req.query.toYmd,
+    });
+    const isOverall = bounds.period === 'overall';
+    const sentDateClause = isOverall
+      ? ''
+      : ` AND ${DT('m.sent_at')} >= datetime(?) AND ${DT('m.sent_at')} < datetime(?)`;
+    const replyDateClause = isOverall
+      ? ''
+      : ` AND ${DT('r.received_at')} >= datetime(?) AND ${DT('r.received_at')} < datetime(?)`;
+
     const acct = emailAccountMatch(account, { alias: 'm' });
     const userClause = userId ? ' AND m.user_id = ?' : '';
-    const params = [...acct.params];
-    if (userId) params.push(userId);
+    const msgParams = [...acct.params];
+    if (userId) msgParams.push(userId);
+    if (!isOverall) msgParams.push(bounds.from, bounds.to);
 
     const sent = db
       .prepare(
-        `SELECT COUNT(*) AS c FROM email_messages m WHERE 1=1${acct.sql}${userClause}`,
+        `SELECT COUNT(*) AS c FROM email_messages m WHERE 1=1${acct.sql}${userClause}${sentDateClause}`,
       )
-      .get(...params).c;
+      .get(...msgParams).c;
     const delivered = db
       .prepare(
         `SELECT COUNT(*) AS c FROM email_messages m
@@ -972,15 +995,19 @@ router.get(
                SELECT 1 FROM email_events e
                WHERE e.email_message_id = m.id AND e.event IN ('delivered', 'request')
              )
-           )${acct.sql}${userClause}`,
+           )${acct.sql}${userClause}${sentDateClause}`,
       )
-      .get(...params).c;
+      .get(...msgParams).c;
     const opened = db
       .prepare(
         `SELECT COUNT(*) AS c FROM email_messages m
-         WHERE COALESCE(m.open_count, 0) > 0${acct.sql}${userClause}`,
+         WHERE COALESCE(m.open_count, 0) > 0${acct.sql}${userClause}${sentDateClause}`,
       )
-      .get(...params).c;
+      .get(...msgParams).c;
+
+    const replyParams = [...acct.params];
+    if (userId) replyParams.push(userId);
+    if (!isOverall) replyParams.push(bounds.from, bounds.to);
     const replies = db
       .prepare(
         `SELECT COUNT(*) AS c FROM email_replies r
@@ -988,9 +1015,9 @@ router.get(
            SELECT 1 FROM email_messages m
            WHERE (m.id = r.email_message_id OR m.lead_id = r.lead_id)
              ${acct.sql}${userClause}
-         )`,
+         )${replyDateClause}`,
       )
-      .get(...params).c;
+      .get(...replyParams).c;
 
     const user = userId
       ? db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).get(userId)
@@ -999,32 +1026,96 @@ router.get(
     let team = [];
     if (canTeam && account) {
       const teamAcct = emailAccountMatch(account, { alias: 'm' });
+      const teamSentDate = isOverall
+        ? ''
+        : ` AND ${DT('m.sent_at')} >= datetime(?) AND ${DT('m.sent_at')} < datetime(?)`;
+      const teamReplyDate = isOverall
+        ? ''
+        : ` AND ${DT('r.received_at')} >= datetime(?) AND ${DT('r.received_at')} < datetime(?)`;
+      const teamParams = [
+        ...teamAcct.params,
+        ...(isOverall ? [] : [bounds.from, bounds.to]),
+        ...teamAcct.params,
+        ...(isOverall ? [] : [bounds.from, bounds.to]),
+        ...teamAcct.params,
+        ...(isOverall ? [] : [bounds.from, bounds.to]),
+      ];
       team = db
         .prepare(
           `SELECT u.id, u.name,
                   (SELECT COUNT(*) FROM email_messages m
-                     WHERE m.user_id = u.id ${teamAcct.sql}) AS sent,
+                     WHERE m.user_id = u.id ${teamAcct.sql}${teamSentDate}) AS sent,
                   (SELECT COUNT(*) FROM email_messages m
-                     WHERE m.user_id = u.id AND COALESCE(m.open_count, 0) > 0 ${teamAcct.sql}) AS opened,
+                     WHERE m.user_id = u.id AND COALESCE(m.open_count, 0) > 0 ${teamAcct.sql}${teamSentDate}) AS opened,
                   (SELECT COUNT(*) FROM email_replies r
                      WHERE EXISTS (
                        SELECT 1 FROM email_messages m
                        WHERE m.user_id = u.id
                          AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
                          ${teamAcct.sql}
-                     )) AS replies
+                     )${teamReplyDate}) AS replies
            FROM users u
            WHERE u.role = 'telesales' AND u.is_active = 1
            ORDER BY u.name COLLATE NOCASE`,
         )
-        .all(...teamAcct.params, ...teamAcct.params, ...teamAcct.params);
+        .all(...teamParams);
     }
+
+    // Daily rollup: how many emails went out (and opened) each calendar day.
+    const byDayMap = new Map();
+    const dayRows = db
+      .prepare(
+        `SELECT ${DAY_KARACHI('m.sent_at')} AS day,
+                COUNT(*) AS sent,
+                SUM(CASE WHEN COALESCE(m.open_count, 0) > 0 THEN 1 ELSE 0 END) AS opened
+         FROM email_messages m
+         WHERE 1=1${acct.sql}${userClause}${sentDateClause}
+         GROUP BY day
+         HAVING day IS NOT NULL
+         ORDER BY day DESC
+         LIMIT 366`,
+      )
+      .all(...msgParams);
+    for (const row of dayRows) {
+      byDayMap.set(row.day, {
+        day: row.day,
+        sent: row.sent || 0,
+        opened: row.opened || 0,
+        replies: 0,
+      });
+    }
+    const replyDayRows = db
+      .prepare(
+        `SELECT ${DAY_KARACHI('r.received_at')} AS day, COUNT(*) AS replies
+         FROM email_replies r
+         WHERE EXISTS (
+           SELECT 1 FROM email_messages m
+           WHERE (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+             ${acct.sql}${userClause}
+         )${replyDateClause}
+         GROUP BY day
+         HAVING day IS NOT NULL
+         ORDER BY day DESC
+         LIMIT 366`,
+      )
+      .all(...replyParams);
+    for (const row of replyDayRows) {
+      const cur = byDayMap.get(row.day) || { day: row.day, sent: 0, opened: 0, replies: 0 };
+      cur.replies = row.replies || 0;
+      byDayMap.set(row.day, cur);
+    }
+    const byDay = [...byDayMap.values()].sort((a, b) => String(b.day).localeCompare(String(a.day)));
 
     res.json({
       user,
       account,
       accounts,
       scope: userId ? 'me' : 'account',
+      period: bounds.period,
+      label: bounds.label,
+      fromYmd: bounds.fromYmd,
+      toYmd: bounds.toYmd,
+      timezone: bounds.timezone,
       stats: {
         sent,
         delivered,
@@ -1035,6 +1126,7 @@ router.get(
         deliveryRate: sent ? Math.round((delivered / sent) * 1000) / 10 : 0,
       },
       team,
+      byDay,
     });
   },
 );
@@ -1095,7 +1187,22 @@ router.get(
   authRequired,
   requirePermission('email:manage_campaigns'),
   (_req, res) => {
-    res.json({ campaigns: campaigns.listCampaigns() });
+    res.json({
+      campaigns: campaigns.listCampaigns(),
+      contentCategories: campaigns.CONTENT_CATEGORIES.map((key) => ({
+        key,
+        label: campaigns.CONTENT_CATEGORY_LABELS[key],
+      })),
+    });
+  },
+);
+
+router.get(
+  '/campaigns/category-stats',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    res.json(campaigns.getCategoryStats(req.query));
   },
 );
 

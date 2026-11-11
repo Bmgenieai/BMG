@@ -5,10 +5,36 @@ import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
 import { canUpdateLead } from './permissions.js';
 import { resolveSendAccount } from './emailAccounts.js';
+import { resolveAnalyticsBounds } from './periodBounds.js';
+
+/** Email format tags — used to compare open/reply rates by style. */
+export const CONTENT_CATEGORIES = ['plain_text', 'image', 'gif', 'video'];
+
+export const CONTENT_CATEGORY_LABELS = {
+  plain_text: 'Plain text',
+  image: 'Image',
+  gif: 'GIF',
+  video: 'Video',
+};
+
+export function normalizeContentCategory(raw) {
+  const v = String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+  if (!v) return null;
+  if (CONTENT_CATEGORIES.includes(v)) return v;
+  if (v === 'text' || v === 'plaintext') return 'plain_text';
+  if (v === 'static_image' || v === 'static') return 'image';
+  if (v === 'youtube' || v === 'video_thumbnail') return 'video';
+  return null;
+}
 
 function sqlDate(d) {
   return d.toISOString().slice(0, 19).replace('T', ' ');
 }
+
+const DT = (col) => `datetime(REPLACE(REPLACE(${col}, 'T', ' '), 'Z', ''))`;
 
 /** Prefer a real name over a stored email (common after CSV imports without Name). */
 export function displayLeadName(name, email, company) {
@@ -80,6 +106,7 @@ export function getCampaignStats(campaignId) {
          cs.step_order,
          cs.delay_days,
          cs.subject,
+         cs.content_category,
          (SELECT COUNT(*) FROM email_messages m WHERE m.campaign_step_id = cs.id) AS sent,
          (SELECT COUNT(*) FROM email_messages m
             WHERE m.campaign_step_id = cs.id AND COALESCE(m.open_count, 0) > 0) AS opened,
@@ -98,6 +125,9 @@ export function getCampaignStats(campaignId) {
     .all(campaignId)
     .map((row) => ({
       ...row,
+      content_category_label:
+        CONTENT_CATEGORY_LABELS[row.content_category] ||
+        (row.content_category ? row.content_category : 'Uncategorized'),
       openRate: row.sent ? Math.round((row.opened / row.sent) * 1000) / 10 : 0,
       replyRate: row.sent ? Math.round((row.replies / row.sent) * 1000) / 10 : 0,
     }));
@@ -135,7 +165,20 @@ export function listCampaigns() {
                    SELECT 1 FROM email_messages m
                    WHERE m.campaign_id = c.id
                      AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
-                 )) AS reply_count
+                 )) AS reply_count,
+              (SELECT COUNT(*) FROM email_messages m
+                 JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+                 WHERE m.campaign_id = c.id AND cs.step_order = 1) AS sent_step_1,
+              (SELECT COUNT(*) FROM email_messages m
+                 JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+                 WHERE m.campaign_id = c.id AND cs.step_order = 2) AS sent_step_2,
+              (SELECT COUNT(*) FROM email_messages m
+                 JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+                 WHERE m.campaign_id = c.id AND cs.step_order = 3) AS sent_step_3,
+              (SELECT MIN(s.scheduled_at) FROM scheduled_emails s
+                 WHERE s.campaign_id = c.id
+                   AND s.status IN ('pending', 'sending')
+                   AND s.scheduled_at IS NOT NULL) AS next_follow_up_at
        FROM email_campaigns c
        LEFT JOIN email_accounts a ON a.id = c.email_account_id
        LEFT JOIN users u ON u.id = c.created_by
@@ -277,8 +320,8 @@ function replaceSteps(campaignId, steps) {
   db.prepare(`DELETE FROM email_campaign_steps WHERE campaign_id = ?`).run(campaignId);
   const insert = db.prepare(
     `INSERT INTO email_campaign_steps (
-       id, campaign_id, step_order, delay_days, subject, html_content, text_content, template_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       id, campaign_id, step_order, delay_days, subject, html_content, text_content, template_id, content_category
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   steps.forEach((s, i) => {
     const order = Number(s.step_order || s.stepOrder || i + 1) || i + 1;
@@ -287,13 +330,21 @@ function replaceSteps(campaignId, steps) {
     const html = s.html_content ?? s.htmlContent ?? null;
     const text = s.text_content ?? s.textContent ?? null;
     const templateId = s.template_id || s.templateId || null;
+    const category = normalizeContentCategory(s.content_category ?? s.contentCategory);
+    if (!category) {
+      const err = new Error(
+        `Email ${order}: pick a format (Plain text, Image, GIF, or Video)`,
+      );
+      err.status = 400;
+      throw err;
+    }
     if (!templateId && !subject) {
-      const err = new Error(`Step ${order}: subject or template required`);
+      const err = new Error(`Email ${order}: subject or template required`);
       err.status = 400;
       throw err;
     }
     if (!templateId && !html && !text) {
-      const err = new Error(`Step ${order}: body required`);
+      const err = new Error(`Email ${order}: body required`);
       err.status = 400;
       throw err;
     }
@@ -306,8 +357,97 @@ function replaceSteps(campaignId, steps) {
       html,
       text,
       templateId,
+      category,
     );
   });
+}
+
+/**
+ * Open / reply rates by email format across campaigns (easy comparison table).
+ */
+export function getCategoryStats(query = {}) {
+  const bounds = resolveAnalyticsBounds({
+    period: query.period || 'overall',
+    from: query.from,
+    to: query.to,
+    fromYmd: query.fromYmd,
+    toYmd: query.toYmd,
+  });
+  const isOverall = bounds.period === 'overall';
+  const dateClause = isOverall
+    ? ''
+    : ` AND ${DT('m.sent_at')} >= datetime(?) AND ${DT('m.sent_at')} < datetime(?)`;
+  const params = isOverall ? [] : [bounds.from, bounds.to];
+
+  const sentRows = db
+    .prepare(
+      `SELECT
+         COALESCE(cs.content_category, '') AS content_category,
+         COUNT(*) AS sent,
+         SUM(CASE WHEN COALESCE(m.open_count, 0) > 0 THEN 1 ELSE 0 END) AS opened,
+         SUM(CASE WHEN m.status = 'bounced' THEN 1 ELSE 0 END) AS bounced
+       FROM email_messages m
+       LEFT JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+       WHERE m.campaign_id IS NOT NULL${dateClause}
+       GROUP BY COALESCE(cs.content_category, '')`,
+    )
+    .all(...params);
+
+  const replyRows = db
+    .prepare(
+      `SELECT
+         COALESCE(cs.content_category, '') AS content_category,
+         COUNT(*) AS replies
+       FROM email_replies r
+       JOIN email_messages m ON m.id = r.email_message_id
+       LEFT JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+       WHERE m.campaign_id IS NOT NULL${dateClause}
+       GROUP BY COALESCE(cs.content_category, '')`,
+    )
+    .all(...params);
+
+  const replyMap = new Map(replyRows.map((r) => [r.content_category || '', r.replies || 0]));
+  const byKey = new Map();
+  for (const row of sentRows) {
+    const key = row.content_category || '';
+    const sent = row.sent || 0;
+    const opened = row.opened || 0;
+    const replies = replyMap.get(key) || 0;
+    byKey.set(key, {
+      content_category: key || null,
+      label: CONTENT_CATEGORY_LABELS[key] || (key ? key : 'Uncategorized'),
+      sent,
+      opened,
+      replies,
+      bounced: row.bounced || 0,
+      openRate: sent ? Math.round((opened / sent) * 1000) / 10 : 0,
+      replyRate: sent ? Math.round((replies / sent) * 1000) / 10 : 0,
+    });
+  }
+
+  const empty = (key) => ({
+    content_category: key || null,
+    label: CONTENT_CATEGORY_LABELS[key] || 'Uncategorized',
+    sent: 0,
+    opened: 0,
+    replies: replyMap.get(key || '') || 0,
+    bounced: 0,
+    openRate: 0,
+    replyRate: 0,
+  });
+
+  const ordered = [
+    ...CONTENT_CATEGORIES.map((key) => byKey.get(key) || empty(key)),
+    ...(byKey.has('') ? [byKey.get('')] : []),
+  ];
+
+  return {
+    period: bounds.period,
+    label: bounds.label,
+    fromYmd: bounds.fromYmd,
+    toYmd: bounds.toYmd,
+    categories: ordered,
+  };
 }
 
 export function addLeads(campaignId, leadIds, { user, skipPerm = false } = {}) {

@@ -100,6 +100,19 @@ async function processOne(row) {
       sender,
     });
 
+    // Step 1 = first email; step 2+ = follow-up (so reports can split them).
+    let summaryPrefix = row.campaign_id ? 'Campaign email' : 'Brevo scheduled';
+    let source = row.campaign_id ? 'campaign' : 'scheduled';
+    if (row.campaign_id && row.campaign_step_id) {
+      const step = db
+        .prepare(`SELECT step_order FROM email_campaign_steps WHERE id = ?`)
+        .get(row.campaign_step_id);
+      if (step && Number(step.step_order) >= 2) {
+        summaryPrefix = 'Campaign follow-up';
+        source = 'followup';
+      }
+    }
+
     recordEmailSend({
       leadId: lead.id,
       userId: row.user_id,
@@ -107,8 +120,8 @@ async function processOne(row) {
       toEmail: lead.email,
       templateId: row.template_id || null,
       brevoMessageId: result?.messageId || result?.message_id || null,
-      source: row.campaign_id ? 'campaign' : 'scheduled',
-      summaryPrefix: row.campaign_id ? 'Campaign email' : 'Brevo scheduled',
+      source,
+      summaryPrefix,
       htmlContent: content.htmlContent || null,
       textContent: content.textContent || null,
       emailAccountId: accountId,

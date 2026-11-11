@@ -687,6 +687,12 @@ export function migrate() {
     /* exists */
   }
 
+  try {
+    db.exec(`ALTER TABLE email_campaign_steps ADD COLUMN content_category TEXT`);
+  } catch {
+    /* exists */
+  }
+
   const messageCampaignAlters = [
     `ALTER TABLE email_messages ADD COLUMN campaign_id TEXT`,
     `ALTER TABLE email_messages ADD COLUMN campaign_step_id TEXT`,
