@@ -1899,15 +1899,22 @@ router.get(
       metric === 'emails_sent' ||
       metric === 'emails' ||
       metric === 'crm_emails_sent' ||
-      metric === 'total_email_outreach'
+      metric === 'total_email_outreach' ||
+      metric === 'crm_first_emails' ||
+      metric === 'first_emails'
     ) {
-      title =
-        metric === 'crm_emails_sent'
+      const firstOnly = metric === 'crm_first_emails' || metric === 'first_emails';
+      title = firstOnly
+        ? 'First emails'
+        : metric === 'crm_emails_sent'
           ? 'CRM emails sent'
           : metric === 'total_email_outreach'
             ? 'Total email outreach'
             : 'Emails sent';
       const uClause = userId ? ` AND m.user_id = '${userId}'` : '';
+      const stepClause = firstOnly
+        ? ' AND (cs.step_order IS NULL OR cs.step_order <= 1)'
+        : '';
       items = db
         .prepare(
           `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
@@ -1918,12 +1925,13 @@ router.get(
            FROM email_messages m
            LEFT JOIN leads l ON l.id = m.lead_id
            LEFT JOIN users u ON u.id = m.user_id
-           WHERE 1=1 ${win('m.sent_at')} ${uClause} ${accountClause} ${stateClause}
+           LEFT JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+           WHERE 1=1 ${win('m.sent_at')} ${uClause} ${accountClause} ${stateClause}${stepClause}
            ORDER BY m.sent_at DESC
            LIMIT ?`,
         )
         .all(limit);
-      if (items.length === 0 && !emailAccountId && metric !== 'crm_emails_sent') {
+      if (items.length === 0 && !emailAccountId && metric !== 'crm_emails_sent' && !firstOnly) {
         // Fallback to lead_activities for email (no account filter available)
         const actUClause = userId ? ` AND a.user_id = '${userId}'` : '';
         items = db
@@ -2009,23 +2017,49 @@ router.get(
            LIMIT ?`,
         )
         .all(limit);
-    } else if (metric === 'email_followups') {
-      title = 'Email follow-ups sent';
-      const uClause = userId ? ` AND a.user_id = '${userId}'` : '';
+    } else if (
+      metric === 'email_followups' ||
+      metric === 'crm_followup_emails' ||
+      metric === 'followup_emails'
+    ) {
+      // Same source as BD Working "Follow-up emails": campaign step 2+ in email_messages.
+      title = 'Follow-up emails';
+      const uClause = userId ? ` AND m.user_id = '${userId}'` : '';
       items = db
         .prepare(
-          `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
+          `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
+                  m.open_count, m.reply_count, cs.step_order,
                   l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
                   l.status AS lead_status, l.business_type, l.state,
                   u.name AS user_name
-           FROM lead_activities a
-           LEFT JOIN leads l ON l.id = a.lead_id
-           LEFT JOIN users u ON u.id = a.user_id
-           WHERE a.type = 'email_followup' ${win('a.created_at')} ${uClause}
-           ORDER BY a.created_at DESC
+           FROM email_messages m
+           JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+           LEFT JOIN leads l ON l.id = m.lead_id
+           LEFT JOIN users u ON u.id = m.user_id
+           WHERE cs.step_order > 1
+             ${win('m.sent_at')} ${uClause} ${accountClause} ${stateClause}
+           ORDER BY m.sent_at DESC
            LIMIT ?`,
         )
         .all(limit);
+      if (items.length === 0) {
+        // Manual / logged follow-ups (activity type)
+        const actUClause = userId ? ` AND a.user_id = '${userId}'` : '';
+        items = db
+          .prepare(
+            `SELECT a.id, a.type, a.summary AS subject, a.created_at AS date,
+                    l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                    l.status AS lead_status, l.business_type, l.state,
+                    u.name AS user_name
+             FROM lead_activities a
+             LEFT JOIN leads l ON l.id = a.lead_id
+             LEFT JOIN users u ON u.id = a.user_id
+             WHERE a.type = 'email_followup' ${win('a.created_at')} ${actUClause} ${stateClause}
+             ORDER BY a.created_at DESC
+             LIMIT ?`,
+          )
+          .all(limit);
+      }
     } else if (metric === 'email_delivered' || metric === 'delivered') {
       title = 'Emails delivered';
       const uClause = userId ? ` AND m.user_id = '${userId}'` : '';
