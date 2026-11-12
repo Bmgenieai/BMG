@@ -5,6 +5,10 @@ import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
 import { canUpdateLead } from './permissions.js';
 import { resolveSendAccount } from './emailAccounts.js';
+import {
+  DEFAULT_CAMPAIGN_TIMEZONE,
+  normalizeCampaignTimezone,
+} from './campaignTimezones.js';
 import { resolveAnalyticsBounds } from './periodBounds.js';
 import { resolveCampaignSendAt, toScheduleSql } from './campaignSchedule.js';
 
@@ -532,11 +536,15 @@ export function createCampaign(body, { userId }) {
     accountId = resolveSendAccount(null).accountId;
   }
 
+  const timezone = normalizeCampaignTimezone(
+    body.timezone || body.timeZone || DEFAULT_CAMPAIGN_TIMEZONE,
+  );
+
   const id = uuid();
   db.prepare(
-    `INSERT INTO email_campaigns (id, name, status, email_account_id, created_by)
-     VALUES (?, ?, 'draft', ?, ?)`,
-  ).run(id, name, accountId, userId);
+    `INSERT INTO email_campaigns (id, name, status, email_account_id, timezone, created_by)
+     VALUES (?, ?, 'draft', ?, ?, ?)`,
+  ).run(id, name, accountId, timezone, userId);
 
   const steps = Array.isArray(body.steps) ? body.steps : [];
   if (steps.length) {
@@ -572,11 +580,16 @@ export function updateCampaign(id, body) {
     if (accountId) resolveSendAccount(accountId);
   }
 
+  let timezone = normalizeCampaignTimezone(row.timezone || DEFAULT_CAMPAIGN_TIMEZONE);
+  if (body.timezone !== undefined || body.timeZone !== undefined) {
+    timezone = normalizeCampaignTimezone(body.timezone ?? body.timeZone);
+  }
+
   db.prepare(
     `UPDATE email_campaigns
-     SET name = ?, email_account_id = ?, updated_at = datetime('now')
+     SET name = ?, email_account_id = ?, timezone = ?, updated_at = datetime('now')
      WHERE id = ?`,
-  ).run(name, accountId, id);
+  ).run(name, accountId, timezone, id);
 
   if (Array.isArray(body.steps)) {
     replaceSteps(id, body.steps);
@@ -1055,7 +1068,11 @@ function scheduleStepsForLeads(campaignId, leadIds, { userId, batchId = null, no
         const variant =
           (step.variants || []).find((v) => v.variant_key === vKey) || step.variants?.[0];
         if (!variant) continue;
-        const when = resolveCampaignSendAt(perLeadBase, Number(step.delay_days) || 0);
+        const when = resolveCampaignSendAt(
+          perLeadBase,
+          Number(step.delay_days) || 0,
+          campaign.timezone || DEFAULT_CAMPAIGN_TIMEZONE,
+        );
         // Skip if already sent/pending for this step+lead
         const exists = db
           .prepare(
@@ -1102,6 +1119,7 @@ export function reschedulePendingCampaignSends() {
       `SELECT s.id, s.campaign_id, s.campaign_step_id, s.lead_id,
               cs.delay_days,
               c.launched_at,
+              c.timezone AS campaign_timezone,
               cl.enrolled_at
        FROM scheduled_emails s
        JOIN email_campaigns c ON c.id = s.campaign_id
@@ -1127,6 +1145,7 @@ export function reschedulePendingCampaignSends() {
       const when = resolveCampaignSendAt(
         Number.isNaN(base.getTime()) ? new Date() : base,
         Number(row.delay_days) || 0,
+        row.campaign_timezone || DEFAULT_CAMPAIGN_TIMEZONE,
       );
       const sql = toScheduleSql(when);
       const r = upd.run(sql, row.id);

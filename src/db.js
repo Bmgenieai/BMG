@@ -699,6 +699,14 @@ export function migrate() {
     /* exists */
   }
 
+  try {
+    db.exec(
+      `ALTER TABLE email_campaigns ADD COLUMN timezone TEXT NOT NULL DEFAULT 'America/New_York'`,
+    );
+  } catch {
+    /* exists */
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS email_campaign_step_variants (
       id TEXT PRIMARY KEY,

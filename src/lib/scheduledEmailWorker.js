@@ -8,25 +8,10 @@ import {
 import { resolveSendAccount } from './emailAccounts.js';
 import { recordEmailSend } from './emailLog.js';
 import { claimLeadIfUnassigned } from './leadAutomation.js';
-import {
-  isWeekendYmd,
-  partsInTz,
-  PEAK_START_HOUR,
-  PEAK_END_HOUR,
-  ymdInTz,
-} from './campaignSchedule.js';
+import { isCampaignSendWindowNow } from './campaignTimezones.js';
 
 const TICK_MS = 30_000;
 const BATCH_LIMIT = 15;
-
-/** Campaign sends only go out Mon–Fri during 7pm–midnight PKT. */
-function campaignSendAllowedNow() {
-  const now = new Date();
-  const ymd = ymdInTz(now);
-  if (isWeekendYmd(ymd)) return false;
-  const { hour } = partsInTz(now);
-  return hour >= PEAK_START_HOUR && hour < PEAK_END_HOUR;
-}
 
 function senderFromUserId(userId, emailAccountId = null) {
   const user = db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).get(userId);
@@ -200,17 +185,19 @@ async function processOne(row) {
 export async function processDueScheduledEmails() {
   const due = db
     .prepare(
-      `SELECT * FROM scheduled_emails
-       WHERE status = 'pending'
-         AND datetime(REPLACE(REPLACE(scheduled_at, 'T', ' '), 'Z', '')) <= datetime('now')
-       ORDER BY scheduled_at ASC
+      `SELECT s.*, c.timezone AS campaign_timezone
+       FROM scheduled_emails s
+       LEFT JOIN email_campaigns c ON c.id = s.campaign_id
+       WHERE s.status = 'pending'
+         AND datetime(REPLACE(REPLACE(s.scheduled_at, 'T', ' '), 'Z', '')) <= datetime('now')
+       ORDER BY s.scheduled_at ASC
        LIMIT ?`,
     )
     .all(BATCH_LIMIT);
 
   for (const row of due) {
-    if (row.campaign_id && !campaignSendAllowedNow()) {
-      // Leave pending until the next weekday peak window.
+    if (row.campaign_id && !isCampaignSendWindowNow(new Date(), row.campaign_timezone)) {
+      // Leave pending until the next weekday window in the campaign timezone.
       continue;
     }
     await processOne(row);

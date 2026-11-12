@@ -1,11 +1,19 @@
 /**
- * Campaign send timing: business-day delays (skip Sat/Sun) + US peak window in PKT.
- * Peak window: 19:00–23:59 Asia/Karachi (targets US daytime / agreed CRM window).
+ * Campaign send timing: business-day delays (skip Sat/Sun) + audience-local send window.
+ * Default window: Mon–Fri 09:00–14:00 in the campaign timezone
+ * (legacy PKT 19:00–24:00 ≈ US Eastern morning).
  */
 import { WORKING_TZ, ymdInTz, zonedStartOfDay, toSqliteUtc } from './periodBounds.js';
+import {
+  CAMPAIGN_SEND_END_HOUR,
+  CAMPAIGN_SEND_START_HOUR,
+  DEFAULT_CAMPAIGN_TIMEZONE,
+  normalizeCampaignTimezone,
+} from './campaignTimezones.js';
 
-const PEAK_START_HOUR = 19; // 7 PM PKT
-const PEAK_END_HOUR = 24; // midnight (exclusive end)
+/** @deprecated Prefer CAMPAIGN_SEND_* — kept for older imports */
+const PEAK_START_HOUR = CAMPAIGN_SEND_START_HOUR;
+const PEAK_END_HOUR = CAMPAIGN_SEND_END_HOUR;
 
 function pad(n) {
   return String(n).padStart(2, '0');
@@ -42,7 +50,7 @@ export function nextWeekdayYmd(ymd, timeZone = WORKING_TZ) {
 
 /**
  * Add N business days (Mon–Fri only) after fromYmd.
- * delayDays=0 → same day (still snapped later for weekend/peak).
+ * delayDays=0 → same day (still snapped later for weekend/window).
  * delayDays=3 from Wed → Mon (Thu, Fri, Mon).
  */
 export function addBusinessDays(fromYmd, delayDays, timeZone = WORKING_TZ) {
@@ -96,60 +104,73 @@ export function partsInTz(date, timeZone = WORKING_TZ) {
 }
 
 /**
- * Snap an instant into the next valid peak window on a weekday (7pm–midnight PKT).
- * If already inside Mon–Fri 19:00–23:59 PKT, keep it.
+ * Snap an instant into the next valid send window on a weekday (09:00–14:00 local).
+ * If already inside Mon–Fri 09:00–13:59 in that zone, keep it.
  */
-export function snapToSendWindow(date, timeZone = WORKING_TZ) {
-  let p = partsInTz(date, timeZone);
+export function snapToSendWindow(date, timeZone = DEFAULT_CAMPAIGN_TIMEZONE) {
+  const tz = normalizeCampaignTimezone(timeZone);
+  let p = partsInTz(date, tz);
   let ymd = p.ymd;
 
-  // Weekend → next Monday 19:00
-  if (isWeekendYmd(ymd, timeZone)) {
-    ymd = nextWeekdayYmd(ymd, timeZone);
-    return zonedDateTime(ymd, PEAK_START_HOUR, 0, 0, timeZone);
+  // Weekend → next Monday window start
+  if (isWeekendYmd(ymd, tz)) {
+    ymd = nextWeekdayYmd(ymd, tz);
+    return zonedDateTime(ymd, CAMPAIGN_SEND_START_HOUR, 0, 0, tz);
   }
 
-  // Before 7pm → same day 7pm
-  if (p.hour < PEAK_START_HOUR) {
-    return zonedDateTime(ymd, PEAK_START_HOUR, 0, 0, timeZone);
+  // Before window → same day at start
+  if (p.hour < CAMPAIGN_SEND_START_HOUR) {
+    return zonedDateTime(ymd, CAMPAIGN_SEND_START_HOUR, 0, 0, tz);
   }
 
-  // Inside peak (19–23) → keep
-  if (p.hour < PEAK_END_HOUR) {
+  // Inside window → keep
+  if (p.hour < CAMPAIGN_SEND_END_HOUR) {
     return date;
   }
 
-  // At/after midnight boundary (hour 0–… already handled as before peak next day)
-  // hour >= 24 shouldn't happen; if somehow past end, next weekday 19:00
-  ymd = nextWeekdayYmd(addCalendarDays(ymd, 1), timeZone);
-  return zonedDateTime(ymd, PEAK_START_HOUR, 0, 0, timeZone);
+  // After window → next weekday at start
+  ymd = nextWeekdayYmd(addCalendarDays(ymd, 1), tz);
+  return zonedDateTime(ymd, CAMPAIGN_SEND_START_HOUR, 0, 0, tz);
 }
 
 /**
  * Resolve when a campaign step should send.
  * @param {Date|string} baseInstant - launch (or enrollment) time
  * @param {number} delayBusinessDays - step.delay_days (business days)
+ * @param {string} [timeZone] - audience IANA timezone
  */
-export function resolveCampaignSendAt(baseInstant, delayBusinessDays) {
+export function resolveCampaignSendAt(
+  baseInstant,
+  delayBusinessDays,
+  timeZone = DEFAULT_CAMPAIGN_TIMEZONE,
+) {
+  const tz = normalizeCampaignTimezone(timeZone);
   const base = baseInstant instanceof Date ? baseInstant : new Date(baseInstant);
   const safeBase = Number.isNaN(base.getTime()) ? new Date() : base;
-  const launchYmd = ymdInTz(safeBase, WORKING_TZ);
-  const targetYmd = addBusinessDays(launchYmd, delayBusinessDays, WORKING_TZ);
+  const launchYmd = ymdInTz(safeBase, tz);
+  const targetYmd = addBusinessDays(launchYmd, delayBusinessDays, tz);
 
-  // delay 0: prefer launch clock if already in peak weekday window; else snap
+  // delay 0: prefer launch clock if already in weekday window; else snap
   if ((Number(delayBusinessDays) || 0) === 0) {
-    const sameDayPeak = snapToSendWindow(safeBase, WORKING_TZ);
-    // If snap moved to another day because launch was after midnight window, OK
-    return sameDayPeak;
+    return snapToSendWindow(safeBase, tz);
   }
 
-  // Follow-ups: target business day at peak start (7pm PKT)
-  const atPeak = zonedDateTime(targetYmd, PEAK_START_HOUR, 0, 0, WORKING_TZ);
-  return snapToSendWindow(atPeak, WORKING_TZ);
+  // Follow-ups: target business day at window start in audience TZ
+  const atStart = zonedDateTime(targetYmd, CAMPAIGN_SEND_START_HOUR, 0, 0, tz);
+  return snapToSendWindow(atStart, tz);
 }
 
 export function toScheduleSql(date) {
   return toSqliteUtc(date);
 }
 
-export { WORKING_TZ, PEAK_START_HOUR, PEAK_END_HOUR, ymdInTz };
+export {
+  WORKING_TZ,
+  PEAK_START_HOUR,
+  PEAK_END_HOUR,
+  ymdInTz,
+  DEFAULT_CAMPAIGN_TIMEZONE,
+  CAMPAIGN_SEND_START_HOUR,
+  CAMPAIGN_SEND_END_HOUR,
+  normalizeCampaignTimezone,
+};

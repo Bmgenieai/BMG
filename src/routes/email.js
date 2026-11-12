@@ -776,6 +776,7 @@ router.get(
     const selectSql = `SELECT s.*,
               l.name AS lead_name, l.email AS lead_email, u.name AS scheduled_by_name,
               c.name AS campaign_name, c.id AS campaign_id_join,
+              c.timezone AS campaign_timezone,
               cs.step_order, cs.delay_days
        FROM scheduled_emails s
        LEFT JOIN leads l ON l.id = s.lead_id
@@ -825,6 +826,7 @@ router.get(
           scheduledByName: r.scheduled_by_name,
           campaignId: r.campaign_id || null,
           campaignName: r.campaign_name || null,
+          timezone: r.campaign_timezone || null,
           stepOrder,
           emailType:
             r.campaign_id && stepOrder
