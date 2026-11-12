@@ -119,6 +119,35 @@ export function getEmailAccountPrivate(id) {
   return db.prepare(`SELECT * FROM email_accounts WHERE id = ?`).get(id) || null;
 }
 
+/** Match a From/To address to an active CRM sending account. */
+export function getEmailAccountByEmail(email) {
+  const em = normalizeEmail(email);
+  if (!em) return null;
+  ensureDefaultAccountFromEnv();
+  return (
+    db
+      .prepare(
+        `SELECT ${PUBLIC_COLS} FROM email_accounts
+         WHERE lower(email) = ? AND is_active = 1
+         LIMIT 1`,
+      )
+      .get(em) || null
+  );
+}
+
+/**
+ * Prefer the first address that matches an active email_accounts row.
+ * Used when a prospect replied To: our mailbox (thread sender).
+ */
+export function findAccountMatchingEmails(emails = []) {
+  const list = Array.isArray(emails) ? emails : [];
+  for (const raw of list) {
+    const account = getEmailAccountByEmail(raw);
+    if (account) return account;
+  }
+  return null;
+}
+
 export function getDefaultEmailAccount() {
   const activeDefault = db
     .prepare(

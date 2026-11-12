@@ -4,6 +4,12 @@
 import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
 import { touchLeadContacted, onLeadReply } from './leadAutomation.js';
+import {
+  findAccountMatchingEmails,
+  getEmailAccountByEmail,
+  isLegacySenderAccount,
+  resolveSendAccount,
+} from './emailAccounts.js';
 
 const OPEN_EVENTS = new Set(['opened', 'unique_opened', 'uniqueOpened']);
 const CLICK_EVENTS = new Set(['click', 'clicks']);
@@ -1145,12 +1151,20 @@ export function getEmailReply(id) {
   }
 
   const original = findOriginalOutboundMessage(row);
+  const replySender = resolveCrmReplySender(row, original);
 
   return {
     ...row,
     hasBody: Boolean(row.body_markdown || row.body_text || row.body_html),
     thread,
     allReplyIds: allReplies.map((r) => r.id),
+    replySender: replySender
+      ? {
+          email: replySender.sender.email,
+          name: replySender.sender.name,
+          accountId: replySender.accountId,
+        }
+      : null,
     originalMessage: original
       ? {
           id: original.id,
@@ -1164,10 +1178,82 @@ export function getEmailReply(id) {
           textContent: original.text_content || null,
           hasBody: Boolean(original.html_content || original.text_content),
           brevoMessageId: original.brevo_message_id || null,
+          emailAccountId: original.email_account_id || null,
         }
       : null,
     crmReplies: [],
   };
+}
+
+function parseReplyToEmails(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.map((e) => normalizeEmail(e)).filter(Boolean);
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.map((e) => normalizeEmail(e)).filter(Boolean);
+      }
+    } catch {
+      /* plain address */
+    }
+    const em = normalizeEmail(raw);
+    return em ? [em] : [];
+  }
+  return [];
+}
+
+/**
+ * CRM Email-replies must continue from the same mailbox the prospect wrote to —
+ * never silently switch to whatever is currently the default sender.
+ */
+function resolveCrmReplySender(reply, originalMessage = null) {
+  const original = originalMessage || findOriginalOutboundMessage(reply);
+
+  if (original?.email_account_id) {
+    try {
+      return resolveSendAccount(original.email_account_id);
+    } catch {
+      /* fall through */
+    }
+  }
+
+  const inboundTos = parseReplyToEmails(reply?.to_emails);
+  const matchedInbound = findAccountMatchingEmails(inboundTos);
+  if (matchedInbound) {
+    return resolveSendAccount(matchedInbound.id);
+  }
+
+  // Pre-multi-account cold sends: null email_account_id → legacy Magic / env sender
+  if (original && !original.email_account_id) {
+    const legacy =
+      getEmailAccountByEmail(process.env.BREVO_SENDER_EMAIL) ||
+      getEmailAccountByEmail('magic.retouching@bmgenie.ai');
+    if (legacy && isLegacySenderAccount(legacy)) {
+      return resolveSendAccount(legacy.id);
+    }
+    if (legacy) return resolveSendAccount(legacy.id);
+  }
+
+  // Last CRM reply in thread may already have account id
+  if (reply?.lead_id) {
+    const lastCrm = db
+      .prepare(
+        `SELECT email_account_id FROM email_messages
+         WHERE lead_id = ? AND source = 'crm_reply' AND email_account_id IS NOT NULL
+         ORDER BY sent_at DESC LIMIT 1`,
+      )
+      .get(reply.lead_id);
+    if (lastCrm?.email_account_id) {
+      try {
+        return resolveSendAccount(lastCrm.email_account_id);
+      } catch {
+        /* fall through */
+      }
+    }
+  }
+
+  return resolveSendAccount(null);
 }
 
 function wrapAngle(messageId) {
@@ -1232,12 +1318,18 @@ export async function sendCrmReplyToInbound({
   const subject = replySubject(subjectOverride || reply.subject || reply.originalMessage?.subject);
   const htmlContent = textToSimpleHtml(text);
 
-  const inboundMid = wrapAngle(reply.provider_message_id);
-  const originalMid = wrapAngle(reply.originalMessage?.brevoMessageId);
-  const references = [originalMid, inboundMid].filter(Boolean).join(' ');
+  // Thread as a reply: In-Reply-To = prospect's message; References = thread chain
+  const prospectMid = wrapAngle(reply.provider_message_id);
+  const originalMid =
+    wrapAngle(reply.originalMessage?.brevoMessageId) || wrapAngle(reply.in_reply_to);
+  const references = [...new Set([originalMid, prospectMid].filter(Boolean))].join(' ');
   const headers = {};
-  if (inboundMid) headers['In-Reply-To'] = inboundMid;
+  if (prospectMid) headers['In-Reply-To'] = prospectMid;
+  else if (originalMid) headers['In-Reply-To'] = originalMid;
   if (references) headers.References = references;
+
+  const resolved = resolveCrmReplySender(reply, findOriginalOutboundMessage(reply));
+  const sender = resolved.sender;
 
   const brevo = await sendTransactionalEmail({
     toEmail,
@@ -1248,6 +1340,9 @@ export async function sendCrmReplyToInbound({
     leadId,
     tags: ['crm-reply'],
     headers,
+    sender,
+    // Keep conversation on the same mailbox (not default / not lead-*@reply domain)
+    replyTo: { email: sender.email, name: sender.name },
   });
 
   recordEmailSend({
@@ -1261,12 +1356,18 @@ export async function sendCrmReplyToInbound({
     htmlContent,
     textContent: text,
     parentReplyId: replyId,
+    emailAccountId: resolved.accountId || null,
   });
 
   // Mark inbound as read after BD responds
   markEmailReplyRead(replyId, true);
 
-  return { ok: true, reply: getEmailReply(replyId), brevo };
+  return {
+    ok: true,
+    reply: getEmailReply(replyId),
+    brevo,
+    sender: { email: sender.email, name: sender.name, accountId: resolved.accountId },
+  };
 }
 
 export function markEmailReplyRead(id, read = true) {
