@@ -6,6 +6,7 @@ import { db } from '../db.js';
 import { canUpdateLead } from './permissions.js';
 import { resolveSendAccount } from './emailAccounts.js';
 import { resolveAnalyticsBounds } from './periodBounds.js';
+import { resolveCampaignSendAt, toScheduleSql } from './campaignSchedule.js';
 
 /** Email format tags — used to compare open/reply rates by style. */
 export const CONTENT_CATEGORIES = ['plain_text', 'image', 'gif', 'video'];
@@ -875,13 +876,23 @@ function scheduleStepsForLeads(campaignId, leadIds, { userId, batchId = null, no
   const tx = db.transaction(() => {
     for (const member of members) {
       const vKey = normalizeVariantKey(member.variant_key || 'A', 0);
+      // Enrollment after launch (mid-campaign add) becomes the base; otherwise use launch time.
+      let perLeadBase = scheduleBase;
+      if (member.enrolled_at) {
+        const enrolled = new Date(
+          String(member.enrolled_at).includes('T')
+            ? member.enrolled_at
+            : `${String(member.enrolled_at).replace(' ', 'T')}Z`,
+        );
+        if (!Number.isNaN(enrolled.getTime()) && enrolled > scheduleBase) {
+          perLeadBase = enrolled;
+        }
+      }
       for (const step of steps) {
         const variant =
           (step.variants || []).find((v) => v.variant_key === vKey) || step.variants?.[0];
         if (!variant) continue;
-        const when = new Date(
-          scheduleBase.getTime() + (Number(step.delay_days) || 0) * 86_400_000,
-        );
+        const when = resolveCampaignSendAt(perLeadBase, Number(step.delay_days) || 0);
         // Skip if already sent/pending for this step+lead
         const exists = db
           .prepare(
@@ -902,7 +913,7 @@ function scheduleStepsForLeads(campaignId, leadIds, { userId, batchId = null, no
           variant.html_content || null,
           variant.text_content || null,
           variant.template_id || null,
-          sqlDate(when),
+          toScheduleSql(when),
           campaign.email_account_id || null,
           campaignId,
           step.id,
@@ -916,6 +927,51 @@ function scheduleStepsForLeads(campaignId, leadIds, { userId, batchId = null, no
   tx();
 
   return { scheduled, batchId: bid };
+}
+
+/**
+ * Rewrite pending campaign follow-ups (and unsent day-0) using business days + peak hours.
+ * Safe to run on boot / after deploy so live campaigns pick up the new rules.
+ */
+export function reschedulePendingCampaignSends() {
+  const rows = db
+    .prepare(
+      `SELECT s.id, s.campaign_id, s.campaign_step_id, s.lead_id,
+              cs.delay_days,
+              c.launched_at,
+              cl.enrolled_at
+       FROM scheduled_emails s
+       JOIN email_campaigns c ON c.id = s.campaign_id
+       JOIN email_campaign_steps cs ON cs.id = s.campaign_step_id
+       LEFT JOIN email_campaign_leads cl
+         ON cl.campaign_id = s.campaign_id AND cl.lead_id = s.lead_id
+       WHERE s.status = 'pending'
+         AND s.campaign_id IS NOT NULL
+         AND s.campaign_step_id IS NOT NULL`,
+    )
+    .all();
+
+  if (!rows.length) return { updated: 0 };
+
+  const upd = db.prepare(
+    `UPDATE scheduled_emails SET scheduled_at = ? WHERE id = ? AND status = 'pending'`,
+  );
+  let updated = 0;
+  const tx = db.transaction(() => {
+    for (const row of rows) {
+      const baseRaw = row.enrolled_at || row.launched_at || new Date().toISOString();
+      const base = new Date(String(baseRaw).includes('T') ? baseRaw : `${baseRaw.replace(' ', 'T')}Z`);
+      const when = resolveCampaignSendAt(
+        Number.isNaN(base.getTime()) ? new Date() : base,
+        Number(row.delay_days) || 0,
+      );
+      const sql = toScheduleSql(when);
+      const r = upd.run(sql, row.id);
+      if (r.changes) updated += 1;
+    }
+  });
+  tx();
+  return { updated };
 }
 
 /**

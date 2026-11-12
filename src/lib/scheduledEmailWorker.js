@@ -8,9 +8,25 @@ import {
 import { resolveSendAccount } from './emailAccounts.js';
 import { recordEmailSend } from './emailLog.js';
 import { claimLeadIfUnassigned } from './leadAutomation.js';
+import {
+  isWeekendYmd,
+  partsInTz,
+  PEAK_START_HOUR,
+  PEAK_END_HOUR,
+  ymdInTz,
+} from './campaignSchedule.js';
 
 const TICK_MS = 30_000;
 const BATCH_LIMIT = 15;
+
+/** Campaign sends only go out Mon–Fri during 7pm–midnight PKT. */
+function campaignSendAllowedNow() {
+  const now = new Date();
+  const ymd = ymdInTz(now);
+  if (isWeekendYmd(ymd)) return false;
+  const { hour } = partsInTz(now);
+  return hour >= PEAK_START_HOUR && hour < PEAK_END_HOUR;
+}
 
 function senderFromUserId(userId, emailAccountId = null) {
   const user = db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).get(userId);
@@ -193,6 +209,10 @@ export async function processDueScheduledEmails() {
     .all(BATCH_LIMIT);
 
   for (const row of due) {
+    if (row.campaign_id && !campaignSendAllowedNow()) {
+      // Leave pending until the next weekday peak window.
+      continue;
+    }
     await processOne(row);
     await new Promise((r) => setTimeout(r, 200));
   }

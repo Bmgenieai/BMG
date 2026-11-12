@@ -770,69 +770,72 @@ router.get(
   (req, res) => {
     const canSeeAll = roleHasPermission(req.user.role, 'leads:view_all');
     const status = String(req.query.status || 'pending').toLowerCase();
+    // High enough for campaign follow-ups; counts must not silently truncate.
+    const limit = Math.min(Math.max(Number(req.query.limit) || 10000, 1), 20000);
+
+    const selectSql = `SELECT s.*,
+              l.name AS lead_name, l.email AS lead_email, u.name AS scheduled_by_name,
+              c.name AS campaign_name, c.id AS campaign_id_join,
+              cs.step_order, cs.delay_days
+       FROM scheduled_emails s
+       LEFT JOIN leads l ON l.id = s.lead_id
+       LEFT JOIN users u ON u.id = s.user_id
+       LEFT JOIN email_campaigns c ON c.id = s.campaign_id
+       LEFT JOIN email_campaign_steps cs ON cs.id = s.campaign_step_id`;
 
     let rows;
     if (canSeeAll) {
       rows =
         status === 'all'
           ? db
-              .prepare(
-                `SELECT s.*, l.name AS lead_name, l.email AS lead_email, u.name AS scheduled_by_name
-                 FROM scheduled_emails s
-                 LEFT JOIN leads l ON l.id = s.lead_id
-                 LEFT JOIN users u ON u.id = s.user_id
-                 ORDER BY s.scheduled_at DESC
-                 LIMIT 200`,
-              )
-              .all()
+              .prepare(`${selectSql} ORDER BY s.scheduled_at DESC LIMIT ?`)
+              .all(limit)
           : db
-              .prepare(
-                `SELECT s.*, l.name AS lead_name, l.email AS lead_email, u.name AS scheduled_by_name
-                 FROM scheduled_emails s
-                 LEFT JOIN leads l ON l.id = s.lead_id
-                 LEFT JOIN users u ON u.id = s.user_id
-                 WHERE s.status = ?
-                 ORDER BY s.scheduled_at ASC
-                 LIMIT 200`,
-              )
-              .all(status);
+              .prepare(`${selectSql} WHERE s.status = ? ORDER BY s.scheduled_at ASC LIMIT ?`)
+              .all(status, limit);
     } else {
       rows =
         status === 'all'
           ? db
-              .prepare(
-                `SELECT s.*, l.name AS lead_name, l.email AS lead_email, u.name AS scheduled_by_name
-                 FROM scheduled_emails s
-                 LEFT JOIN leads l ON l.id = s.lead_id
-                 LEFT JOIN users u ON u.id = s.user_id
-                 WHERE s.user_id = ?
-                 ORDER BY s.scheduled_at DESC
-                 LIMIT 200`,
-              )
-              .all(req.user.id)
+              .prepare(`${selectSql} WHERE s.user_id = ? ORDER BY s.scheduled_at DESC LIMIT ?`)
+              .all(req.user.id, limit)
           : db
               .prepare(
-                `SELECT s.*, l.name AS lead_name, l.email AS lead_email, u.name AS scheduled_by_name
-                 FROM scheduled_emails s
-                 LEFT JOIN leads l ON l.id = s.lead_id
-                 LEFT JOIN users u ON u.id = s.user_id
-                 WHERE s.user_id = ? AND s.status = ?
-                 ORDER BY s.scheduled_at ASC
-                 LIMIT 200`,
+                `${selectSql} WHERE s.user_id = ? AND s.status = ? ORDER BY s.scheduled_at ASC LIMIT ?`,
               )
-              .all(req.user.id, status);
+              .all(req.user.id, status, limit);
     }
 
+    // Campaign rows: one group per campaign + step + scheduled time.
+    // Cold-email rows: keep batch_id grouping.
     const batches = new Map();
     for (const r of rows) {
-      if (!batches.has(r.batch_id)) {
-        batches.set(r.batch_id, {
+      const groupKey = r.campaign_id
+        ? `campaign:${r.campaign_id}:step:${r.campaign_step_id || 'x'}:${r.scheduled_at || ''}`
+        : `batch:${r.batch_id}`;
+      if (!batches.has(groupKey)) {
+        const stepOrder = Number(r.step_order) || null;
+        batches.set(groupKey, {
+          id: groupKey,
           batchId: r.batch_id,
           scheduledAt: r.scheduled_at,
           status: r.status,
           subject: r.subject,
           templateId: r.template_id,
           scheduledByName: r.scheduled_by_name,
+          campaignId: r.campaign_id || null,
+          campaignName: r.campaign_name || null,
+          stepOrder,
+          emailType:
+            r.campaign_id && stepOrder
+              ? stepOrder <= 1
+                ? 'new'
+                : 'follow-up'
+              : r.campaign_id
+                ? 'campaign'
+                : 'cold',
+          stepLabel: stepOrder ? `Email ${stepOrder}` : null,
+          variantKey: r.variant_key || null,
           count: 0,
           sent: 0,
           failed: 0,
@@ -841,7 +844,7 @@ router.get(
           recipients: [],
         });
       }
-      const b = batches.get(r.batch_id);
+      const b = batches.get(groupKey);
       b.count += 1;
       if (r.status === 'sent') b.sent += 1;
       else if (r.status === 'failed') b.failed += 1;
@@ -855,10 +858,45 @@ router.get(
         leadEmail: r.lead_email,
         status: r.status,
         error: r.error,
+        variantKey: r.variant_key || null,
       });
     }
 
     res.json({ batches: [...batches.values()] });
+  },
+);
+
+/** Cancel specific pending scheduled rows (preferred for campaign step groups). */
+router.post(
+  '/scheduled/cancel',
+  authRequired,
+  requirePermission('email:bulk_send'),
+  (req, res) => {
+    const canSeeAll = roleHasPermission(req.user.role, 'leads:view_all');
+    const ids = [...new Set((req.body?.ids || []).map(String).filter(Boolean))];
+    if (!ids.length) {
+      return res.status(400).json({ error: 'ids[] required' });
+    }
+    const placeholders = ids.map(() => '?').join(',');
+    let rows = db
+      .prepare(
+        `SELECT id, user_id, status FROM scheduled_emails WHERE id IN (${placeholders})`,
+      )
+      .all(...ids);
+    if (!canSeeAll) rows = rows.filter((r) => r.user_id === req.user.id);
+    const pending = rows.filter((r) => r.status === 'pending');
+    if (!pending.length) {
+      return res.status(404).json({ error: 'No pending scheduled emails found' });
+    }
+    const cancel = db.prepare(
+      `UPDATE scheduled_emails SET status = 'cancelled'
+       WHERE id = ? AND status = 'pending'`,
+    );
+    const tx = db.transaction(() => {
+      for (const r of pending) cancel.run(r.id);
+    });
+    tx();
+    res.json({ ok: true, cancelled: pending.length });
   },
 );
 
@@ -878,6 +916,12 @@ router.post(
 
     if (!canSeeAll) {
       rows = rows.filter((r) => r.user_id === req.user.id);
+    }
+
+    // Optional: only one campaign step within the batch
+    const stepId = req.query.stepId ? String(req.query.stepId) : '';
+    if (stepId) {
+      rows = rows.filter((r) => r.campaign_step_id === stepId);
     }
 
     const pending = rows.filter((r) => r.status === 'pending');

@@ -18,6 +18,7 @@ import demosRoutes from './routes/demos.js';
 import chatsRoutes from './routes/chats.js';
 import { startScheduledEmailWorker } from './lib/scheduledEmailWorker.js';
 import { startSenderMailboxSync } from './lib/senderMailboxSync.js';
+import { reschedulePendingCampaignSends } from './lib/campaigns.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -101,6 +102,14 @@ app.listen(PORT, () => {
   if (PUBLIC_API_URL) console.log(`PUBLIC_API_URL=${PUBLIC_API_URL}`);
   if (fs.existsSync(distPath)) {
     console.log(`Serving frontend from ${distPath}`);
+  }
+  try {
+    const r = reschedulePendingCampaignSends();
+    if (r?.updated) {
+      console.log(`Rescheduled ${r.updated} pending campaign send(s) (business days + peak hours)`);
+    }
+  } catch (err) {
+    console.warn('Campaign reschedule skipped:', err.message);
   }
   startScheduledEmailWorker();
   startSenderMailboxSync();
