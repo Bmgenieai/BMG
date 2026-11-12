@@ -230,6 +230,38 @@ export function replyToForLead(leadId) {
 }
 
 /**
+ * Opt-in only: lead-<id>@reply… aliases look like phishing when From is @bmgenie.ai.
+ * Default is Reply-To = From (replies land on the sending mailbox → IMAP sync).
+ */
+export function leadReplyAliasEnabled() {
+  return ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.BREVO_LEAD_REPLY_ALIAS || '')
+      .trim()
+      .toLowerCase(),
+  );
+}
+
+function htmlToPlainText(html) {
+  return String(html || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/\r/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+/**
  * @param {{
  *   toEmail: string,
  *   toName?: string,
@@ -241,6 +273,7 @@ export function replyToForLead(leadId) {
  *   headers?: Record<string, string>,
  *   replyTo?: { email: string, name?: string } | null,
  *   sender?: { email: string, name?: string } | null,
+ *   skipListUnsubscribe?: boolean,
  * }} opts
  */
 export async function sendTransactionalEmail(opts) {
@@ -254,34 +287,57 @@ export async function sendTransactionalEmail(opts) {
       : senderConfig();
   const tags = [...(opts.tags || [])];
   if (opts.leadId) tags.push(`crm-lead-${opts.leadId}`);
+
+  const textContent =
+    (opts.textContent && String(opts.textContent).trim()) ||
+    (opts.htmlContent ? htmlToPlainText(opts.htmlContent) : '') ||
+    opts.subject;
+
   const body = {
     sender,
     to: [{ email: opts.toEmail, name: opts.toName || undefined }],
     subject: opts.subject,
     htmlContent: opts.htmlContent || undefined,
-    textContent: opts.textContent || opts.subject,
+    textContent,
   };
   if (tags.length) body.tags = [...new Set(tags)];
   if (opts.leadId) {
     body.params = { CRM_LEAD_ID: opts.leadId };
   }
-  const replyTo =
-    opts.replyTo === null
-      ? null
-      : opts.replyTo ||
-        (() => {
-          const rt = replyToForLead(opts.leadId);
-          if (rt && sender.name) rt.name = sender.name;
-          return rt;
-        })();
+
+  // Deliverability: keep Reply-To on the same address as From unless explicitly overridden.
+  // lead-*@reply… is opt-in via BREVO_LEAD_REPLY_ALIAS=true (hurts inbox placement).
+  let replyTo = null;
+  if (opts.replyTo === null) {
+    replyTo = null;
+  } else if (opts.replyTo?.email) {
+    replyTo = {
+      email: String(opts.replyTo.email).trim(),
+      name: String(opts.replyTo.name || opts.replyTo.email).trim(),
+    };
+  } else if (leadReplyAliasEnabled() && opts.leadId) {
+    const rt = replyToForLead(opts.leadId);
+    if (rt) {
+      rt.name = sender.name || rt.name;
+      replyTo = rt;
+    }
+  } else {
+    replyTo = { email: sender.email, name: sender.name };
+  }
   if (replyTo) body.replyTo = replyTo;
+
+  const headers = {};
+  if (!opts.skipListUnsubscribe && sender.email) {
+    // mailto-only (no fake One-Click URL). Helps bulk-sender checks without a landing page.
+    headers['List-Unsubscribe'] = `<mailto:${sender.email}?subject=unsubscribe>`;
+  }
   if (opts.headers && typeof opts.headers === 'object') {
-    const headers = {};
     for (const [k, v] of Object.entries(opts.headers)) {
       if (v != null && String(v).trim()) headers[k] = String(v);
     }
-    if (Object.keys(headers).length) body.headers = headers;
   }
+  if (Object.keys(headers).length) body.headers = headers;
+
   return brevoFetch('/smtp/email', { method: 'POST', body: JSON.stringify(body) });
 }
 

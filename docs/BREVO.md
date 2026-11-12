@@ -58,13 +58,15 @@ Keep the existing **transactional** webhook for open/click/reply events:
 
 `https://crm-api.bmgenie.ai/api/email/webhooks/brevo?secret=...`
 
-### 3. How matching works
+### 3. How matching works (deliverability-first)
 
-When CRM sends cold email and `BREVO_REPLY_DOMAIN` is set, Brevo `replyTo` is set to `lead-<leadId>@reply.bmgenie.ai`. Prospect replies go to Brevo → inbound webhook → CRM stores subject + body and links the lead.
+**Default:** cold / campaign / CRM replies set **Reply-To = From** (same mailbox). That avoids a common spam signal (`From: @bmgenie.ai` + `Reply-To: lead-…@reply.bmgenie.ai`). Prospects reply to the visible sender; **IMAP mailbox sync** ingests those into Email replies.
 
-BD / CEO can **reply from CRM** on Email replies → thread → “Send via Brevo”. That send uses the Brevo mailbox (`BREVO_SENDER_EMAIL`), sets `In-Reply-To` / `References` for threading, and keeps `Reply-To` as `lead-<id>@reply…` so their next reply still lands in CRM.
+Optional (not recommended for inbox placement): set `BREVO_LEAD_REPLY_ALIAS=true` to restore `Reply-To: lead-<leadId>@reply.bmgenie.ai` for Brevo inbound parsing.
 
-Without inbound DNS, the Replies tab still lists **reply notifications** from the transactional `reply` event (no body until inbound is live).
+BD / CEO can **reply from CRM** on Email replies → “Send via Brevo”. That send uses the **same thread mailbox**, with `In-Reply-To` / `References`, so it stays a reply in the conversation.
+
+Without inbound DNS / IMAP, the Replies tab still lists **reply notifications** from the transactional `reply` event (no body until capture is live).
 
 ### 4. Replies to `magic.retouching@` (From address)
 
