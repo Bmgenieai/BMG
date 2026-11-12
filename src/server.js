@@ -15,6 +15,7 @@ import analyticsRoutes from './routes/analytics.js';
 import ingestRoutes from './routes/ingest.js';
 import emailRoutes from './routes/email.js';
 import demosRoutes from './routes/demos.js';
+import callBookingsRoutes from './routes/callBookings.js';
 import chatsRoutes from './routes/chats.js';
 import { startScheduledEmailWorker } from './lib/scheduledEmailWorker.js';
 import { startSenderMailboxSync } from './lib/senderMailboxSync.js';
@@ -78,6 +79,7 @@ app.use('/api/working-tree', workingTreeRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/ingest', ingestRoutes);
 app.use('/api/demos', demosRoutes);
+app.use('/api/call-bookings', callBookingsRoutes);
 app.use('/api/chats', chatsRoutes);
 app.use('/api/email', emailRoutes);
 

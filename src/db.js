@@ -714,6 +714,31 @@ export function migrate() {
   }
 
   db.exec(`
+    CREATE TABLE IF NOT EXISTS call_bookings (
+      id TEXT PRIMARY KEY,
+      lead_id TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+      booked_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      name TEXT,
+      email TEXT,
+      phone TEXT,
+      company TEXT,
+      scheduled_at TEXT NOT NULL,
+      timezone TEXT NOT NULL DEFAULT 'America/Los_Angeles',
+      notes TEXT,
+      status TEXT NOT NULL DEFAULT 'scheduled'
+        CHECK(status IN ('scheduled','completed','cancelled','no_show')),
+      notify_sent_at TEXT,
+      notify_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_call_bookings_scheduled
+      ON call_bookings(status, scheduled_at);
+    CREATE INDEX IF NOT EXISTS idx_call_bookings_lead
+      ON call_bookings(lead_id);
+  `);
+
+  db.exec(`
     CREATE TABLE IF NOT EXISTS email_campaign_step_variants (
       id TEXT PRIMARY KEY,
       campaign_step_id TEXT NOT NULL REFERENCES email_campaign_steps(id) ON DELETE CASCADE,
