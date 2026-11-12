@@ -1,14 +1,15 @@
 /**
  * Audience timezones for cold-email campaigns.
- * Send window is Mon–Fri 09:00–14:00 in the selected zone
- * (same US-morning window previously expressed as 7pm–midnight PKT).
+ * Send window: Mon–Fri 09:00–17:00 in the selected zone (business hours).
+ * Preferred send hour (send_hour) is when Email 1 + follow-ups are scheduled.
  */
 
 export const DEFAULT_CAMPAIGN_TIMEZONE = 'America/New_York';
+export const DEFAULT_CAMPAIGN_SEND_HOUR = 9;
 
-/** Local Mon–Fri send window in the campaign timezone. */
+/** Local Mon–Fri send window in the campaign timezone (9am–5pm). */
 export const CAMPAIGN_SEND_START_HOUR = 9;
-export const CAMPAIGN_SEND_END_HOUR = 14;
+export const CAMPAIGN_SEND_END_HOUR = 17; // exclusive → through 4:59 PM; preferred hour max 16
 
 export const CAMPAIGN_TIMEZONES = [
   { value: 'America/New_York', label: 'US Eastern (New York)', short: 'ET' },
@@ -22,6 +23,9 @@ export const CAMPAIGN_TIMEZONES = [
   { value: 'UTC', label: 'UTC', short: 'UTC' },
 ];
 
+/** Preferred schedule hours inside the business window (9 AM – 4 PM). */
+export const CAMPAIGN_SEND_HOURS = [9, 10, 11, 12, 13, 14, 15, 16];
+
 const ALLOWED = new Set(CAMPAIGN_TIMEZONES.map((t) => t.value));
 
 export function normalizeCampaignTimezone(raw) {
@@ -30,15 +34,23 @@ export function normalizeCampaignTimezone(raw) {
   return DEFAULT_CAMPAIGN_TIMEZONE;
 }
 
+export function normalizeCampaignSendHour(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return DEFAULT_CAMPAIGN_SEND_HOUR;
+  const hour = Math.floor(n);
+  if (hour < CAMPAIGN_SEND_START_HOUR) return CAMPAIGN_SEND_START_HOUR;
+  if (hour >= CAMPAIGN_SEND_END_HOUR) return CAMPAIGN_SEND_END_HOUR - 1;
+  return hour;
+}
+
 export function campaignTimezoneMeta(raw) {
   const value = normalizeCampaignTimezone(raw);
   return CAMPAIGN_TIMEZONES.find((t) => t.value === value) || CAMPAIGN_TIMEZONES[0];
 }
 
-/** True if Instant is inside Mon–Fri send window for this IANA zone. */
+/** True if Instant is inside Mon–Fri 9am–5pm for this IANA zone. */
 export function isCampaignSendWindowNow(date = new Date(), timeZone = DEFAULT_CAMPAIGN_TIMEZONE) {
   const tz = normalizeCampaignTimezone(timeZone);
-  // Lazy import cycle avoided: inline weekday/hour via Intl
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat('en-US', {
       timeZone: tz,

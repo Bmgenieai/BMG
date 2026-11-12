@@ -1,13 +1,14 @@
 /**
- * Campaign send timing: business-day delays (skip Sat/Sun) + audience-local send window.
- * Default window: Mon–Fri 09:00–14:00 in the campaign timezone
- * (legacy PKT 19:00–24:00 ≈ US Eastern morning).
+ * Campaign send timing: business-day delays (skip Sat/Sun) + audience-local window.
+ * Window: Mon–Fri 09:00–17:00 local. Preferred hour (default 9) sets Email 1 + follow-ups.
  */
 import { WORKING_TZ, ymdInTz, zonedStartOfDay, toSqliteUtc } from './periodBounds.js';
 import {
   CAMPAIGN_SEND_END_HOUR,
   CAMPAIGN_SEND_START_HOUR,
+  DEFAULT_CAMPAIGN_SEND_HOUR,
   DEFAULT_CAMPAIGN_TIMEZONE,
+  normalizeCampaignSendHour,
   normalizeCampaignTimezone,
 } from './campaignTimezones.js';
 
@@ -51,7 +52,6 @@ export function nextWeekdayYmd(ymd, timeZone = WORKING_TZ) {
 /**
  * Add N business days (Mon–Fri only) after fromYmd.
  * delayDays=0 → same day (still snapped later for weekend/window).
- * delayDays=3 from Wed → Mon (Thu, Fri, Mon).
  */
 export function addBusinessDays(fromYmd, delayDays, timeZone = WORKING_TZ) {
   const n = Math.max(0, Number(delayDays) || 0);
@@ -59,7 +59,6 @@ export function addBusinessDays(fromYmd, delayDays, timeZone = WORKING_TZ) {
   if (n === 0) return nextWeekdayYmd(cur, timeZone);
 
   let left = n;
-  // Start counting from the next calendar day after launch day
   cur = addCalendarDays(cur, 1);
   while (left > 0) {
     if (!isWeekendYmd(cur, timeZone)) left -= 1;
@@ -75,7 +74,7 @@ export function zonedDateTime(ymd, hour, minute = 0, second = 0, timeZone = WORK
   return new Date(start.getTime() + ((hour * 60 + minute) * 60 + second) * 1000);
 }
 
-/** Parts of a Date in office TZ. */
+/** Parts of a Date in a TZ. */
 export function partsInTz(date, timeZone = WORKING_TZ) {
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat('en-US', {
@@ -104,60 +103,66 @@ export function partsInTz(date, timeZone = WORKING_TZ) {
 }
 
 /**
- * Snap an instant into the next valid send window on a weekday (09:00–14:00 local).
- * If already inside Mon–Fri 09:00–13:59 in that zone, keep it.
+ * Snap into next valid send: weekday + preferred hour inside 9am–5pm local.
+ * If already past preferred hour but still before 5pm on a weekday, keep (due soon).
+ * If before preferred hour same day, snap to preferred hour.
  */
-export function snapToSendWindow(date, timeZone = DEFAULT_CAMPAIGN_TIMEZONE) {
+export function snapToSendWindow(
+  date,
+  timeZone = DEFAULT_CAMPAIGN_TIMEZONE,
+  preferredHour = DEFAULT_CAMPAIGN_SEND_HOUR,
+) {
   const tz = normalizeCampaignTimezone(timeZone);
+  const pref = normalizeCampaignSendHour(preferredHour);
   let p = partsInTz(date, tz);
   let ymd = p.ymd;
 
-  // Weekend → next Monday window start
   if (isWeekendYmd(ymd, tz)) {
     ymd = nextWeekdayYmd(ymd, tz);
-    return zonedDateTime(ymd, CAMPAIGN_SEND_START_HOUR, 0, 0, tz);
+    return zonedDateTime(ymd, pref, 0, 0, tz);
   }
 
-  // Before window → same day at start
-  if (p.hour < CAMPAIGN_SEND_START_HOUR) {
-    return zonedDateTime(ymd, CAMPAIGN_SEND_START_HOUR, 0, 0, tz);
+  // Before preferred hour → same day at preferred
+  if (p.hour < pref) {
+    return zonedDateTime(ymd, pref, 0, 0, tz);
   }
 
-  // Inside window → keep
+  // At/after preferred and still before 5pm → keep
   if (p.hour < CAMPAIGN_SEND_END_HOUR) {
     return date;
   }
 
-  // After window → next weekday at start
+  // After 5pm → next weekday at preferred
   ymd = nextWeekdayYmd(addCalendarDays(ymd, 1), tz);
-  return zonedDateTime(ymd, CAMPAIGN_SEND_START_HOUR, 0, 0, tz);
+  return zonedDateTime(ymd, pref, 0, 0, tz);
 }
 
 /**
  * Resolve when a campaign step should send.
- * @param {Date|string} baseInstant - launch (or enrollment) time
- * @param {number} delayBusinessDays - step.delay_days (business days)
- * @param {string} [timeZone] - audience IANA timezone
+ * @param {Date|string} baseInstant
+ * @param {number} delayBusinessDays
+ * @param {string} [timeZone]
+ * @param {number} [preferredHour] - local hour 9–16
  */
 export function resolveCampaignSendAt(
   baseInstant,
   delayBusinessDays,
   timeZone = DEFAULT_CAMPAIGN_TIMEZONE,
+  preferredHour = DEFAULT_CAMPAIGN_SEND_HOUR,
 ) {
   const tz = normalizeCampaignTimezone(timeZone);
+  const pref = normalizeCampaignSendHour(preferredHour);
   const base = baseInstant instanceof Date ? baseInstant : new Date(baseInstant);
   const safeBase = Number.isNaN(base.getTime()) ? new Date() : base;
   const launchYmd = ymdInTz(safeBase, tz);
   const targetYmd = addBusinessDays(launchYmd, delayBusinessDays, tz);
 
-  // delay 0: prefer launch clock if already in weekday window; else snap
   if ((Number(delayBusinessDays) || 0) === 0) {
-    return snapToSendWindow(safeBase, tz);
+    return snapToSendWindow(safeBase, tz, pref);
   }
 
-  // Follow-ups: target business day at window start in audience TZ
-  const atStart = zonedDateTime(targetYmd, CAMPAIGN_SEND_START_HOUR, 0, 0, tz);
-  return snapToSendWindow(atStart, tz);
+  const atPref = zonedDateTime(targetYmd, pref, 0, 0, tz);
+  return snapToSendWindow(atPref, tz, pref);
 }
 
 export function toScheduleSql(date) {
@@ -170,7 +175,9 @@ export {
   PEAK_END_HOUR,
   ymdInTz,
   DEFAULT_CAMPAIGN_TIMEZONE,
+  DEFAULT_CAMPAIGN_SEND_HOUR,
   CAMPAIGN_SEND_START_HOUR,
   CAMPAIGN_SEND_END_HOUR,
   normalizeCampaignTimezone,
+  normalizeCampaignSendHour,
 };

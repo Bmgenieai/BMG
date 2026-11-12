@@ -707,6 +707,12 @@ export function migrate() {
     /* exists */
   }
 
+  try {
+    db.exec(`ALTER TABLE email_campaigns ADD COLUMN send_hour INTEGER NOT NULL DEFAULT 9`);
+  } catch {
+    /* exists */
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS email_campaign_step_variants (
       id TEXT PRIMARY KEY,
