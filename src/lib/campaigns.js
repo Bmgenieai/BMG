@@ -279,6 +279,9 @@ export function listCampaigns() {
               (SELECT COUNT(*) FROM email_messages m
                  JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
                  WHERE m.campaign_id = c.id AND cs.step_order = 3) AS sent_step_3,
+              (SELECT COUNT(*) FROM email_messages m
+                 JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+                 WHERE m.campaign_id = c.id AND cs.step_order = 4) AS sent_step_4,
               (SELECT MIN(s.scheduled_at) FROM scheduled_emails s
                  WHERE s.campaign_id = c.id
                    AND s.status IN ('pending', 'sending')
@@ -294,6 +297,166 @@ export function listCampaigns() {
     open_rate: r.sent_count ? Math.round((r.opened_count / r.sent_count) * 1000) / 10 : 0,
     reply_rate: r.sent_count ? Math.round((r.reply_count / r.sent_count) * 1000) / 10 : 0,
   }));
+}
+
+/**
+ * Drilldown rows for a campaign metric (leads, Email 1–4, opened, replies, bounced).
+ */
+export function getCampaignDrilldown(campaignId, metricRaw = 'leads') {
+  const campaign = db
+    .prepare(`SELECT id, name, status FROM email_campaigns WHERE id = ?`)
+    .get(campaignId);
+  if (!campaign) {
+    const err = new Error('Campaign not found');
+    err.status = 404;
+    throw err;
+  }
+
+  const metric = String(metricRaw || 'leads')
+    .trim()
+    .toLowerCase();
+  const limit = 2000;
+  let title = campaign.name;
+  let items = [];
+
+  if (metric === 'leads') {
+    title = `${campaign.name} · Leads`;
+    items = db
+      .prepare(
+        `SELECT cl.id, cl.status, cl.variant_key, cl.enrolled_at AS date,
+                l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                l.status AS lead_status
+         FROM email_campaign_leads cl
+         JOIN leads l ON l.id = cl.lead_id
+         WHERE cl.campaign_id = ?
+         ORDER BY cl.enrolled_at DESC
+         LIMIT ?`,
+      )
+      .all(campaignId, limit)
+      .map((row) => ({
+        ...row,
+        lead_name: displayLeadName(row.lead_name, row.lead_email, row.lead_company),
+        subject: row.variant_key ? `Variant ${row.variant_key}` : null,
+      }));
+  } else if (/^step_?[1-4]$/.test(metric) || /^email_?[1-4]$/.test(metric)) {
+    const stepOrder = Number(String(metric).replace(/\D/g, '')) || 1;
+    title = `${campaign.name} · Email ${stepOrder}`;
+    items = db
+      .prepare(
+        `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
+                m.open_count, m.reply_count, m.variant_key,
+                l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                l.status AS lead_status, cs.step_order
+         FROM email_messages m
+         JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+         LEFT JOIN leads l ON l.id = m.lead_id
+         WHERE m.campaign_id = ? AND cs.step_order = ?
+         ORDER BY m.sent_at DESC
+         LIMIT ?`,
+      )
+      .all(campaignId, stepOrder, limit)
+      .map((row) => ({
+        ...row,
+        lead_name: displayLeadName(row.lead_name, row.lead_email, row.lead_company),
+      }));
+  } else if (metric === 'opened' || metric === 'opens') {
+    title = `${campaign.name} · Opened`;
+    items = db
+      .prepare(
+        `SELECT m.id, m.subject, m.to_email, COALESCE(m.last_opened_at, m.sent_at) AS date, m.status,
+                m.open_count, m.reply_count, m.variant_key,
+                l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                l.status AS lead_status, cs.step_order
+         FROM email_messages m
+         LEFT JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+         LEFT JOIN leads l ON l.id = m.lead_id
+         WHERE m.campaign_id = ? AND COALESCE(m.open_count, 0) > 0
+         ORDER BY COALESCE(m.last_opened_at, m.sent_at) DESC
+         LIMIT ?`,
+      )
+      .all(campaignId, limit)
+      .map((row) => ({
+        ...row,
+        lead_name: displayLeadName(row.lead_name, row.lead_email, row.lead_company),
+      }));
+  } else if (metric === 'replies' || metric === 'reply') {
+    title = `${campaign.name} · Replies`;
+    items = db
+      .prepare(
+        `SELECT r.id, r.subject, r.from_email AS to_email, r.received_at AS date, 'replied' AS status,
+                r.from_name, m.variant_key, cs.step_order,
+                l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                l.status AS lead_status
+         FROM email_replies r
+         LEFT JOIN email_messages m ON m.id = r.email_message_id
+         LEFT JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+         LEFT JOIN leads l ON l.id = r.lead_id
+         WHERE EXISTS (
+           SELECT 1 FROM email_messages m2
+           WHERE m2.campaign_id = ?
+             AND (m2.id = r.email_message_id OR m2.lead_id = r.lead_id)
+         )
+         ORDER BY r.received_at DESC
+         LIMIT ?`,
+      )
+      .all(campaignId, limit)
+      .map((row) => ({
+        ...row,
+        lead_name: displayLeadName(row.lead_name, row.lead_email, row.lead_company),
+      }));
+  } else if (metric === 'bounced' || metric === 'bounces') {
+    title = `${campaign.name} · Bounces`;
+    items = db
+      .prepare(
+        `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
+                m.open_count, m.reply_count, m.variant_key,
+                l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                l.status AS lead_status, cs.step_order
+         FROM email_messages m
+         LEFT JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+         LEFT JOIN leads l ON l.id = m.lead_id
+         WHERE m.campaign_id = ? AND m.status = 'bounced'
+         ORDER BY m.sent_at DESC
+         LIMIT ?`,
+      )
+      .all(campaignId, limit)
+      .map((row) => ({
+        ...row,
+        lead_name: displayLeadName(row.lead_name, row.lead_email, row.lead_company),
+      }));
+  } else if (metric === 'sent' || metric === 'emails') {
+    title = `${campaign.name} · Sent`;
+    items = db
+      .prepare(
+        `SELECT m.id, m.subject, m.to_email, m.sent_at AS date, m.status,
+                m.open_count, m.reply_count, m.variant_key,
+                l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company,
+                l.status AS lead_status, cs.step_order
+         FROM email_messages m
+         LEFT JOIN email_campaign_steps cs ON cs.id = m.campaign_step_id
+         LEFT JOIN leads l ON l.id = m.lead_id
+         WHERE m.campaign_id = ?
+         ORDER BY m.sent_at DESC
+         LIMIT ?`,
+      )
+      .all(campaignId, limit)
+      .map((row) => ({
+        ...row,
+        lead_name: displayLeadName(row.lead_name, row.lead_email, row.lead_company),
+      }));
+  } else {
+    const err = new Error('Unknown metric');
+    err.status = 400;
+    throw err;
+  }
+
+  return {
+    campaign,
+    metric,
+    title,
+    count: items.length,
+    items,
+  };
 }
 
 export function getCampaign(id) {

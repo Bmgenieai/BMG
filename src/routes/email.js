@@ -1276,6 +1276,19 @@ router.get(
   },
 );
 
+router.get(
+  '/campaigns/:id/drilldown',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    try {
+      res.json(campaigns.getCampaignDrilldown(req.params.id, req.query.metric));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
 router.patch(
   '/campaigns/:id',
   authRequired,
