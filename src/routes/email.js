@@ -13,6 +13,7 @@ import {
   sendTransactionalEmail,
   upsertContact,
 } from '../lib/brevo.js';
+import { processDueScheduledEmails } from '../lib/scheduledEmailWorker.js';
 import {
   backfillLegacyEmailAccountIds,
   createEmailAccount,
@@ -1339,6 +1340,28 @@ router.post(
   (req, res) => {
     try {
       res.json(campaigns.launchCampaign(req.params.id, { userId: req.user.id }));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.post(
+  '/campaigns/:id/send-now',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  async (req, res) => {
+    try {
+      // Mark pending or failed emails for this campaign as immediately due
+      db.prepare(
+        `UPDATE scheduled_emails
+         SET scheduled_at = datetime('now', '-1 minute'), status = 'pending', error = NULL
+         WHERE campaign_id = ? AND status IN ('pending', 'failed')`,
+      ).run(req.params.id);
+
+      const processed = await processDueScheduledEmails();
+      const campaign = campaigns.getCampaign(req.params.id);
+      res.json({ ok: true, processed, campaign });
     } catch (err) {
       res.status(err.status || 500).json({ error: err.message });
     }

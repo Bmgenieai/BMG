@@ -491,6 +491,17 @@ export function getCampaign(id) {
     .all(id);
   const steps = hydrateStepsWithVariants(rawSteps);
 
+  const scheduledSends = db
+    .prepare(
+      `SELECT s.id, s.lead_id, s.campaign_step_id, s.status, s.scheduled_at, s.sent_at, s.error,
+              cs.step_order
+       FROM scheduled_emails s
+       LEFT JOIN email_campaign_steps cs ON cs.id = s.campaign_step_id
+       WHERE s.campaign_id = ?
+       ORDER BY s.scheduled_at ASC`,
+    )
+    .all(id);
+
   const leads = db
     .prepare(
       `SELECT cl.*, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company
@@ -500,10 +511,22 @@ export function getCampaign(id) {
        ORDER BY cl.enrolled_at DESC`,
     )
     .all(id)
-    .map((row) => ({
-      ...row,
-      lead_name: displayLeadName(row.lead_name, row.lead_email, row.lead_company),
-    }));
+    .map((row) => {
+      const s =
+        scheduledSends.find(
+          (item) =>
+            item.lead_id === row.lead_id &&
+            (item.status === 'pending' || item.status === 'sending' || item.status === 'failed'),
+        ) || scheduledSends.filter((item) => item.lead_id === row.lead_id).slice(-1)[0];
+      return {
+        ...row,
+        lead_name: displayLeadName(row.lead_name, row.lead_email, row.lead_company),
+        scheduled_at: s?.scheduled_at || null,
+        scheduled_status: s?.status || null,
+        scheduled_error: s?.error || null,
+        scheduled_step: s?.step_order || 1,
+      };
+    });
 
   const counts = db
     .prepare(
@@ -522,7 +545,7 @@ export function getCampaign(id) {
   const stats = getCampaignStats(id);
   const variantKeys = (steps[0]?.variants || []).map((v) => v.variant_key);
 
-  return { ...campaign, steps, leads, counts, stats, variantKeys };
+  return { ...campaign, steps, leads, counts, stats, variantKeys, scheduledSends };
 }
 
 export function createCampaign(body, { userId }) {
