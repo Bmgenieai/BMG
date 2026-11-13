@@ -7,8 +7,10 @@ import { canUpdateLead } from './permissions.js';
 import { resolveSendAccount } from './emailAccounts.js';
 import {
   DEFAULT_CAMPAIGN_SEND_HOUR,
+  DEFAULT_CAMPAIGN_SEND_MINUTE,
   DEFAULT_CAMPAIGN_TIMEZONE,
   normalizeCampaignSendHour,
+  normalizeCampaignSendMinute,
   normalizeCampaignTimezone,
 } from './campaignTimezones.js';
 import { resolveAnalyticsBounds } from './periodBounds.js';
@@ -544,12 +546,15 @@ export function createCampaign(body, { userId }) {
   const sendHour = normalizeCampaignSendHour(
     body.sendHour ?? body.send_hour ?? DEFAULT_CAMPAIGN_SEND_HOUR,
   );
+  const sendMinute = normalizeCampaignSendMinute(
+    body.sendMinute ?? body.send_minute ?? DEFAULT_CAMPAIGN_SEND_MINUTE,
+  );
 
   const id = uuid();
   db.prepare(
-    `INSERT INTO email_campaigns (id, name, status, email_account_id, timezone, send_hour, created_by)
-     VALUES (?, ?, 'draft', ?, ?, ?, ?)`,
-  ).run(id, name, accountId, timezone, sendHour, userId);
+    `INSERT INTO email_campaigns (id, name, status, email_account_id, timezone, send_hour, send_minute, created_by)
+     VALUES (?, ?, 'draft', ?, ?, ?, ?, ?)`,
+  ).run(id, name, accountId, timezone, sendHour, sendMinute, userId);
 
   const steps = Array.isArray(body.steps) ? body.steps : [];
   if (steps.length) {
@@ -595,11 +600,16 @@ export function updateCampaign(id, body) {
     sendHour = normalizeCampaignSendHour(body.sendHour ?? body.send_hour);
   }
 
+  let sendMinute = normalizeCampaignSendMinute(row.send_minute ?? DEFAULT_CAMPAIGN_SEND_MINUTE);
+  if (body.sendMinute !== undefined || body.send_minute !== undefined) {
+    sendMinute = normalizeCampaignSendMinute(body.sendMinute ?? body.send_minute);
+  }
+
   db.prepare(
     `UPDATE email_campaigns
-     SET name = ?, email_account_id = ?, timezone = ?, send_hour = ?, updated_at = datetime('now')
+     SET name = ?, email_account_id = ?, timezone = ?, send_hour = ?, send_minute = ?, updated_at = datetime('now')
      WHERE id = ?`,
-  ).run(name, accountId, timezone, sendHour, id);
+  ).run(name, accountId, timezone, sendHour, sendMinute, id);
 
   if (Array.isArray(body.steps)) {
     replaceSteps(id, body.steps);
@@ -1083,6 +1093,7 @@ function scheduleStepsForLeads(campaignId, leadIds, { userId, batchId = null, no
           Number(step.delay_days) || 0,
           campaign.timezone || DEFAULT_CAMPAIGN_TIMEZONE,
           campaign.send_hour ?? DEFAULT_CAMPAIGN_SEND_HOUR,
+          campaign.send_minute ?? DEFAULT_CAMPAIGN_SEND_MINUTE,
         );
         // Skip if already sent/pending for this step+lead
         const exists = db
@@ -1132,6 +1143,7 @@ export function reschedulePendingCampaignSends() {
               c.launched_at,
               c.timezone AS campaign_timezone,
               c.send_hour AS campaign_send_hour,
+              c.send_minute AS campaign_send_minute,
               cl.enrolled_at
        FROM scheduled_emails s
        JOIN email_campaigns c ON c.id = s.campaign_id
@@ -1159,6 +1171,7 @@ export function reschedulePendingCampaignSends() {
         Number(row.delay_days) || 0,
         row.campaign_timezone || DEFAULT_CAMPAIGN_TIMEZONE,
         row.campaign_send_hour ?? DEFAULT_CAMPAIGN_SEND_HOUR,
+        row.campaign_send_minute ?? DEFAULT_CAMPAIGN_SEND_MINUTE,
       );
       const sql = toScheduleSql(when);
       const r = upd.run(sql, row.id);

@@ -713,6 +713,12 @@ export function migrate() {
     /* exists */
   }
 
+  try {
+    db.exec(`ALTER TABLE email_campaigns ADD COLUMN send_minute INTEGER NOT NULL DEFAULT 0`);
+  } catch {
+    /* exists */
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS call_bookings (
       id TEXT PRIMARY KEY,

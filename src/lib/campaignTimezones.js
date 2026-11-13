@@ -6,10 +6,11 @@
 
 export const DEFAULT_CAMPAIGN_TIMEZONE = 'America/New_York';
 export const DEFAULT_CAMPAIGN_SEND_HOUR = 9;
+export const DEFAULT_CAMPAIGN_SEND_MINUTE = 0;
 
-/** Local Mon–Fri send window in the campaign timezone (9am–5pm). */
-export const CAMPAIGN_SEND_START_HOUR = 9;
-export const CAMPAIGN_SEND_END_HOUR = 17; // exclusive → through 4:59 PM; preferred hour max 16
+/** Default window start/end hours (0–24 allowed). */
+export const CAMPAIGN_SEND_START_HOUR = 0;
+export const CAMPAIGN_SEND_END_HOUR = 24;
 
 export const CAMPAIGN_TIMEZONES = [
   { value: 'America/New_York', label: 'US Eastern (New York)', short: 'ET' },
@@ -23,8 +24,8 @@ export const CAMPAIGN_TIMEZONES = [
   { value: 'UTC', label: 'UTC', short: 'UTC' },
 ];
 
-/** Preferred schedule hours inside the business window (9 AM – 4 PM). */
-export const CAMPAIGN_SEND_HOURS = [9, 10, 11, 12, 13, 14, 15, 16];
+/** All 24 hours (0–23). */
+export const CAMPAIGN_SEND_HOURS = Array.from({ length: 24 }, (_, i) => i);
 
 const ALLOWED = new Set(CAMPAIGN_TIMEZONES.map((t) => t.value));
 
@@ -38,9 +39,18 @@ export function normalizeCampaignSendHour(raw) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return DEFAULT_CAMPAIGN_SEND_HOUR;
   const hour = Math.floor(n);
-  if (hour < CAMPAIGN_SEND_START_HOUR) return CAMPAIGN_SEND_START_HOUR;
-  if (hour >= CAMPAIGN_SEND_END_HOUR) return CAMPAIGN_SEND_END_HOUR - 1;
+  if (hour < 0) return 0;
+  if (hour > 23) return 23;
   return hour;
+}
+
+export function normalizeCampaignSendMinute(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 0;
+  const minute = Math.floor(n);
+  if (minute < 0) return 0;
+  if (minute > 59) return 59;
+  return minute;
 }
 
 export function campaignTimezoneMeta(raw) {
@@ -48,22 +58,8 @@ export function campaignTimezoneMeta(raw) {
   return CAMPAIGN_TIMEZONES.find((t) => t.value === value) || CAMPAIGN_TIMEZONES[0];
 }
 
-/** True if Instant is inside Mon–Fri 9am–5pm for this IANA zone. */
+/** Check if current time is valid for campaign delivery. */
 export function isCampaignSendWindowNow(date = new Date(), timeZone = DEFAULT_CAMPAIGN_TIMEZONE) {
-  const tz = normalizeCampaignTimezone(timeZone);
-  const parts = Object.fromEntries(
-    new Intl.DateTimeFormat('en-US', {
-      timeZone: tz,
-      weekday: 'short',
-      hour: '2-digit',
-      hour12: false,
-    })
-      .formatToParts(date)
-      .filter((p) => p.type !== 'literal')
-      .map((p) => [p.type, p.value]),
-  );
-  const weekday = parts.weekday;
-  if (weekday === 'Sat' || weekday === 'Sun') return false;
-  const hour = Number(parts.hour === '24' ? '0' : parts.hour);
-  return hour >= CAMPAIGN_SEND_START_HOUR && hour < CAMPAIGN_SEND_END_HOUR;
+  // Respects exact scheduled times; allows execution once due
+  return true;
 }
