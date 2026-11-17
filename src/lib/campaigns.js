@@ -969,7 +969,94 @@ export function getCategoryStats(query = {}) {
   };
 }
 
-export function addLeads(campaignId, leadIds, { user, skipPerm = false } = {}) {
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+
+/** Parse pasted/typed recipient emails (comma, semicolon, whitespace, or newline separated). */
+export function parseEmailList(raw) {
+  const chunks = [];
+  if (Array.isArray(raw)) {
+    for (const item of raw) chunks.push(...parseEmailList(item));
+    return [...new Set(chunks)];
+  }
+  const text = String(raw || '').trim();
+  if (!text) return [];
+  return [
+    ...new Set(
+      text
+        .split(/[\s,;]+/)
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => EMAIL_RE.test(s)),
+    ),
+  ];
+}
+
+function displayNameFromEmail(email) {
+  const local = String(email || '').split('@')[0] || '';
+  const human = local
+    .replace(/[._+-]+/g, ' ')
+    .replace(/\d+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
+  return human || email;
+}
+
+/**
+ * Resolve pasted emails to lead ids — reuse existing leads by email, otherwise create
+ * lightweight manual leads (for quick campaign testing without CSV).
+ */
+export function ensureLeadsFromEmails(emails, { userId } = {}) {
+  const list = parseEmailList(emails);
+  if (!list.length) return { leadIds: [], created: 0, reused: 0 };
+
+  const findByEmail = db.prepare(
+    `SELECT id FROM leads
+     WHERE LOWER(TRIM(COALESCE(email, ''))) = ?
+       AND (archived_at IS NULL OR archived_at = '')
+     ORDER BY created_at DESC
+     LIMIT 1`,
+  );
+  const insertLead = db.prepare(
+    `INSERT INTO leads (
+       id, name, email, company, industry, contact_format, source, status,
+       notes, created_by, assigned_to, assigned_at, assigned_by, date_added, times_added
+     ) VALUES (?, ?, ?, NULL, 'Campaign test', 'company', 'manual', 'uncontacted',
+       ?, ?, ?, datetime('now'), ?, datetime('now'), 1)`,
+  );
+
+  const leadIds = [];
+  let created = 0;
+  let reused = 0;
+  const tx = db.transaction(() => {
+    for (const email of list) {
+      const existing = findByEmail.get(email);
+      if (existing?.id) {
+        leadIds.push(existing.id);
+        reused += 1;
+        continue;
+      }
+      const id = uuid();
+      insertLead.run(
+        id,
+        displayNameFromEmail(email),
+        email,
+        'Added via campaign manual email entry (test/send)',
+        userId || null,
+        userId || null,
+        userId || null,
+      );
+      leadIds.push(id);
+      created += 1;
+    }
+  });
+  tx();
+
+  return { leadIds, created, reused, emails: list };
+}
+
+export function addLeads(campaignId, leadIds, { user, skipPerm = false, emails } = {}) {
   const campaign = db.prepare(`SELECT * FROM email_campaigns WHERE id = ?`).get(campaignId);
   if (!campaign) {
     const err = new Error('Campaign not found');
@@ -982,9 +1069,14 @@ export function addLeads(campaignId, leadIds, { user, skipPerm = false } = {}) {
     throw err;
   }
 
-  const ids = [...new Set((leadIds || []).filter(Boolean))];
+  let fromEmails = { leadIds: [], created: 0, reused: 0 };
+  if (emails != null && String(emails).trim() !== '' && !(Array.isArray(emails) && !emails.length)) {
+    fromEmails = ensureLeadsFromEmails(emails, { userId: user?.id });
+  }
+
+  const ids = [...new Set([...(leadIds || []).filter(Boolean), ...fromEmails.leadIds])];
   if (!ids.length) {
-    const err = new Error('leadIds[] required');
+    const err = new Error('leadIds[] or emails required');
     err.status = 400;
     throw err;
   }
@@ -1029,7 +1121,53 @@ export function addLeads(campaignId, leadIds, { user, skipPerm = false } = {}) {
     }).scheduled;
   }
 
-  return { added, total: leads.length, scheduled };
+  return {
+    added,
+    total: leads.length,
+    scheduled,
+    createdLeads: fromEmails.created || 0,
+    reusedLeads: fromEmails.reused || 0,
+  };
+}
+
+/**
+ * Mark the next pending campaign wave as due now (does not force later follow-ups).
+ * Returns number of rows bumped.
+ */
+export function bumpNextCampaignWaveDue(campaignId) {
+  const nextStep = db
+    .prepare(
+      `SELECT cs.id AS step_id
+       FROM scheduled_emails s
+       JOIN email_campaign_steps cs ON cs.id = s.campaign_step_id
+       WHERE s.campaign_id = ?
+         AND s.status IN ('pending', 'failed')
+         AND s.campaign_step_id IS NOT NULL
+       ORDER BY cs.step_order ASC, s.scheduled_at ASC
+       LIMIT 1`,
+    )
+    .get(campaignId);
+
+  if (nextStep?.step_id) {
+    return db
+      .prepare(
+        `UPDATE scheduled_emails
+         SET scheduled_at = datetime('now', '-1 minute'), status = 'pending', error = NULL
+         WHERE campaign_id = ?
+           AND campaign_step_id = ?
+           AND status IN ('pending', 'failed')`,
+      )
+      .run(campaignId, nextStep.step_id).changes;
+  }
+
+  // Fallback: no step linkage — bump all pending for this campaign
+  return db
+    .prepare(
+      `UPDATE scheduled_emails
+       SET scheduled_at = datetime('now', '-1 minute'), status = 'pending', error = NULL
+       WHERE campaign_id = ? AND status IN ('pending', 'failed')`,
+    )
+    .run(campaignId).changes;
 }
 
 export function removeLead(campaignId, leadId) {

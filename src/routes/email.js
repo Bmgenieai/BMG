@@ -1311,8 +1311,13 @@ router.post(
   requirePermission('email:manage_campaigns'),
   (req, res) => {
     try {
-      const { leadIds } = req.body || {};
-      res.json(campaigns.addLeads(req.params.id, leadIds, { user: req.user }));
+      const { leadIds, emails } = req.body || {};
+      res.json(
+        campaigns.addLeads(req.params.id, leadIds, {
+          user: req.user,
+          emails,
+        }),
+      );
     } catch (err) {
       res.status(err.status || 500).json({ error: err.message });
     }
@@ -1352,16 +1357,23 @@ router.post(
   requirePermission('email:manage_campaigns'),
   async (req, res) => {
     try {
-      // Mark pending or failed emails for this campaign as immediately due
-      db.prepare(
-        `UPDATE scheduled_emails
-         SET scheduled_at = datetime('now', '-1 minute'), status = 'pending', error = NULL
-         WHERE campaign_id = ? AND status IN ('pending', 'failed')`,
-      ).run(req.params.id);
+      const campaignRow = db
+        .prepare(`SELECT id, status FROM email_campaigns WHERE id = ?`)
+        .get(req.params.id);
+      if (!campaignRow) {
+        return res.status(404).json({ error: 'Campaign not found' });
+      }
 
+      let launchResult = null;
+      // Draft/paused: launch (schedule) first, then dispatch the first wave immediately
+      if (campaignRow.status === 'draft' || campaignRow.status === 'paused') {
+        launchResult = campaigns.launchCampaign(req.params.id, { userId: req.user.id });
+      }
+
+      const bumped = campaigns.bumpNextCampaignWaveDue(req.params.id);
       const processed = await processDueScheduledEmails();
       const campaign = campaigns.getCampaign(req.params.id);
-      res.json({ ok: true, processed, campaign });
+      res.json({ ok: true, bumped, processed, launched: Boolean(launchResult), launch: launchResult, campaign });
     } catch (err) {
       res.status(err.status || 500).json({ error: err.message });
     }
