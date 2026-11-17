@@ -502,6 +502,23 @@ export function getCampaign(id) {
     )
     .all(id);
 
+  const repliedLeadIds = new Set(
+    db
+      .prepare(
+        `SELECT DISTINCT r.lead_id AS lead_id
+         FROM email_replies r
+         WHERE r.lead_id IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM email_messages m
+             WHERE m.campaign_id = ?
+               AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
+           )`,
+      )
+      .all(id)
+      .map((r) => r.lead_id)
+      .filter(Boolean),
+  );
+
   const leads = db
     .prepare(
       `SELECT cl.*, l.name AS lead_name, l.email AS lead_email, l.company AS lead_company
@@ -525,6 +542,7 @@ export function getCampaign(id) {
         scheduled_status: s?.status || null,
         scheduled_error: s?.error || null,
         scheduled_step: s?.step_order || 1,
+        replied: repliedLeadIds.has(row.lead_id),
       };
     });
 
@@ -545,7 +563,40 @@ export function getCampaign(id) {
   const stats = getCampaignStats(id);
   const variantKeys = (steps[0]?.variants || []).map((v) => v.variant_key);
 
-  return { ...campaign, steps, leads, counts, stats, variantKeys, scheduledSends };
+  // Per-step queue: pending / sent / next scheduled date (campaign follow-ups live here)
+  const sequenceSummary = steps.map((step, idx) => {
+    const stepSends = scheduledSends.filter((s) => s.campaign_step_id === step.id);
+    const pending = stepSends.filter((s) => s.status === 'pending' || s.status === 'sending');
+    const sent = stepSends.filter((s) => s.status === 'sent').length;
+    const failed = stepSends.filter((s) => s.status === 'failed').length;
+    const next = pending
+      .slice()
+      .sort((a, b) => String(a.scheduled_at || '').localeCompare(String(b.scheduled_at || '')))[0];
+    const stepStat = (stats.byStep || []).find((x) => x.step_id === step.id);
+    return {
+      stepId: step.id,
+      stepOrder: step.step_order || idx + 1,
+      label: idx === 0 ? 'Initial email' : `Follow-up ${idx}`,
+      delayDays: Number(step.delay_days) || 0,
+      subject: step.subject || step.variants?.[0]?.subject || null,
+      pending: pending.length,
+      sent: stepStat?.sent ?? sent,
+      failed,
+      replies: stepStat?.replies ?? 0,
+      nextScheduledAt: next?.scheduled_at || null,
+    };
+  });
+
+  return {
+    ...campaign,
+    steps,
+    leads,
+    counts: { ...counts, replied: repliedLeadIds.size },
+    stats,
+    variantKeys,
+    scheduledSends,
+    sequenceSummary,
+  };
 }
 
 export function createCampaign(body, { userId }) {

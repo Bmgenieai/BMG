@@ -76,19 +76,6 @@ router.get('/', requireAnyPermission(
     `SELECT status, COUNT(*) AS c FROM leads
      WHERE assigned_to = ? GROUP BY status`,
   );
-  const overdueFu = db.prepare(
-    `SELECT COUNT(*) AS c FROM follow_ups
-     WHERE assigned_to = ? AND status IN ('pending','overdue') AND due_at < datetime('now')`,
-  );
-  const pendingFu = db.prepare(
-    `SELECT COUNT(*) AS c FROM follow_ups
-     WHERE assigned_to = ? AND status = 'pending'`,
-  );
-  const dueToday = db.prepare(
-    `SELECT COUNT(*) AS c FROM follow_ups
-     WHERE assigned_to = ? AND status IN ('pending','overdue')
-       AND date(due_at) = date('now')`,
-  );
 
   const people = reps.map((rep) => {
     const byStatus = Object.fromEntries(
@@ -96,17 +83,15 @@ router.get('/', requireAnyPermission(
     );
     const open = OPEN_STATUSES.reduce((s, st) => s + (byStatus[st] || 0), 0);
     const ended = END_STATUSES.reduce((s, st) => s + (byStatus[st] || 0), 0);
-    const overdue = overdueFu.get(rep.id).c;
-    const pending = pendingFu.get(rep.id).c;
-    const today = dueToday.get(rep.id).c;
 
+    // Legacy manual follow-up buckets omitted from UI — campaign sequences live under Campaigns.
     const buckets = [
       ...OPEN_STATUSES.map((st) => ({
         key: st,
         label: STATUS_LABELS[st] || st.replace(/_/g, ' '),
         count: byStatus[st] || 0,
         kind: 'open',
-        tone: toneFor(st, overdue),
+        tone: toneFor(st, 0),
       })),
       ...END_STATUSES.map((st) => ({
         key: st,
@@ -115,32 +100,11 @@ router.get('/', requireAnyPermission(
         kind: 'ended',
         tone: toneFor(st, 0),
       })),
-      {
-        key: 'followups_overdue',
-        label: 'Overdue follow-ups',
-        count: overdue,
-        kind: 'attention',
-        tone: overdue ? 'red' : 'green',
-      },
-      {
-        key: 'followups_pending',
-        label: 'Pending follow-ups',
-        count: pending,
-        kind: 'open',
-        tone: 'amber',
-      },
-      {
-        key: 'followups_today',
-        label: 'Due today',
-        count: today,
-        kind: 'attention',
-        tone: today ? 'amber' : 'green',
-      },
     ];
 
     return {
       user: rep,
-      totals: { open, ended, overdue, pending, today },
+      totals: { open, ended, overdue: 0, pending: 0, today: 0 },
       buckets,
     };
   });
