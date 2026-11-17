@@ -190,7 +190,7 @@ async function processMessage(client, uid, mailboxMeta) {
       to: toEmails,
       subject: parsed.subject,
     },
-    source: 'brevo_inbound',
+    source: 'sender_mailbox',
     requireLeadMatch: false,
   });
 }

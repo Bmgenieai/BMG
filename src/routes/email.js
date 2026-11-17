@@ -27,17 +27,18 @@ import * as campaigns from '../lib/campaigns.js';
 import { canAccessLead, canUpdateLead, roleHasPermission } from '../lib/permissions.js';
 import { claimLeadIfUnassigned } from '../lib/leadAutomation.js';
 import {
-  countEmailReplies,
-  countUnreadEmailReplies,
   getEmailReply,
+  getEmailReplyInboxCounts,
   getLeadConversation,
   getLeadEmailHistory,
   ingestBrevoInboundEmail,
   ingestBrevoWebhookEvent,
   listEmailReplies,
   markEmailReplyRead,
+  markWarmupEmailRepliesRead,
   recordEmailSend,
   sendCrmReplyToInbound,
+  setEmailReplyInboxKind,
 } from '../lib/emailLog.js';
 import { resolveAnalyticsBounds } from '../lib/periodBounds.js';
 
@@ -205,10 +206,12 @@ router.get(
       req.query.unread === '1' ||
       req.query.unread === 'true' ||
       req.query.status === 'unread';
+    const bucket = String(req.query.bucket || req.query.kind || 'campaign').toLowerCase();
     const rows = listEmailReplies({
       user: req.user,
       q: String(req.query.q || '').trim(),
       unreadOnly,
+      bucket: ['campaign', 'warmup', 'all'].includes(bucket) ? bucket : 'campaign',
       limit: Number(req.query.limit) || 100,
       canViewAll,
     });
@@ -222,10 +225,22 @@ router.get(
   requireAnyPermission('leads:view_all', 'leads:view_own'),
   (req, res) => {
     const canViewAll = roleHasPermission(req.user.role, 'leads:view_all');
-    res.json({
-      unread: countUnreadEmailReplies({ user: req.user, canViewAll }),
-      total: countEmailReplies({ user: req.user, canViewAll }),
-    });
+    res.json(getEmailReplyInboxCounts({ user: req.user, canViewAll }));
+  },
+);
+
+/** Mark Instantly warm-up / non-campaign inbox noise as read in bulk. */
+router.post(
+  '/replies/mark-warmup-read',
+  authRequired,
+  requireAnyPermission('leads:view_all', 'leads:view_own'),
+  (req, res) => {
+    try {
+      const canViewAll = roleHasPermission(req.user.role, 'leads:view_all');
+      res.json(markWarmupEmailRepliesRead({ user: req.user, canViewAll }));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
   },
 );
 
@@ -263,6 +278,31 @@ router.post(
     }
     const read = req.body?.read !== false;
     res.json(markEmailReplyRead(req.params.id, read));
+  },
+);
+
+/** Move a thread between Campaign replies and Warm-up section. */
+router.post(
+  '/replies/:id/inbox-kind',
+  authRequired,
+  requireAnyPermission('leads:view_all', 'leads:view_own'),
+  (req, res) => {
+    try {
+      const row = getEmailReply(req.params.id);
+      if (!row) return res.status(404).json({ error: 'Reply not found' });
+      if (row.lead_id) {
+        const lead = db.prepare(`SELECT * FROM leads WHERE id = ?`).get(row.lead_id);
+        if (lead && !canAccessLead(req.user, lead)) {
+          return res.status(403).json({ error: 'Permission denied' });
+        }
+      } else if (!roleHasPermission(req.user.role, 'leads:view_all')) {
+        return res.status(403).json({ error: 'Permission denied' });
+      }
+      const kind = req.body?.kind || req.body?.inboxKind || req.body?.bucket;
+      res.json(setEmailReplyInboxKind(req.params.id, kind));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
   },
 );
 

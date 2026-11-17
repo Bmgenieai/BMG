@@ -563,11 +563,15 @@ function upsertReplyStubFromEvent({
   if (recentInbound) return recentInbound.id;
 
   const id = uuid();
+  const inboxKind = computeReplyInboxKind({
+    emailMessageId: message?.id || null,
+    leadId,
+  });
   db.prepare(
     `INSERT INTO email_replies (
        id, lead_id, email_message_id, provider_message_id, from_email, subject,
-       source, received_at, raw_json
-     ) VALUES (?, ?, ?, ?, ?, ?, 'brevo_event', ?, ?)`,
+       source, received_at, raw_json, inbox_kind
+     ) VALUES (?, ?, ?, ?, ?, ?, 'brevo_event', ?, ?, ?)`,
   ).run(
     id,
     leadId,
@@ -577,8 +581,47 @@ function upsertReplyStubFromEvent({
     subject || null,
     occurredAt,
     JSON.stringify(payload).slice(0, 8000),
+    inboxKind,
   );
   return id;
+}
+
+/** Campaign replies vs Instantly warm-up / unmatched mailbox noise. */
+export function computeReplyInboxKind({ emailMessageId = null, leadId = null } = {}) {
+  if (emailMessageId) {
+    const linked = db
+      .prepare(
+        `SELECT campaign_id FROM email_messages
+         WHERE id = ? AND campaign_id IS NOT NULL AND TRIM(campaign_id) != ''`,
+      )
+      .get(emailMessageId);
+    if (linked) return 'campaign';
+  }
+  if (leadId) {
+    const campaignOutbound = db
+      .prepare(
+        `SELECT 1 AS ok FROM email_messages
+         WHERE lead_id = ?
+           AND campaign_id IS NOT NULL
+           AND TRIM(campaign_id) != ''
+         LIMIT 1`,
+      )
+      .get(leadId);
+    const enrolled = db
+      .prepare(`SELECT 1 AS ok FROM email_campaign_leads WHERE lead_id = ? LIMIT 1`)
+      .get(leadId);
+    // Matched CRM lead that is (or was) in a campaign and has campaign outbound → campaign reply
+    if (campaignOutbound && enrolled) return 'campaign';
+  }
+  return 'warmup';
+}
+
+export function normalizeInboxKind(raw) {
+  const v = String(raw || '')
+    .trim()
+    .toLowerCase();
+  if (v === 'campaign' || v === 'warmup') return v;
+  return null;
 }
 
 /**
@@ -631,13 +674,17 @@ export function ingestParsedReply({
 
   const when = receivedAt || new Date().toISOString();
   const id = uuid();
+  const inboxKind = computeReplyInboxKind({
+    emailMessageId: message?.id || null,
+    leadId,
+  });
   db.prepare(
     `INSERT INTO email_replies (
        id, lead_id, email_message_id, provider_message_id, in_reply_to,
        from_email, from_name, to_emails, subject,
        body_text, body_html, body_markdown, spam_score,
-       source, received_at, raw_json
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       source, received_at, raw_json, inbox_kind
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     leadId,
@@ -655,6 +702,7 @@ export function ingestParsedReply({
     sourceKey,
     when,
     raw ? JSON.stringify(raw).slice(0, 16_000) : null,
+    inboxKind,
   );
 
   if (leadId) {
@@ -788,11 +836,22 @@ export function ingestBrevoInboundEmail(item) {
   });
 }
 
-/**
- * List email replies for CRM inbox tab.
- * @param {{ user: { id: string, role: string }, q?: string, unreadOnly?: boolean, limit?: number, canViewAll: boolean }} opts
- */
-export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100, canViewAll }) {
+function inboxKindExpr(alias = 'r') {
+  // Prefer stored inbox_kind; fall back so older rows still classify correctly
+  return `CASE
+    WHEN LOWER(TRIM(COALESCE(${alias}.inbox_kind, ''))) IN ('campaign', 'warmup')
+      THEN LOWER(TRIM(${alias}.inbox_kind))
+    WHEN EXISTS (
+      SELECT 1 FROM email_messages mx
+      WHERE mx.id = ${alias}.email_message_id
+        AND mx.campaign_id IS NOT NULL
+        AND TRIM(mx.campaign_id) != ''
+    ) THEN 'campaign'
+    ELSE 'warmup'
+  END`;
+}
+
+function scopeReplyClauses({ user, canViewAll, unreadOnly = false, q = '', bucket = 'all' }) {
   const clauses = [];
   const params = [];
 
@@ -803,6 +862,11 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
   if (unreadOnly) {
     clauses.push('r.read_at IS NULL');
   }
+  const kind = normalizeInboxKind(bucket);
+  if (kind) {
+    clauses.push(`(${inboxKindExpr('r')}) = ?`);
+    params.push(kind);
+  }
   if (q) {
     clauses.push(
       `(r.subject LIKE ? OR r.from_email LIKE ? OR r.body_markdown LIKE ? OR r.body_text LIKE ? OR l.name LIKE ? OR l.email LIKE ? OR m.subject LIKE ? OR su.name LIKE ?)`,
@@ -810,7 +874,22 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
     const like = `%${q}%`;
     params.push(like, like, like, like, like, like, like, like);
   }
+  return { clauses, params };
+}
 
+/**
+ * List email replies for CRM inbox tab.
+ * @param {{ user: { id: string, role: string }, q?: string, unreadOnly?: boolean, bucket?: string, limit?: number, canViewAll: boolean }} opts
+ */
+export function listEmailReplies({
+  user,
+  q = '',
+  unreadOnly = false,
+  bucket = 'all',
+  limit = 100,
+  canViewAll,
+}) {
+  const { clauses, params } = scopeReplyClauses({ user, canViewAll, unreadOnly, q, bucket });
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const rows = db
     .prepare(
@@ -828,6 +907,7 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
                 m.sent_at AS original_sent_at,
                 m.to_email AS original_to_email,
                 su.name AS sent_by_name,
+                (${inboxKindExpr('r')}) AS resolved_inbox_kind,
                 COALESCE(r.lead_id, LOWER(TRIM(r.from_email))) AS conv_key,
                 ROW_NUMBER() OVER (
                   PARTITION BY COALESCE(r.lead_id, LOWER(TRIM(r.from_email)))
@@ -855,6 +935,7 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
 
   return rows.map((r) => ({
     ...r,
+    inbox_kind: r.resolved_inbox_kind || r.inbox_kind || 'warmup',
     preview: (r.body_markdown || r.body_text || r.subject || '')
       .replace(/\s+/g, ' ')
       .trim()
@@ -864,43 +945,102 @@ export function listEmailReplies({ user, q = '', unreadOnly = false, limit = 100
   }));
 }
 
-export function countUnreadEmailReplies({ user, canViewAll }) {
-  if (canViewAll || !user?.id) {
-    return db
-      .prepare(
-        `SELECT COUNT(DISTINCT COALESCE(lead_id, LOWER(TRIM(from_email)))) AS c
-         FROM email_replies WHERE read_at IS NULL`,
-      )
-      .get().c;
+function countDistinctThreads({ user, canViewAll, unreadOnly = false, bucket = 'all' }) {
+  const { clauses, params } = scopeReplyClauses({ user, canViewAll, unreadOnly, bucket });
+  // scopeReplyClauses joins m/su for search — for counts we only need leads
+  const countClauses = [];
+  const countParams = [];
+  if (!canViewAll && user?.id) {
+    countClauses.push('(l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)');
+    countParams.push(user.id, user.id);
   }
+  if (unreadOnly) countClauses.push('r.read_at IS NULL');
+  const kind = normalizeInboxKind(bucket);
+  if (kind) {
+    countClauses.push(`(${inboxKindExpr('r')}) = ?`);
+    countParams.push(kind);
+  }
+  const where = countClauses.length ? `WHERE ${countClauses.join(' AND ')}` : '';
   return db
     .prepare(
       `SELECT COUNT(DISTINCT COALESCE(r.lead_id, LOWER(TRIM(r.from_email)))) AS c
        FROM email_replies r
        LEFT JOIN leads l ON l.id = r.lead_id
-       WHERE r.read_at IS NULL
-         AND (l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)`,
+       ${where}`,
     )
-    .get(user.id, user.id).c;
+    .get(...countParams).c;
 }
 
-export function countEmailReplies({ user, canViewAll }) {
-  if (canViewAll || !user?.id) {
-    return db
-      .prepare(
-        `SELECT COUNT(DISTINCT COALESCE(lead_id, LOWER(TRIM(from_email)))) AS c
-         FROM email_replies`,
-      )
-      .get().c;
+export function countUnreadEmailReplies({ user, canViewAll, bucket = 'all' }) {
+  return countDistinctThreads({ user, canViewAll, unreadOnly: true, bucket });
+}
+
+export function countEmailReplies({ user, canViewAll, bucket = 'all' }) {
+  return countDistinctThreads({ user, canViewAll, unreadOnly: false, bucket });
+}
+
+export function getEmailReplyInboxCounts({ user, canViewAll }) {
+  return {
+    total: countEmailReplies({ user, canViewAll, bucket: 'all' }),
+    unread: countUnreadEmailReplies({ user, canViewAll, bucket: 'all' }),
+    campaign: countEmailReplies({ user, canViewAll, bucket: 'campaign' }),
+    campaignUnread: countUnreadEmailReplies({ user, canViewAll, bucket: 'campaign' }),
+    warmup: countEmailReplies({ user, canViewAll, bucket: 'warmup' }),
+    warmupUnread: countUnreadEmailReplies({ user, canViewAll, bucket: 'warmup' }),
+  };
+}
+
+export function setEmailReplyInboxKind(id, kindRaw) {
+  const kind = normalizeInboxKind(kindRaw);
+  if (!kind) {
+    const err = new Error('inbox kind must be campaign or warmup');
+    err.status = 400;
+    throw err;
   }
-  return db
+  const row = db.prepare(`SELECT id, lead_id, from_email FROM email_replies WHERE id = ?`).get(id);
+  if (!row) {
+    const err = new Error('Reply not found');
+    err.status = 404;
+    throw err;
+  }
+  // Apply to whole thread so list bucketing stays consistent
+  if (row.lead_id) {
+    db.prepare(`UPDATE email_replies SET inbox_kind = ? WHERE lead_id = ?`).run(kind, row.lead_id);
+  } else if (row.from_email) {
+    db.prepare(
+      `UPDATE email_replies SET inbox_kind = ? WHERE LOWER(TRIM(from_email)) = ?`,
+    ).run(kind, String(row.from_email).toLowerCase().trim());
+  } else {
+    db.prepare(`UPDATE email_replies SET inbox_kind = ? WHERE id = ?`).run(kind, id);
+  }
+  return getEmailReply(id);
+}
+
+/** Mark every warm-up thread as read (keeps Campaign inbox clean during Instantly warm-up). */
+export function markWarmupEmailRepliesRead({ user, canViewAll }) {
+  const countClauses = ['r.read_at IS NULL', `(${inboxKindExpr('r')}) = 'warmup'`];
+  const countParams = [];
+  if (!canViewAll && user?.id) {
+    countClauses.unshift('(l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)');
+    countParams.push(user.id, user.id);
+  }
+  const where = `WHERE ${countClauses.join(' AND ')}`;
+  const ids = db
     .prepare(
-      `SELECT COUNT(DISTINCT COALESCE(r.lead_id, LOWER(TRIM(r.from_email)))) AS c
+      `SELECT r.id
        FROM email_replies r
        LEFT JOIN leads l ON l.id = r.lead_id
-       WHERE (l.assigned_to = ? OR l.created_by = ? OR r.lead_id IS NULL)`,
+       ${where}`,
     )
-    .get(user.id, user.id).c;
+    .all(...countParams)
+    .map((r) => r.id);
+  const readAt = new Date().toISOString();
+  const upd = db.prepare(`UPDATE email_replies SET read_at = ? WHERE id = ?`);
+  const tx = db.transaction(() => {
+    for (const id of ids) upd.run(readAt, id);
+  });
+  tx();
+  return { ok: true, marked: ids.length };
 }
 
 function findOriginalOutboundMessage(reply) {
@@ -1153,8 +1293,16 @@ export function getEmailReply(id) {
   const original = findOriginalOutboundMessage(row);
   const replySender = resolveCrmReplySender(row, original);
 
+  const resolvedKind =
+    normalizeInboxKind(row.inbox_kind) ||
+    computeReplyInboxKind({
+      emailMessageId: row.email_message_id,
+      leadId: row.lead_id,
+    });
+
   return {
     ...row,
+    inbox_kind: resolvedKind,
     hasBody: Boolean(row.body_markdown || row.body_text || row.body_html),
     thread,
     allReplyIds: allReplies.map((r) => r.id),

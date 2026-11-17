@@ -838,6 +838,47 @@ export function migrate() {
     }
   }
 
+  // Separate Instantly warm-up / noise from real campaign replies in Email inbox
+  try {
+    db.exec(`ALTER TABLE email_replies ADD COLUMN inbox_kind TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  try {
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_email_replies_inbox_kind ON email_replies(inbox_kind, received_at)`,
+    );
+  } catch {
+    /* ignore */
+  }
+  if (!metaGet.get('email_replies_inbox_kind_backfill_v1')?.value) {
+    try {
+      db.exec(`
+        UPDATE email_replies
+        SET inbox_kind = 'campaign'
+        WHERE email_message_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM email_messages m
+            WHERE m.id = email_replies.email_message_id
+              AND m.campaign_id IS NOT NULL
+              AND TRIM(m.campaign_id) != ''
+          );
+
+        UPDATE email_replies
+        SET inbox_kind = 'warmup'
+        WHERE inbox_kind IS NULL OR TRIM(COALESCE(inbox_kind, '')) = '';
+      `);
+      metaSet.run('email_replies_inbox_kind_backfill_v1', '1');
+    } catch (err) {
+      console.warn('[migrate] email_replies_inbox_kind_backfill_v1:', err.message);
+      try {
+        metaSet.run('email_replies_inbox_kind_backfill_v1', '1');
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   // Seed default account from BREVO_SENDER_EMAIL once
   if (!metaGet.get('email_accounts_seed_v1')?.value) {
     try {
