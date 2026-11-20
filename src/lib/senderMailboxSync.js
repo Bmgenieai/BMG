@@ -207,6 +207,14 @@ async function syncOneMailbox(box, lookbackDays) {
     secure: true,
     auth: { user: box.user, pass: box.pass },
     logger: false,
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 30_000,
+  });
+
+  // Prevent unhandled 'error' events from crashing Node when internet drops mid-sync.
+  client.on('error', (err) => {
+    console.warn('[sender-mailbox] imap socket error:', box.user, err?.message || err);
   });
 
   try {

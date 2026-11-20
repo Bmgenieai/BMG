@@ -98,6 +98,10 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: err.message || 'Server error' });
 });
 
+process.on('unhandledRejection', (err) => {
+  console.error('[unhandledRejection]', err?.stack || err);
+});
+
 app.listen(PORT, () => {
   console.log(`BMGenie CRM API listening on http://localhost:${PORT}/api`);
   if (FRONTEND_URL) console.log(`FRONTEND_URL=${FRONTEND_URL}`);

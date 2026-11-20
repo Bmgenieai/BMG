@@ -1,11 +1,15 @@
-# Register BMG-CRM-Watchdog Scheduled Task (every 10 minutes).
-# Run: Right-click PowerShell -> Run as administrator
+# Register BMG-CRM-Watchdog Scheduled Task:
+#   - Every 2 minutes
+#   - At Windows startup (45s delay)
+#   - Immediately when Windows reconnects to a network (Event ID 10000)
+# Also configures any cloudflared Windows service for Automatic startup + restart on failure.
+# Run: Right-click PowerShell -> Run as administrator (same user as DEPLOY_USER)
 #Requires -Version 5.1
 #Requires -RunAsAdministrator
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'BMG-CRM-Watchdog'
-$IntervalMinutes = 10
+$IntervalMinutes = 2
 
 $sys32 = Join-Path $env:SystemRoot 'System32'
 if ($env:Path -notlike "*${sys32}*") {
@@ -49,9 +53,30 @@ if (-not $cred) {
 }
 
 $action = New-ScheduledTaskAction -Execute $wrapper
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+
+# Trigger 1: Every 2 minutes
+$repeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
   -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
   -RepetitionDuration (New-TimeSpan -Days 3650)
+
+# Trigger 2: At Windows startup (after power outage / reboot, even before login)
+$bootTrigger = New-ScheduledTaskTrigger -AtStartup
+$bootTrigger.Delay = 'PT45S'
+
+$triggers = @($repeatTrigger, $bootTrigger)
+
+# Trigger 3: On network connect (Event ID 10000 in Microsoft-Windows-NetworkProfile/Operational)
+try {
+  $eventTriggerClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler
+  $netTrigger = New-CimInstance -CimClass $eventTriggerClass -ClientOnly
+  $netTrigger.Enabled = $true
+  $netTrigger.Delay = 'PT10S'
+  $netTrigger.Subscription = "<QueryList><Query Id='0' Path='Microsoft-Windows-NetworkProfile/Operational'><Select Path='Microsoft-Windows-NetworkProfile/Operational'>*[System[EventID=10000]]</Select></Query></QueryList>"
+  $triggers += $netTrigger
+  Write-Host 'Added network-reconnect trigger (NetworkProfile EventID=10000).'
+} catch {
+  Write-Warning "Could not attach network-reconnect event trigger (2-min + boot triggers still active): $_"
+}
 
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
@@ -64,12 +89,12 @@ try {
   Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
-    -Trigger $trigger `
+    -Trigger $triggers `
     -User $cred.UserName `
     -Password $cred.GetNetworkCredential().Password `
     -RunLevel Highest `
     -Settings $settings `
-    -Description "CRM Watchdog: every $IntervalMinutes min check health and pm2 restart if down" | Out-Null
+    -Description "CRM Watchdog: boot + network reconnect + every $IntervalMinutes min check health, PM2, and cloudflared" | Out-Null
 } catch {
   $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
   if (-not (Test-Path $schtasks)) {
@@ -85,6 +110,17 @@ try {
   }
 }
 
+# Ensure cloudflared service (if installed) starts automatically and auto-restarts on failure
+foreach ($svc in @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*cloudflared*' })) {
+  try {
+    Set-Service -Name $svc.Name -StartupType Automatic -ErrorAction Stop
+    & (Join-Path $sys32 'sc.exe') failure $svc.Name reset= 86400 actions= restart/5000/restart/15000/restart/30000 | Out-Null
+    Write-Host "Configured service '$($svc.Name)' as Automatic + restart-on-failure."
+  } catch {
+    Write-Warning "Could not configure '$($svc.Name)' recovery: $_"
+  }
+}
+
 # Smoke-test watchdog once now (same session - do not spawn nested powershell)
 Write-Host 'Running watchdog once to verify...'
 & $watchdog
@@ -93,6 +129,6 @@ if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) {
 }
 
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-Write-Host ("OK: '{0}' state={1} - every {2} minutes" -f $task.TaskName, $task.State, $IntervalMinutes)
+Write-Host ("OK: '{0}' state={1} - every {2} minutes + boot + network reconnect" -f $task.TaskName, $task.State, $IntervalMinutes)
 Write-Host ("Log: {0}" -f (Join-Path $Root 'logs\crm-watchdog.log'))
 Write-Host 'Start-ScheduledTask -TaskName BMG-CRM-Watchdog'
