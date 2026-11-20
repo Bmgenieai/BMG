@@ -1294,6 +1294,15 @@ router.get(
   },
 );
 
+router.get(
+  '/campaigns/failed-summary',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (_req, res) => {
+    res.json(campaigns.listFailedCampaignSteps());
+  },
+);
+
 router.post(
   '/campaigns',
   authRequired,
@@ -1414,6 +1423,30 @@ router.post(
       const processed = await processDueScheduledEmails();
       const campaign = campaigns.getCampaign(req.params.id);
       res.json({ ok: true, bumped, processed, launched: Boolean(launchResult), launch: launchResult, campaign });
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.post(
+  '/campaigns/:id/steps/:stepId/retry',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  async (req, res) => {
+    try {
+      const mode = req.body?.mode === 'schedule' ? 'schedule' : 'now';
+      const scheduledAt = req.body?.scheduledAt || null;
+      const result = campaigns.retryFailedCampaignStep(req.params.id, req.params.stepId, {
+        mode,
+        scheduledAt,
+      });
+      let processed = 0;
+      if (mode === 'now') {
+        processed = await processDueScheduledEmails();
+      }
+      const campaign = campaigns.getCampaign(req.params.id);
+      res.json({ ...result, processed, campaign });
     } catch (err) {
       res.status(err.status || 500).json({ error: err.message });
     }

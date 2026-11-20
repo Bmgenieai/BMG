@@ -563,12 +563,14 @@ export function getCampaign(id) {
   const stats = getCampaignStats(id);
   const variantKeys = (steps[0]?.variants || []).map((v) => v.variant_key);
 
-  // Per-step queue: pending / sent / next scheduled date (campaign follow-ups live here)
+  // Per-step queue: pending / sent / failed / next scheduled date (campaign follow-ups live here)
   const sequenceSummary = steps.map((step, idx) => {
     const stepSends = scheduledSends.filter((s) => s.campaign_step_id === step.id);
     const pending = stepSends.filter((s) => s.status === 'pending' || s.status === 'sending');
     const sent = stepSends.filter((s) => s.status === 'sent').length;
-    const failed = stepSends.filter((s) => s.status === 'failed').length;
+    const failedRows = stepSends.filter((s) => s.status === 'failed');
+    const failed = failedRows.length;
+    const latestFailed = failedRows[failedRows.length - 1] || null;
     const next = pending
       .slice()
       .sort((a, b) => String(a.scheduled_at || '').localeCompare(String(b.scheduled_at || '')))[0];
@@ -582,6 +584,7 @@ export function getCampaign(id) {
       pending: pending.length,
       sent: stepStat?.sent ?? sent,
       failed,
+      failedError: latestFailed?.error || null,
       replies: stepStat?.replies ?? 0,
       nextScheduledAt: next?.scheduled_at || null,
     };
@@ -1526,4 +1529,171 @@ export function cancelCampaign(campaignId) {
     `UPDATE email_campaigns SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`,
   ).run(campaignId);
   return getCampaign(campaignId);
+}
+
+/**
+ * Aggregate failed scheduled campaign emails grouped by campaign + step.
+ */
+export function listFailedCampaignSteps() {
+  const rows = db
+    .prepare(
+      `SELECT
+         s.campaign_id AS campaignId,
+         c.name AS campaignName,
+         c.status AS campaignStatus,
+         c.timezone AS timezone,
+         c.send_hour AS sendHour,
+         c.send_minute AS sendMinute,
+         s.campaign_step_id AS stepId,
+         COALESCE(cs.step_order, 1) AS stepOrder,
+         COALESCE(
+           cs.subject,
+           (SELECT v.subject FROM email_campaign_step_variants v
+            WHERE v.campaign_step_id = cs.id
+            ORDER BY v.sort_order ASC, v.variant_key ASC LIMIT 1)
+         ) AS subject,
+         COUNT(*) AS failedCount,
+         MAX(COALESCE(s.sent_at, s.scheduled_at, s.created_at)) AS lastFailedAt,
+         MAX(s.error) AS error
+       FROM scheduled_emails s
+       JOIN email_campaigns c ON c.id = s.campaign_id
+       LEFT JOIN email_campaign_steps cs ON cs.id = s.campaign_step_id
+       WHERE s.status = 'failed'
+         AND s.campaign_id IS NOT NULL
+       GROUP BY s.campaign_id, s.campaign_step_id
+       ORDER BY lastFailedAt DESC, failedCount DESC`,
+    )
+    .all()
+    .map((r) => ({
+      ...r,
+      stepLabel: Number(r.stepOrder) <= 1 ? 'Initial email' : `Follow-up ${Number(r.stepOrder) - 1}`,
+    }));
+
+  const nonCampaignFailed = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM scheduled_emails
+       WHERE status = 'failed' AND campaign_id IS NULL`,
+    )
+    .get().c;
+
+  const totalCampaignFailed = rows.reduce((sum, r) => sum + (Number(r.failedCount) || 0), 0);
+  return {
+    totalFailed: totalCampaignFailed + (Number(nonCampaignFailed) || 0),
+    totalCampaignFailed,
+    nonCampaignFailed: Number(nonCampaignFailed) || 0,
+    groups: rows,
+  };
+}
+
+/**
+ * Re-queue failed emails for a specific campaign step, either immediately ('now')
+ * or at a chosen future time ('schedule').
+ */
+export function retryFailedCampaignStep(
+  campaignId,
+  stepId,
+  { mode = 'now', scheduledAt = null } = {},
+) {
+  const campaign = db.prepare(`SELECT * FROM email_campaigns WHERE id = ?`).get(campaignId);
+  if (!campaign) {
+    const err = new Error('Campaign not found');
+    err.status = 404;
+    throw err;
+  }
+  if (campaign.status === 'cancelled') {
+    const err = new Error('Cannot resend a cancelled campaign');
+    err.status = 400;
+    throw err;
+  }
+
+  const step = db
+    .prepare(`SELECT * FROM email_campaign_steps WHERE id = ? AND campaign_id = ?`)
+    .get(stepId, campaignId);
+  if (!step) {
+    const err = new Error('Campaign step not found');
+    err.status = 404;
+    throw err;
+  }
+
+  const failedCount = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM scheduled_emails
+       WHERE campaign_id = ? AND campaign_step_id = ? AND status = 'failed'`,
+    )
+    .get(campaignId, stepId).c;
+  if (!failedCount) {
+    const err = new Error('No failed emails found for this step');
+    err.status = 400;
+    throw err;
+  }
+
+  let targetDate;
+  if (mode === 'schedule') {
+    if (scheduledAt) {
+      const parsed = new Date(scheduledAt);
+      if (Number.isNaN(parsed.getTime())) {
+        const err = new Error('Invalid schedule date/time');
+        err.status = 400;
+        throw err;
+      }
+      targetDate = parsed;
+    } else {
+      targetDate = resolveCampaignSendAt(
+        new Date(),
+        1,
+        campaign.timezone,
+        campaign.send_hour,
+        campaign.send_minute,
+      );
+    }
+  } else {
+    targetDate = new Date(Date.now() - 60_000);
+  }
+
+  const targetSql = toScheduleSql(targetDate);
+
+  const queued = db.transaction(() => {
+    const res = db
+      .prepare(
+        `UPDATE scheduled_emails
+         SET status = 'pending', error = NULL, scheduled_at = ?
+         WHERE campaign_id = ? AND campaign_step_id = ? AND status = 'failed'`,
+      )
+      .run(targetSql, campaignId, stepId);
+
+    if (campaign.status === 'completed' || campaign.status === 'paused') {
+      db.prepare(
+        `UPDATE email_campaigns
+         SET status = 'active', updated_at = datetime('now')
+         WHERE id = ?`,
+      ).run(campaignId);
+    }
+
+    db.prepare(
+      `UPDATE email_campaign_leads
+       SET status = 'active', completed_at = NULL
+       WHERE campaign_id = ?
+         AND status = 'completed'
+         AND lead_id IN (
+           SELECT DISTINCT lead_id FROM scheduled_emails
+           WHERE campaign_id = ? AND campaign_step_id = ? AND status = 'pending'
+         )`,
+    ).run(campaignId, campaignId, stepId);
+
+    return res.changes;
+  })();
+
+  const stepOrder = Number(step.step_order) || 1;
+  const stepLabel = stepOrder <= 1 ? 'Initial email' : `Follow-up ${stepOrder - 1}`;
+
+  return {
+    ok: true,
+    mode: mode === 'schedule' ? 'schedule' : 'now',
+    campaignId,
+    stepId,
+    stepOrder,
+    stepLabel,
+    queued,
+    scheduledAt: targetDate.toISOString(),
+  };
 }
