@@ -1651,8 +1651,25 @@ export function retryFailedCampaignStep(
   }
 
   const targetSql = toScheduleSql(targetDate);
+  const stepOrder = Number(step.step_order) || 1;
+  const laterSteps = db
+    .prepare(
+      `SELECT * FROM email_campaign_steps
+       WHERE campaign_id = ? AND step_order > ?
+       ORDER BY step_order ASC`,
+    )
+    .all(campaignId, stepOrder);
 
-  const queued = db.transaction(() => {
+  const { queued, followUpsScheduled } = db.transaction(() => {
+    const affectedLeadIds = db
+      .prepare(
+        `SELECT DISTINCT lead_id FROM scheduled_emails
+         WHERE campaign_id = ? AND campaign_step_id = ? AND status = 'failed'`,
+      )
+      .all(campaignId, stepId)
+      .map((r) => r.lead_id)
+      .filter(Boolean);
+
     const res = db
       .prepare(
         `UPDATE scheduled_emails
@@ -1660,6 +1677,41 @@ export function retryFailedCampaignStep(
          WHERE campaign_id = ? AND campaign_step_id = ? AND status = 'failed'`,
       )
       .run(targetSql, campaignId, stepId);
+
+    let nextScheduledCount = 0;
+    if (laterSteps.length > 0 && affectedLeadIds.length > 0) {
+      const placeholders = affectedLeadIds.map(() => '?').join(',');
+      let prevDelay = Number(step.delay_days) || 0;
+      let prevDate = targetDate;
+
+      for (const nextStep of laterSteps) {
+        const nextDelay = Number(nextStep.delay_days) || 0;
+        const gapDays = Math.max(1, nextDelay - prevDelay);
+        const nextWhen = resolveCampaignSendAt(
+          prevDate,
+          gapDays,
+          campaign.timezone,
+          campaign.send_hour,
+          campaign.send_minute,
+        );
+        const nextSql = toScheduleSql(nextWhen);
+
+        const updNext = db
+          .prepare(
+            `UPDATE scheduled_emails
+             SET status = 'pending', error = NULL, scheduled_at = ?
+             WHERE campaign_id = ?
+               AND campaign_step_id = ?
+               AND status IN ('pending', 'failed')
+               AND lead_id IN (${placeholders})`,
+          )
+          .run(nextSql, campaignId, nextStep.id, ...affectedLeadIds);
+
+        nextScheduledCount += updNext.changes;
+        prevDelay = nextDelay;
+        prevDate = nextWhen;
+      }
+    }
 
     if (campaign.status === 'completed' || campaign.status === 'paused') {
       db.prepare(
@@ -1680,10 +1732,9 @@ export function retryFailedCampaignStep(
          )`,
     ).run(campaignId, campaignId, stepId);
 
-    return res.changes;
+    return { queued: res.changes, followUpsScheduled: nextScheduledCount };
   })();
 
-  const stepOrder = Number(step.step_order) || 1;
   const stepLabel = stepOrder <= 1 ? 'Initial email' : `Follow-up ${stepOrder - 1}`;
 
   return {
@@ -1694,6 +1745,7 @@ export function retryFailedCampaignStep(
     stepOrder,
     stepLabel,
     queued,
+    followUpsScheduled,
     scheduledAt: targetDate.toISOString(),
   };
 }
