@@ -39,7 +39,7 @@ $wrapper = Join-Path $wrapperDir 'crm-watchdog.cmd'
 # Use FULL paths - this machine often has a broken PATH (no System32)
 $cmdLines = @(
   '@echo off'
-  ('set PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%APPDATA%\npm;%ProgramFiles%\nodejs;%PATH%')
+  ('set PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%APPDATA%\npm;%ProgramFiles%\nodejs;%ProgramFiles%\Git\cmd;%PATH%')
   ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $psExe, $watchdog)
 )
 Set-Content -Path $wrapper -Value $cmdLines -Encoding ASCII

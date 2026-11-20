@@ -1,4 +1,4 @@
-# BMGenie CRM API — pull, install, restart (Windows)
+﻿# BMGenie CRM API — pull, install, restart (Windows)
 # Run from repo root (e.g. D:\crm-api.bmgenie.ai). .env and data/ are never deleted.
 
 $ErrorActionPreference = 'Stop'
@@ -170,21 +170,28 @@ function Restart-CrmApi {
   throw 'PM2 not available and CRM_APP_POOL_NAME not set — install PM2 (see scripts/windows/setup-pm2-crm-api.ps1)'
 }
 
-Stop-PortListener -Port 4050
+$lockFile = Join-Path $Root '.deploy.lock'
+try {
+  Set-Content -Path $lockFile -Value "$(Get-Date -Format o)" -Encoding ASCII -ErrorAction SilentlyContinue
 
-# Repo may already be at origin/main (workflow pulls before invoking this script).
-# Still sync here for manual runs.
-git fetch origin main
-if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
-git reset --hard origin/main
-if ($LASTEXITCODE -ne 0) { throw 'git reset --hard failed' }
-git clean -fd -e .env -e .env.local -e node_modules -e data -e web.config
+  Stop-PortListener -Port 4050
 
-# npm install is more reliable on Windows when native modules are locked (better-sqlite3)
-npm install
-if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+  # Repo may already be at origin/main (workflow pulls before invoking this script).
+  # Still sync here for manual runs.
+  git fetch origin main
+  if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+  git reset --hard origin/main
+  if ($LASTEXITCODE -ne 0) { throw 'git reset --hard failed' }
+  git clean -fd -e .env -e .env.local -e node_modules -e data -e logs -e web.config -e .deploy.lock
 
-Restart-CrmApi
+  # npm install is more reliable on Windows when native modules are locked (better-sqlite3)
+  npm install
+  if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
 
-Write-Host 'CRM deploy OK'
+  Restart-CrmApi
+
+  Write-Host 'CRM deploy OK'
+} finally {
+  Remove-Item -Path $lockFile -Force -ErrorAction SilentlyContinue
+}
 exit 0

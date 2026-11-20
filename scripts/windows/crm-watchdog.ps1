@@ -17,6 +17,10 @@ $npmBin = Join-Path $env:APPDATA 'npm'
 if ($env:Path -notlike "*${npmBin}*") {
   $env:Path = "$npmBin;$env:Path"
 }
+$gitCmd = Join-Path $env:ProgramFiles 'Git\cmd'
+if ((Test-Path $gitCmd) -and ($env:Path -notlike "*${gitCmd}*")) {
+  $env:Path = "$gitCmd;$env:Path"
+}
 
 function Get-DotEnvValue([string]$key) {
   $envPath = Join-Path $Root '.env'
@@ -194,7 +198,71 @@ function Repair-CloudflareTunnelIfNeeded {
   }
 }
 
+function Sync-CrmFromOriginIfUpdated {
+  if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    return
+  }
+  if (-not (Test-InternetUp)) {
+    return
+  }
+
+  $lockFile = Join-Path $Root '.deploy.lock'
+  if (Test-Path $lockFile) {
+    $ageMinutes = ((Get-Date) - (Get-Item $lockFile).LastWriteTime).TotalMinutes
+    if ($ageMinutes -lt 10) {
+      Write-WatchLog 'INFO: deploy lock active - skipping auto-pull'
+      return
+    }
+    Remove-Item -Path $lockFile -Force -ErrorAction SilentlyContinue
+  }
+
+  Set-Location $Root
+  & git fetch origin main 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    return
+  }
+
+  $localSha = (& git rev-parse HEAD 2>$null | Out-String).Trim()
+  $remoteSha = (& git rev-parse origin/main 2>$null | Out-String).Trim()
+  if (-not $localSha -or -not $remoteSha -or ($localSha -eq $remoteSha)) {
+    return
+  }
+
+  $failMarker = Join-Path $logDir 'last-auto-deploy-fail.txt'
+  if (Test-Path $failMarker) {
+    $raw = (Get-Content $failMarker -Raw -ErrorAction SilentlyContinue).Trim()
+    $parts = $raw.Split('|', 2)
+    if ($parts.Length -eq 2 -and $parts[0] -eq $remoteSha) {
+      try {
+        $prevFail = [datetime]::Parse($parts[1])
+        if (((Get-Date) - $prevFail).TotalMinutes -lt 15) {
+          Write-WatchLog "INFO: skipping retry of failed commit $remoteSha (cooldown)"
+          return
+        }
+      } catch {}
+    }
+  }
+
+  Write-WatchLog "UPDATE: origin/main moved $localSha -> $remoteSha - running auto-deploy"
+  $deployScript = Join-Path $Root 'scripts\windows\deploy-crm-api.ps1'
+  try {
+    & $deployScript 2>&1 | Out-String | ForEach-Object { if ($_.Trim()) { Write-WatchLog $_.Trim() } }
+    if ($LASTEXITCODE -ne 0) { throw "deploy-crm-api.ps1 exited $LASTEXITCODE" }
+    if (Wait-LocalHealthy -attempts 8) {
+      Remove-Item -Path $failMarker -Force -ErrorAction SilentlyContinue
+      Write-WatchLog "AUTO-DEPLOYED: now running $remoteSha"
+    } else {
+      throw 'Health check failed after auto-deploy'
+    }
+  } catch {
+    Set-Content -Path $failMarker -Value "$remoteSha|$((Get-Date).ToString('o'))" -Encoding ASCII -ErrorAction SilentlyContinue
+    Write-WatchLog "AUTO-DEPLOY FAILED for $remoteSha : $_"
+  }
+}
+
 Write-WatchLog "Watchdog check -> $healthUrl"
+
+Sync-CrmFromOriginIfUpdated
 
 $localOk = Test-HealthUrl $healthUrl
 if (-not $localOk) {
