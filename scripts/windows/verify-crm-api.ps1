@@ -26,4 +26,13 @@ foreach ($i in 1..8) {
 }
 if (-not $ok) { throw "Health check failed for $url" }
 
+$diagScript = Join-Path $PSScriptRoot 'diagnose-brevo-ci.ps1'
+if (Test-Path $diagScript) {
+  try {
+    & $diagScript
+  } catch {
+    Write-Host "Brevo diagnostic warning: $_"
+  }
+}
+
 exit 0
