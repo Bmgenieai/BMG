@@ -8,6 +8,63 @@ import { testLeadSql, pakistanLeadSql } from '../lib/leadFilters.js';
 const router = Router();
 
 /**
+ * Original acquisition sources (BD / social / CSV / manual) must be preserved
+ * when a lead later signs up on BMGenie, uses a free credit, abandons checkout,
+ * requests revisions, or books a Calendly demo.
+ */
+const PRESERVE_ORIGINAL_SOURCES = new Set([
+  'facebook',
+  'instagram',
+  'linkedin',
+  'telesales',
+  'csv_import',
+  'manual',
+]);
+
+function resolvePreservedSource(existingSource, incomingProductSource) {
+  if (existingSource && PRESERVE_ORIGINAL_SOURCES.has(existingSource)) {
+    return existingSource;
+  }
+  return incomingProductSource || existingSource;
+}
+
+function mergeMetadata(existingMetadataJson, incomingMetadata) {
+  if (incomingMetadata == null) return existingMetadataJson ?? null;
+  let existingObj = {};
+  if (existingMetadataJson) {
+    try {
+      const parsed =
+        typeof existingMetadataJson === 'string'
+          ? JSON.parse(existingMetadataJson)
+          : existingMetadataJson;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        existingObj = parsed;
+      }
+    } catch {
+      existingObj = {};
+    }
+  }
+  let incomingObj = incomingMetadata;
+  if (typeof incomingMetadata === 'string') {
+    try {
+      incomingObj = JSON.parse(incomingMetadata);
+    } catch {
+      return serializeMetadata(incomingMetadata);
+    }
+  }
+  if (incomingObj && typeof incomingObj === 'object' && !Array.isArray(incomingObj)) {
+    return JSON.stringify({ ...existingObj, ...incomingObj });
+  }
+  return serializeMetadata(incomingMetadata);
+}
+
+function pickPreferredName(existingName, incomingName, rawName) {
+  if (rawName && String(rawName).trim()) return String(rawName).trim();
+  if (existingName && String(existingName).trim()) return existingName;
+  return incomingName;
+}
+
+/**
  * Service-to-service ingest from BMGenie product / Calendly / Tawk.
  * Auth: header X-CRM-Ingest-Key must match CRM_INGEST_API_KEY
  * (Calendly/Tawk may also use their own signature headers when configured).
@@ -149,7 +206,7 @@ function insertLead({
   return db.prepare(`SELECT * FROM leads WHERE id = ?`).get(id);
 }
 
-function updateLead(id, fields, activitySummary) {
+function updateLead(id, fields, activitySummary, activityType = 'product_sync') {
   const allowed = [
     'name',
     'email',
@@ -166,12 +223,20 @@ function updateLead(id, fields, activitySummary) {
     'lost_reason',
     'metadata',
   ];
+  const current =
+    fields.metadata !== undefined
+      ? db.prepare(`SELECT metadata FROM leads WHERE id = ?`).get(id)
+      : null;
   const sets = [];
   const params = [];
   for (const key of allowed) {
     if (fields[key] !== undefined) {
       sets.push(`${key} = ?`);
-      params.push(key === 'metadata' ? serializeMetadata(fields[key]) : fields[key]);
+      params.push(
+        key === 'metadata'
+          ? mergeMetadata(current?.metadata, fields[key])
+          : fields[key],
+      );
     }
   }
   if (!sets.length) return db.prepare(`SELECT * FROM leads WHERE id = ?`).get(id);
@@ -181,8 +246,8 @@ function updateLead(id, fields, activitySummary) {
   if (activitySummary) {
     db.prepare(
       `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
-       VALUES (?, ?, NULL, 'product_sync', ?)`,
-    ).run(uuid(), id, activitySummary);
+       VALUES (?, ?, NULL, ?, ?)`,
+    ).run(uuid(), id, activityType || 'product_sync', activitySummary);
   }
   return db.prepare(`SELECT * FROM leads WHERE id = ?`).get(id);
 }
@@ -220,8 +285,8 @@ function upsertCheckoutAbandoned({
       lead: updateLead(
         target.id,
         {
-          source: 'checkout_abandoned',
-          name: displayName,
+          source: resolvePreservedSource(target.source, 'checkout_abandoned'),
+          name: pickPreferredName(target.name, displayName),
           email: normalizedEmail || target.email,
           phone: phone ?? target.phone,
           company: company ?? target.company,
@@ -234,7 +299,7 @@ function upsertCheckoutAbandoned({
           estimated_value: estimatedValue ?? target.estimated_value ?? 65,
           metadata: metadata ?? undefined,
         },
-        markAbandoned ? 'Checkout abandoned' : 'Checkout opened (Stripe)',
+        markAbandoned ? 'Abandoned Stripe checkout on BMGenie' : 'Opened Stripe checkout on BMGenie',
       ),
       action: 'updated',
     };
@@ -250,8 +315,8 @@ function upsertCheckoutAbandoned({
       lead: updateLead(
         open.id,
         {
-          source: 'checkout_abandoned',
-          name: displayName,
+          source: resolvePreservedSource(open.source, 'checkout_abandoned'),
+          name: pickPreferredName(open.name, displayName),
           email: normalizedEmail || open.email,
           phone: phone ?? open.phone,
           company: company ?? open.company,
@@ -264,7 +329,7 @@ function upsertCheckoutAbandoned({
           estimated_value: estimatedValue ?? open.estimated_value ?? 65,
           metadata: metadata ?? undefined,
         },
-        markAbandoned ? 'Escalated to checkout_abandoned' : 'Checkout opened — escalated',
+        markAbandoned ? 'Abandoned Stripe checkout on BMGenie' : 'Opened Stripe checkout on BMGenie',
       ),
       action: 'updated',
     };
@@ -308,8 +373,8 @@ function upsertRevisionRequested({
       lead: updateLead(
         open.id,
         {
-          source: 'revision_requested',
-          name: displayName,
+          source: resolvePreservedSource(open.source, 'revision_requested'),
+          name: pickPreferredName(open.name, displayName),
           email: normalizedEmail || open.email,
           phone: phone ?? open.phone,
           company: company ?? open.company,
@@ -318,7 +383,7 @@ function upsertRevisionRequested({
           estimated_value: estimatedValue ?? open.estimated_value ?? 65,
           metadata: metadata ?? undefined,
         },
-        'Revision requested on BMGenie',
+        'Requested listing revisions on BMGenie',
       ),
       action: 'updated',
     };
@@ -360,13 +425,13 @@ function upsertDemoBooking({
     lead = updateLead(
       existing.id,
       {
-        name: displayName,
+        name: pickPreferredName(existing.name, displayName),
         email: normalizedEmail || existing.email,
         phone: phone ?? existing.phone,
         company: company ?? existing.company,
         country: country ?? existing.country,
         bmgenie_user_id: bmgenieUserId || existing.bmgenie_user_id,
-        source: existing.source === 'demo_booking' ? existing.source : existing.source,
+        source: resolvePreservedSource(existing.source, 'demo_booking'),
         status:
           existing.status === 'paid' ||
           existing.status === 'repeat' ||
@@ -378,12 +443,9 @@ function upsertDemoBooking({
         estimated_value: estimatedValue ?? existing.estimated_value ?? 65,
         metadata: meta,
       },
-      `Demo booked — ${meta.scheduledAt || 'Calendly'}`,
+      `Booked a Calendly demo — ${meta.scheduledAt || 'Calendly'}`,
+      'demo_booked',
     );
-    // Prefer demo_booking source when moving into demo queue
-    if (lead.status === 'demo_scheduled' || lead.status === 'demo_booked') {
-      lead = updateLead(lead.id, { source: 'demo_booking' }, null);
-    }
     action = 'updated';
   } else {
     lead = insertLead({
@@ -651,20 +713,18 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
       lead = updateLead(
         existing.id,
         {
-          name: displayName,
-          email: normalizedEmail,
+          name: pickPreferredName(existing.name, displayName, name),
+          email: normalizedEmail || existing.email,
           phone: phone ?? existing.phone,
           company: company ?? existing.company,
           country: country ?? existing.country,
           city: city ?? existing.city,
           bmgenie_user_id: bmgenieUserId || existing.bmgenie_user_id,
-          source:
-            OPEN_STATUSES.includes(existing.status) && existing.source === 'signup_no_listing'
-              ? existing.source
-              : existing.source,
+          source: existing.source,
           metadata: metadata ?? undefined,
         },
-        'Signup sync — lead already existed',
+        'Signed up on BMGenie',
+        'product_signup',
       );
       action = 'updated';
     } else {
@@ -689,8 +749,8 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
       lead = updateLead(
         open.id,
         {
-          source: 'free_credit_no_purchase',
-          name: displayName,
+          source: resolvePreservedSource(open.source, 'free_credit_no_purchase'),
+          name: pickPreferredName(open.name, displayName, name),
           email: normalizedEmail || open.email,
           phone: phone ?? open.phone,
           company: company ?? open.company,
@@ -701,7 +761,7 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
           estimated_value: estimatedValue ?? open.estimated_value ?? 65,
           metadata: metadata ?? undefined,
         },
-        'Escalated to free_credit_no_purchase',
+        'Used free listing credit on BMGenie',
       );
       action = 'updated';
     } else if (!open) {
@@ -732,14 +792,14 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
         {
           status: 'paid',
           converted_at: new Date().toISOString(),
-          name: displayName,
+          name: pickPreferredName(any.name, displayName, name),
           email: normalizedEmail || any.email,
           bmgenie_user_id: bmgenieUserId || any.bmgenie_user_id,
           estimated_value: estimatedValue ?? any.estimated_value,
           notes: notes || 'Purchased a BMGenie package',
           metadata: metadata ?? undefined,
         },
-        'Marked paid — package purchased',
+        'Marked paid — package purchased on BMGenie',
       );
       action = 'paid';
     } else {
@@ -771,13 +831,13 @@ router.post('/product-leads', requireIngestKey, (req, res) => {
       lead = updateLead(
         openWinback.id,
         {
-          source: 'purchased_no_repurchase',
+          source: resolvePreservedSource(openWinback.source, 'purchased_no_repurchase'),
           notes: notes || 'Paid credits depleted — win-back opportunity',
           estimated_value: estimatedValue ?? openWinback.estimated_value ?? 65,
           bmgenie_user_id: bmgenieUserId || openWinback.bmgenie_user_id,
           metadata: metadata ?? undefined,
         },
-        'Escalated to purchased_no_repurchase',
+        'Paid credits depleted on BMGenie',
       );
       action = 'updated';
     } else {
@@ -957,10 +1017,23 @@ router.post('/calendly', (req, res) => {
     if (String(eventType).includes('invitee.canceled')) {
       const inviteeUri = body.payload?.invitee?.uri || body.payload?.uri;
       if (inviteeUri) {
+        const booking = db
+          .prepare(`SELECT lead_id, scheduled_at FROM demo_bookings WHERE calendly_invitee_uri = ?`)
+          .get(inviteeUri);
         db.prepare(
           `UPDATE demo_bookings SET status = 'canceled', updated_at = datetime('now')
            WHERE calendly_invitee_uri = ?`,
         ).run(inviteeUri);
+        if (booking?.lead_id) {
+          db.prepare(
+            `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
+             VALUES (?, ?, NULL, 'demo_canceled', ?)`,
+          ).run(
+            uuid(),
+            booking.lead_id,
+            `Calendly demo canceled${booking.scheduled_at ? ` (${booking.scheduled_at})` : ''}`,
+          );
+        }
       }
       return res.json({ ok: true, action: 'canceled' });
     }
