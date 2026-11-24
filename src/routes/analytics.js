@@ -2342,6 +2342,77 @@ router.get(
            LIMIT ?`,
         )
         .all(r, limit);
+    } else if (metric.startsWith('caller_')) {
+      const safeUserId = userId ? String(userId).replace(/'/g, "''") : null;
+      const callerUserClause = safeUserId
+        ? ` AND a.user_id = '${safeUserId}'`
+        : ` AND u.role = 'caller'`;
+      const callBase = `a.type IN ('call','call_attempted','call_connected')`;
+      const connectedCond = `(a.type = 'call_connected' OR a.outcome IN ('connected_not_interested','connected_callback','connected_interested','demo_booked'))`;
+
+      if (metric === 'caller_leads_added') {
+        title = 'New Leads Added by Caller';
+        const creatorClause = safeUserId
+          ? ` AND l.created_by = '${safeUserId}'`
+          : ` AND u.role = 'caller'`;
+        items = db
+          .prepare(
+            `SELECT l.id, l.name, l.email, l.phone, l.company, l.status, l.source, l.business_type, l.state,
+                    l.created_at AS date, l.notes,
+                    u.name AS user_name
+             FROM leads l
+             JOIN users u ON u.id = l.created_by
+             WHERE 1=1 ${win('l.created_at')} ${creatorClause} ${stateClause}
+             ORDER BY l.created_at DESC
+             LIMIT ?`,
+          )
+          .all(limit);
+      } else {
+        const callerMetricMap = {
+          caller_total_calls: { title: 'Total Calls', clause: callBase },
+          caller_connected: { title: 'Connected Calls', clause: `${callBase} AND ${connectedCond}` },
+          caller_no_answer_voicemail: {
+            title: 'No Answer / Voicemail',
+            clause: `${callBase} AND a.outcome IN ('no_answer','voicemail')`,
+          },
+          caller_wrong_number: {
+            title: 'Wrong Number',
+            clause: `${callBase} AND a.outcome = 'wrong_number'`,
+          },
+          caller_callbacks: {
+            title: 'Callbacks / Follow-ups',
+            clause: `${callBase} AND a.outcome IN ('busy_callback','connected_callback')`,
+          },
+          caller_not_interested: {
+            title: 'Connected — Not Interested',
+            clause: `${callBase} AND a.outcome = 'connected_not_interested'`,
+          },
+          caller_interested: {
+            title: 'Connected — Interested / Qualified',
+            clause: `${callBase} AND a.outcome = 'connected_interested'`,
+          },
+          caller_demos_booked: {
+            title: 'Demos / Meetings Booked',
+            clause: `${callBase} AND a.outcome = 'demo_booked'`,
+          },
+        };
+        const cfg = callerMetricMap[metric] || { title: 'Calls', clause: callBase };
+        title = cfg.title;
+        items = db
+          .prepare(
+            `SELECT a.id, a.type, a.summary, a.outcome, a.created_at AS date,
+                    l.id AS lead_id, l.name AS lead_name, l.email AS lead_email, l.phone AS lead_phone,
+                    l.company AS lead_company, l.status AS lead_status, l.business_type, l.state,
+                    u.name AS user_name
+             FROM lead_activities a
+             LEFT JOIN leads l ON l.id = a.lead_id
+             LEFT JOIN users u ON u.id = a.user_id
+             WHERE ${cfg.clause} ${win('a.created_at')} ${callerUserClause} ${stateClause}
+             ORDER BY a.created_at DESC
+             LIMIT ?`,
+          )
+          .all(limit);
+      }
     } else {
       // General fallback query on lead_activities or leads
       title = String(metric || 'Drilldown').replace(/_/g, ' ');
@@ -2367,6 +2438,142 @@ router.get(
       dateRange: `${bounds.fromYmd} to ${bounds.toYmd}`,
       total: items.length,
       items,
+    });
+  },
+);
+
+/**
+ * Caller Working — period-based cold-calling KPIs per Caller (and totals for CEO/Manager).
+ * Query: ?period=today|yesterday|week|month|overall OR ?from=YYYY-MM-DD&to=YYYY-MM-DD, optional ?userId=
+ */
+router.get(
+  '/caller-working',
+  requireAnyPermission('analytics:view_all', 'analytics:view_team', 'analytics:view_own'),
+  (req, res) => {
+    const isCeo = roleHasPermission(req.user.role, 'analytics:view_all');
+    const isManager = roleHasPermission(req.user.role, 'analytics:view_team');
+    const canViewTeam = isCeo || isManager;
+    const bounds = resolveAnalyticsBounds(req.query);
+    const { from, to } = bounds;
+    const isOverall = bounds.period === 'overall';
+
+    const focusUserId = !canViewTeam
+      ? req.user.id
+      : req.query.userId
+        ? String(req.query.userId)
+        : null;
+
+    const callers = canViewTeam
+      ? db
+          .prepare(
+            `SELECT id, name, email FROM users
+             WHERE role = 'caller' AND is_active = 1
+             ORDER BY name COLLATE NOCASE`,
+          )
+          .all()
+      : db.prepare(`SELECT id, name, email FROM users WHERE id = ?`).all(req.user.id);
+
+    const winAct = isOverall
+      ? ''
+      : ` AND ${DT('a.created_at')} >= datetime('${from}') AND ${DT('a.created_at')} < datetime('${to}')`;
+    const winLead = isOverall
+      ? ''
+      : ` AND ${DT('l.created_at')} >= datetime('${from}') AND ${DT('l.created_at')} < datetime('${to}')`;
+
+    const callAgg = db
+      .prepare(
+        `SELECT a.user_id,
+           COUNT(*) AS total_calls,
+           SUM(CASE WHEN a.type = 'call_connected'
+                      OR a.outcome IN ('connected_not_interested','connected_callback','connected_interested','demo_booked')
+                    THEN 1 ELSE 0 END) AS connected_calls,
+           SUM(CASE WHEN a.outcome IN ('no_answer','voicemail') THEN 1 ELSE 0 END) AS no_answer_voicemail,
+           SUM(CASE WHEN a.outcome = 'wrong_number' THEN 1 ELSE 0 END) AS wrong_number,
+           SUM(CASE WHEN a.outcome IN ('busy_callback','connected_callback') THEN 1 ELSE 0 END) AS callbacks,
+           SUM(CASE WHEN a.outcome = 'connected_not_interested' THEN 1 ELSE 0 END) AS not_interested,
+           SUM(CASE WHEN a.outcome = 'connected_interested' THEN 1 ELSE 0 END) AS interested,
+           SUM(CASE WHEN a.outcome = 'demo_booked' THEN 1 ELSE 0 END) AS demos_booked
+         FROM lead_activities a
+         WHERE a.user_id IS NOT NULL
+           AND a.type IN ('call','call_attempted','call_connected')
+           ${winAct}
+         GROUP BY a.user_id`,
+      )
+      .all();
+
+    const leadAdds = db
+      .prepare(
+        `SELECT l.created_by AS user_id, COUNT(*) AS leads_added
+         FROM leads l
+         WHERE l.created_by IS NOT NULL
+           ${winLead}
+         GROUP BY l.created_by`,
+      )
+      .all();
+
+    const callMap = Object.fromEntries(callAgg.map((r) => [r.user_id, r]));
+    const leadMap = Object.fromEntries(leadAdds.map((r) => [r.user_id, r]));
+
+    const rows = callers
+      .filter((c) => !focusUserId || c.id === focusUserId)
+      .map((c) => {
+        const a = callMap[c.id] || {};
+        const l = leadMap[c.id] || {};
+        const totalCalls = Number(a.total_calls || 0);
+        const connectedCalls = Number(a.connected_calls || 0);
+        const connectRate = totalCalls > 0 ? Math.round((connectedCalls / totalCalls) * 100) : 0;
+        return {
+          id: c.id,
+          name: c.name,
+          email: c.email,
+          totalCalls,
+          connectedCalls,
+          connectRate,
+          noAnswerVoicemail: Number(a.no_answer_voicemail || 0),
+          wrongNumber: Number(a.wrong_number || 0),
+          callbacks: Number(a.callbacks || 0),
+          interested: Number(a.interested || 0),
+          notInterested: Number(a.not_interested || 0),
+          demosBooked: Number(a.demos_booked || 0),
+          leadsAdded: Number(l.leads_added || 0),
+        };
+      });
+
+    const totals = rows.reduce(
+      (acc, r) => ({
+        totalCalls: acc.totalCalls + r.totalCalls,
+        connectedCalls: acc.connectedCalls + r.connectedCalls,
+        noAnswerVoicemail: acc.noAnswerVoicemail + r.noAnswerVoicemail,
+        wrongNumber: acc.wrongNumber + r.wrongNumber,
+        callbacks: acc.callbacks + r.callbacks,
+        interested: acc.interested + r.interested,
+        notInterested: acc.notInterested + r.notInterested,
+        demosBooked: acc.demosBooked + r.demosBooked,
+        leadsAdded: acc.leadsAdded + r.leadsAdded,
+      }),
+      {
+        totalCalls: 0,
+        connectedCalls: 0,
+        noAnswerVoicemail: 0,
+        wrongNumber: 0,
+        callbacks: 0,
+        interested: 0,
+        notInterested: 0,
+        demosBooked: 0,
+        leadsAdded: 0,
+      },
+    );
+    totals.connectRate =
+      totals.totalCalls > 0 ? Math.round((totals.connectedCalls / totals.totalCalls) * 100) : 0;
+
+    res.json({
+      period: bounds.period,
+      periodLabel: bounds.label,
+      fromYmd: bounds.fromYmd,
+      toYmd: bounds.toYmd,
+      callers: rows,
+      allCallers: callers,
+      totals,
     });
   },
 );

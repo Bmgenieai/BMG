@@ -257,6 +257,7 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     followUpDue,
     followUpFrom,
     followUpTo,
+    hasPhone,
   } = req.query;
   const clauses = [];
   const params = [];
@@ -275,6 +276,9 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
 
   if (unassigned === '1' || unassigned === 'true') {
     clauses.push('l.assigned_to IS NULL');
+  }
+  if (hasPhone === '1' || hasPhone === 'true') {
+    clauses.push(`(l.phone IS NOT NULL AND TRIM(l.phone) != '')`);
   }
   if (source) {
     clauses.push('l.source = ?');
@@ -944,6 +948,12 @@ router.post(
       db.prepare(
         `UPDATE leads SET next_follow_up_at = ?, updated_at = datetime('now') WHERE id = ?`,
       ).run(next_follow_up_at, lead.id);
+      if (type === 'call' || type === 'call_attempted' || type === 'call_connected') {
+        db.prepare(
+          `INSERT INTO follow_ups (id, lead_id, assigned_to, due_at, note, created_by)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(uuid(), lead.id, req.user.id, next_follow_up_at, summary, req.user.id);
+      }
     }
 
     res.status(201).json(db.prepare(`SELECT * FROM lead_activities WHERE id = ?`).get(actId));
@@ -991,6 +1001,9 @@ router.delete(
       .prepare(`SELECT * FROM lead_activities WHERE id = ? AND lead_id = ?`)
       .get(req.params.activityId, lead.id);
     if (!act) return res.status(404).json({ error: 'Activity not found' });
+    if (req.user.role === 'caller' && act.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'You can only delete your own call logs' });
+    }
 
     // Decrement corresponding LinkedIn metric if applicable
     const liDec = {

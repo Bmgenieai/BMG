@@ -7,16 +7,18 @@
  * - manager — team visibility / performance (view-mostly; no BD day-to-day ops)
  * - telesales — BD (create leads, notes, status, send email)
  * - chat_support — website AI/human chat inbox only
+ * - caller — cold caller (all CRM leads, add leads, log call status & talk notes, own Caller Working)
  */
 
-export const ROLES = ['ceo', 'manager', 'telesales', 'chat_support'];
+export const ROLES = ['ceo', 'manager', 'telesales', 'chat_support', 'caller'];
 
-/** Display names for UI (DB still stores ceo / manager / telesales / chat_support). */
+/** Display names for UI (DB still stores ceo / manager / telesales / chat_support / caller). */
 export const ROLE_LABELS = {
   ceo: 'CEO',
   manager: 'Manager',
   telesales: 'BD',
   chat_support: 'Chat Support',
+  caller: 'Caller',
 };
 
 export function roleLabel(role) {
@@ -27,22 +29,22 @@ export const PERMISSIONS = {
   // Analytics
   'analytics:view_all': ['ceo'],
   'analytics:view_team': ['ceo', 'manager'],
-  'analytics:view_own': ['ceo', 'manager', 'telesales'],
+  'analytics:view_own': ['ceo', 'manager', 'telesales', 'caller'],
 
-  // Leads — manager can view/assign team leads but not edit BD work
-  'leads:view_all': ['ceo', 'manager'],
-  'leads:view_own': ['ceo', 'manager', 'telesales'],
-  'leads:create': ['ceo', 'telesales'],
+  // Leads — manager can view/assign team leads; caller can view/work all leads + add new leads
+  'leads:view_all': ['ceo', 'manager', 'caller'],
+  'leads:view_own': ['ceo', 'manager', 'telesales', 'caller'],
+  'leads:create': ['ceo', 'telesales', 'caller'],
   'leads:update_any': ['ceo'],
-  'leads:update_own': ['ceo', 'telesales'],
+  'leads:update_own': ['ceo', 'telesales', 'caller'],
   'leads:import': ['ceo', 'telesales'],
   'leads:assign': ['ceo', 'manager'],
   'leads:delete': ['ceo'],
 
   // Follow-ups — manager view-only
   'followups:view_all': ['ceo', 'manager'],
-  'followups:view_own': ['ceo', 'manager', 'telesales'],
-  'followups:manage_own': ['ceo', 'telesales'],
+  'followups:view_own': ['ceo', 'manager', 'telesales', 'caller'],
+  'followups:manage_own': ['ceo', 'telesales', 'caller'],
   'followups:manage_team': ['ceo'],
 
   // Working tree
@@ -123,11 +125,12 @@ export function canAccessLead(user, lead) {
   return false;
 }
 
-/** BD may update / email shared product-pool leads (and own leads). */
+/** BD may update / email shared product-pool leads (and own leads). Caller may log calls & update any CRM lead. */
 export function canUpdateLead(user, lead) {
   if (!lead) return false;
   if (roleHasPermission(user.role, 'leads:update_any')) return true;
   if (!roleHasPermission(user.role, 'leads:update_own')) return false;
+  if (user.role === 'caller') return true;
   if (lead.assigned_to === user.id || lead.created_by === user.id) return true;
   return isBdSharedProductSource(lead.source);
 }
@@ -197,6 +200,11 @@ export const LEAD_SOURCES = {
     key: 'manual',
     label: 'Manual',
     description: 'Created manually by staff',
+  },
+  cold_call: {
+    key: 'cold_call',
+    label: 'Cold call',
+    description: 'Prospect added by Caller from calling outreach',
   },
 };
 
@@ -358,6 +366,40 @@ export function allowedOutreachTypesForSource(source) {
 }
 
 export const REPLY_OUTCOMES = ['positive', 'negative', 'neutral', 'no_reply'];
+
+/** Structured call statuses logged by Callers on a lead. */
+export const CALL_OUTCOMES = [
+  { key: 'no_answer', label: 'No Answer', connected: false, defaultStatus: 'contacted' },
+  { key: 'voicemail', label: 'Voicemail', connected: false, defaultStatus: 'contacted' },
+  { key: 'busy_callback', label: 'Busy / Call Back Later', connected: false, defaultStatus: 'contacted' },
+  { key: 'wrong_number', label: 'Wrong Number', connected: false, defaultStatus: 'nurture' },
+  {
+    key: 'connected_not_interested',
+    label: 'Connected — Not Interested',
+    connected: true,
+    defaultStatus: 'nurture',
+  },
+  {
+    key: 'connected_callback',
+    label: 'Connected — Follow-up / Callback',
+    connected: true,
+    defaultStatus: 'engaged',
+  },
+  {
+    key: 'connected_interested',
+    label: 'Connected — Interested / Qualified',
+    connected: true,
+    defaultStatus: 'qualified',
+  },
+  {
+    key: 'demo_booked',
+    label: 'Demo / Meeting Booked',
+    connected: true,
+    defaultStatus: 'demo_scheduled',
+  },
+];
+
+export const CALL_OUTCOME_MAP = Object.fromEntries(CALL_OUTCOMES.map((o) => [o.key, o]));
 
 /** Prospect business type — lets CEO see outreach split by segment. */
 export const BUSINESS_TYPES = [

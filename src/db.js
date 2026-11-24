@@ -20,7 +20,7 @@ export function migrate() {
       email TEXT NOT NULL UNIQUE COLLATE NOCASE,
       password_hash TEXT NOT NULL,
       name TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('ceo','manager','telesales','chat_support')),
+      role TEXT NOT NULL CHECK(role IN ('ceo','manager','telesales','chat_support','caller')),
       phone TEXT,
       is_active INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -541,7 +541,7 @@ export function migrate() {
           email TEXT NOT NULL UNIQUE COLLATE NOCASE,
           password_hash TEXT NOT NULL,
           name TEXT NOT NULL,
-          role TEXT NOT NULL CHECK(role IN ('ceo','manager','telesales','chat_support')),
+          role TEXT NOT NULL CHECK(role IN ('ceo','manager','telesales','chat_support','caller')),
           phone TEXT,
           is_active INTEGER NOT NULL DEFAULT 1,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -561,6 +561,39 @@ export function migrate() {
     } catch (err) {
       db.pragma('foreign_keys = ON');
       console.warn('[migrate] users_role_chat_support_v1:', err.message);
+    }
+  }
+
+  // Expand users.role CHECK to include caller (SQLite cannot ALTER CHECK)
+  if (!metaGet.get('users_role_caller_v1')?.value) {
+    try {
+      db.pragma('foreign_keys = OFF');
+      db.exec(`
+        CREATE TABLE users_mig (
+          id TEXT PRIMARY KEY,
+          email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          password_hash TEXT NOT NULL,
+          name TEXT NOT NULL,
+          role TEXT NOT NULL CHECK(role IN ('ceo','manager','telesales','chat_support','caller')),
+          phone TEXT,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          created_by TEXT
+        );
+        INSERT INTO users_mig (
+          id, email, password_hash, name, role, phone, is_active, created_at, updated_at, created_by
+        )
+        SELECT id, email, password_hash, name, role, phone, is_active, created_at, updated_at, created_by
+        FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_mig RENAME TO users;
+      `);
+      db.pragma('foreign_keys = ON');
+      metaSet.run('users_role_caller_v1', '1');
+    } catch (err) {
+      db.pragma('foreign_keys = ON');
+      console.warn('[migrate] users_role_caller_v1:', err.message);
     }
   }
 
