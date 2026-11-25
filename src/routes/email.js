@@ -10,6 +10,7 @@ import {
   getTemplateById,
   getTemplatesForSource,
   COLD_EMAIL_TEMPLATES,
+  VALID_MERGE_TAGS,
   sendTransactionalEmail,
   upsertContact,
 } from '../lib/brevo.js';
@@ -18,11 +19,26 @@ import {
   backfillLegacyEmailAccountIds,
   createEmailAccount,
   emailAccountMatch,
+  getAccountSendQuota,
   getEmailAccount,
   listEmailAccounts,
   resolveSendAccount,
   updateEmailAccount,
 } from '../lib/emailAccounts.js';
+import {
+  getEmailSuppression,
+  getSuppressedEmailSet,
+  listSuppressions,
+  reasonStopMessage,
+  suppressEmail,
+  unsuppressEmail,
+} from '../lib/emailSuppression.js';
+import {
+  createEmailTemplate,
+  deleteEmailTemplate,
+  listEmailTemplates,
+  updateEmailTemplate,
+} from '../lib/emailTemplates.js';
 import * as campaigns from '../lib/campaigns.js';
 import { canAccessLead, canUpdateLead, roleHasPermission } from '../lib/permissions.js';
 import { claimLeadIfUnassigned } from '../lib/leadAutomation.js';
@@ -256,8 +272,6 @@ router.get(
       if (lead && !canAccessLead(req.user, lead)) {
         return res.status(403).json({ error: 'Permission denied' });
       }
-    } else if (!roleHasPermission(req.user.role, 'leads:view_all')) {
-      return res.status(403).json({ error: 'Permission denied' });
     }
     res.json(row);
   },
@@ -295,8 +309,6 @@ router.post(
         if (lead && !canAccessLead(req.user, lead)) {
           return res.status(403).json({ error: 'Permission denied' });
         }
-      } else if (!roleHasPermission(req.user.role, 'leads:view_all')) {
-        return res.status(403).json({ error: 'Permission denied' });
       }
       const kind = req.body?.kind || req.body?.inboxKind || req.body?.bucket;
       res.json(setEmailReplyInboxKind(req.params.id, kind));
@@ -340,12 +352,105 @@ router.post(
 );
 
 router.get('/templates', authRequired, (req, res) => {
-  const { source } = req.query;
-  if (source) {
-    return res.json({ templates: getTemplatesForSource(String(source)) });
-  }
-  res.json({ templates: COLD_EMAIL_TEMPLATES });
+  const templates = listEmailTemplates();
+  res.json({ templates, validMergeTags: VALID_MERGE_TAGS });
 });
+
+router.post(
+  '/templates',
+  authRequired,
+  requireAnyPermission('email:bulk_send', 'leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    try {
+      const result = createEmailTemplate(req.body || {}, { userId: req.user.id });
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.patch(
+  '/templates/:id',
+  authRequired,
+  requireAnyPermission('email:bulk_send', 'leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    try {
+      const result = updateEmailTemplate(req.params.id, req.body || {}, { userId: req.user.id });
+      res.json(result);
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.delete(
+  '/templates/:id',
+  authRequired,
+  requireAnyPermission('email:bulk_send', 'leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    try {
+      res.json(deleteEmailTemplate(req.params.id));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+/** Global suppression list (hard bounces, spam complaints, unsubscribes, manual). */
+router.get(
+  '/suppressions',
+  authRequired,
+  requireAnyPermission('email:bulk_send', 'email:manage_campaigns', 'leads:view_all'),
+  (req, res) => {
+    try {
+      const data = listSuppressions({
+        reason: req.query.reason || '',
+        q: req.query.q || '',
+        limit: req.query.limit,
+        offset: req.query.offset,
+      });
+      res.json(data);
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.post(
+  '/suppressions',
+  authRequired,
+  requireAnyPermission('email:bulk_send', 'email:manage_campaigns', 'leads:update_any'),
+  (req, res) => {
+    try {
+      const { email, reason, notes, leadId } = req.body || {};
+      const result = suppressEmail({
+        email,
+        reason: reason || 'manual',
+        source: 'crm_manual',
+        leadId: leadId || null,
+        notes: notes || null,
+        userId: req.user.id,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.delete(
+  '/suppressions/:id',
+  authRequired,
+  requireAnyPermission('email:manage_campaigns', 'leads:update_any'),
+  (req, res) => {
+    try {
+      res.json(unsuppressEmail(req.params.id));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
 
 router.get('/lists', authRequired, requireAnyPermission('email:bulk_send', 'leads:assign', 'leads:import'), async (_req, res) => {
   try {
@@ -471,9 +576,25 @@ router.post(
       }
       if (!lead.email) return res.status(400).json({ error: 'Lead has no email' });
 
+      const supp = getEmailSuppression(lead.email);
+      if (supp) {
+        return res.status(400).json({
+          error: `Blocked: ${reasonStopMessage(supp.reason)} (${lead.email})`,
+          suppressed: true,
+          reason: supp.reason,
+        });
+      }
+
       const { subject, htmlContent, textContent, templateId, syncToBrevo, emailAccountId } =
         req.body || {};
       const { accountId } = resolveSendAccount(emailAccountId || null);
+      const quota = getAccountSendQuota(accountId);
+      if (quota.capReached) {
+        return res.status(429).json({
+          error: `Daily send limit reached for this inbox (${quota.sentToday}/${quota.dailyLimit}). Try another inbox or wait until tomorrow.`,
+          capReached: true,
+        });
+      }
       const content = resolveEmailContent({
         subject,
         htmlContent,
@@ -559,6 +680,13 @@ router.post(
       }
 
       const { accountId } = resolveSendAccount(emailAccountId || null);
+      const quota = getAccountSendQuota(accountId);
+      if (quota.capReached) {
+        return res.status(429).json({
+          error: `Daily send limit reached for this inbox (${quota.sentToday}/${quota.dailyLimit}).`,
+          capReached: true,
+        });
+      }
 
       const ids = leadIds.slice(0, 25);
       const placeholders = ids.map(() => '?').join(',');
@@ -568,10 +696,27 @@ router.post(
 
       leads = leads.filter((lead) => canUpdateLead(req.user, lead));
 
+      // Exclude globally suppressed emails
+      const suppressedSet = getSuppressedEmailSet(leads.map((l) => l.email));
+      const beforeSupp = leads.length;
+      leads = leads.filter((l) => !suppressedSet.has(String(l.email || '').trim().toLowerCase()));
+      const skippedSuppressed = beforeSupp - leads.length;
+
       if (!leads.length) {
         return res.status(400).json({
-          error: 'No accessible leads with email addresses found',
+          error:
+            skippedSuppressed > 0
+              ? `All ${skippedSuppressed} selected lead(s) are suppressed (hard bounce, spam, or unsubscribed)`
+              : 'No accessible leads with email addresses found',
+          skippedSuppressed,
         });
+      }
+
+      // Cap batch to remaining daily quota for this inbox
+      let skippedDailyCap = 0;
+      if (leads.length > quota.remaining) {
+        skippedDailyCap = leads.length - quota.remaining;
+        leads = leads.slice(0, quota.remaining);
       }
 
       let sent = 0;
@@ -638,7 +783,13 @@ router.post(
         }
       }
 
-      res.json({ sent, failed, errors: errors.slice(0, 10) });
+      res.json({
+        sent,
+        failed,
+        skippedSuppressed,
+        skippedDailyCap,
+        errors: errors.slice(0, 10),
+      });
     } catch (err) {
       const status = err.code === 'BREVO_DISABLED' ? 503 : err.status || 500;
       res.status(status).json({ error: err.message || 'Bulk send failed' });
@@ -762,8 +913,19 @@ router.post(
       .all(...ids)
       .filter((lead) => canUpdateLead(req.user, lead));
 
+    const suppressedSet = getSuppressedEmailSet(leads.map((l) => l.email));
+    const beforeSupp = leads.length;
+    leads = leads.filter((l) => !suppressedSet.has(String(l.email || '').trim().toLowerCase()));
+    const skippedSuppressed = beforeSupp - leads.length;
+
     if (!leads.length) {
-      return res.status(400).json({ error: 'No accessible leads with email addresses found' });
+      return res.status(400).json({
+        error:
+          skippedSuppressed > 0
+            ? `All ${skippedSuppressed} selected lead(s) are suppressed (hard bounce, spam, or unsubscribed)`
+            : 'No accessible leads with email addresses found',
+        skippedSuppressed,
+      });
     }
 
     const batchId = uuid();
@@ -799,6 +961,7 @@ router.post(
       batchId,
       scheduledAt: scheduledSql,
       count: leads.length,
+      skippedSuppressed,
     });
   },
 );
@@ -1076,7 +1239,8 @@ router.get(
     const delivered = db
       .prepare(
         `SELECT COUNT(*) AS c FROM email_messages m
-         WHERE (
+         WHERE m.status != 'bounced'
+           AND (
              m.status IN ('delivered', 'opened', 'replied')
              OR EXISTS (
                SELECT 1 FROM email_events e
@@ -1091,18 +1255,38 @@ router.get(
          WHERE COALESCE(m.open_count, 0) > 0${acct.sql}${userClause}${sentDateClause}`,
       )
       .get(...msgParams).c;
+    const clicked = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM email_messages m
+         WHERE COALESCE(m.click_count, 0) > 0${acct.sql}${userClause}${sentDateClause}`,
+      )
+      .get(...msgParams).c;
+    const bounced = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM email_messages m
+         WHERE m.status = 'bounced'${acct.sql}${userClause}${sentDateClause}`,
+      )
+      .get(...msgParams).c;
+    const deferred = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM email_messages m
+         WHERE m.status != 'bounced'
+           AND (m.status = 'deferred' OR COALESCE(m.deferred_count, 0) > 0)${acct.sql}${userClause}${sentDateClause}`,
+      )
+      .get(...msgParams).c;
 
     const replyParams = [...acct.params];
     if (userId) replyParams.push(userId);
     if (!isOverall) replyParams.push(bounds.from, bounds.to);
     const replies = db
       .prepare(
-        `SELECT COUNT(*) AS c FROM email_replies r
-         WHERE EXISTS (
-           SELECT 1 FROM email_messages m
-           WHERE (m.id = r.email_message_id OR m.lead_id = r.lead_id)
-             ${acct.sql}${userClause}
-         )${replyDateClause}`,
+        `SELECT COUNT(DISTINCT COALESCE(r.lead_id, r.id)) AS c FROM email_replies r
+         WHERE COALESCE(r.is_auto_reply, 0) = 0
+           AND EXISTS (
+             SELECT 1 FROM email_messages m
+             WHERE (m.id = r.email_message_id OR (r.email_message_id IS NULL AND m.lead_id = r.lead_id))
+               ${acct.sql}${userClause}
+           )${replyDateClause}`,
       )
       .get(...replyParams).c;
 
@@ -1126,6 +1310,10 @@ router.get(
         ...(isOverall ? [] : [bounds.from, bounds.to]),
         ...teamAcct.params,
         ...(isOverall ? [] : [bounds.from, bounds.to]),
+        ...teamAcct.params,
+        ...(isOverall ? [] : [bounds.from, bounds.to]),
+        ...teamAcct.params,
+        ...(isOverall ? [] : [bounds.from, bounds.to]),
       ];
       team = db
         .prepare(
@@ -1134,13 +1322,18 @@ router.get(
                      WHERE m.user_id = u.id ${teamAcct.sql}${teamSentDate}) AS sent,
                   (SELECT COUNT(*) FROM email_messages m
                      WHERE m.user_id = u.id AND COALESCE(m.open_count, 0) > 0 ${teamAcct.sql}${teamSentDate}) AS opened,
-                  (SELECT COUNT(*) FROM email_replies r
-                     WHERE EXISTS (
-                       SELECT 1 FROM email_messages m
-                       WHERE m.user_id = u.id
-                         AND (m.id = r.email_message_id OR m.lead_id = r.lead_id)
-                         ${teamAcct.sql}
-                     )${teamReplyDate}) AS replies
+                  (SELECT COUNT(*) FROM email_messages m
+                     WHERE m.user_id = u.id AND COALESCE(m.click_count, 0) > 0 ${teamAcct.sql}${teamSentDate}) AS clicked,
+                  (SELECT COUNT(*) FROM email_messages m
+                     WHERE m.user_id = u.id AND m.status = 'bounced' ${teamAcct.sql}${teamSentDate}) AS bounced,
+                  (SELECT COUNT(DISTINCT COALESCE(r.lead_id, r.id)) FROM email_replies r
+                     WHERE COALESCE(r.is_auto_reply, 0) = 0
+                       AND EXISTS (
+                         SELECT 1 FROM email_messages m
+                         WHERE m.user_id = u.id
+                           AND (m.id = r.email_message_id OR (r.email_message_id IS NULL AND m.lead_id = r.lead_id))
+                           ${teamAcct.sql}
+                       )${teamReplyDate}) AS replies
            FROM users u
            WHERE u.role = 'telesales' AND u.is_active = 1
            ORDER BY u.name COLLATE NOCASE`,
@@ -1148,13 +1341,15 @@ router.get(
         .all(...teamParams);
     }
 
-    // Daily rollup: how many emails went out (and opened) each calendar day.
+    // Daily rollup: how many emails went out (opened, clicked, bounced, replied) each calendar day.
     const byDayMap = new Map();
     const dayRows = db
       .prepare(
         `SELECT ${DAY_KARACHI('m.sent_at')} AS day,
                 COUNT(*) AS sent,
-                SUM(CASE WHEN COALESCE(m.open_count, 0) > 0 THEN 1 ELSE 0 END) AS opened
+                SUM(CASE WHEN COALESCE(m.open_count, 0) > 0 THEN 1 ELSE 0 END) AS opened,
+                SUM(CASE WHEN COALESCE(m.click_count, 0) > 0 THEN 1 ELSE 0 END) AS clicked,
+                SUM(CASE WHEN m.status = 'bounced' THEN 1 ELSE 0 END) AS bounced
          FROM email_messages m
          WHERE 1=1${acct.sql}${userClause}${sentDateClause}
          GROUP BY day
@@ -1168,18 +1363,21 @@ router.get(
         day: row.day,
         sent: row.sent || 0,
         opened: row.opened || 0,
+        clicked: row.clicked || 0,
+        bounced: row.bounced || 0,
         replies: 0,
       });
     }
     const replyDayRows = db
       .prepare(
-        `SELECT ${DAY_KARACHI('r.received_at')} AS day, COUNT(*) AS replies
+        `SELECT ${DAY_KARACHI('r.received_at')} AS day, COUNT(DISTINCT COALESCE(r.lead_id, r.id)) AS replies
          FROM email_replies r
-         WHERE EXISTS (
-           SELECT 1 FROM email_messages m
-           WHERE (m.id = r.email_message_id OR m.lead_id = r.lead_id)
-             ${acct.sql}${userClause}
-         )${replyDateClause}
+         WHERE COALESCE(r.is_auto_reply, 0) = 0
+           AND EXISTS (
+             SELECT 1 FROM email_messages m
+             WHERE (m.id = r.email_message_id OR (r.email_message_id IS NULL AND m.lead_id = r.lead_id))
+               ${acct.sql}${userClause}
+           )${replyDateClause}
          GROUP BY day
          HAVING day IS NOT NULL
          ORDER BY day DESC
@@ -1187,7 +1385,14 @@ router.get(
       )
       .all(...replyParams);
     for (const row of replyDayRows) {
-      const cur = byDayMap.get(row.day) || { day: row.day, sent: 0, opened: 0, replies: 0 };
+      const cur = byDayMap.get(row.day) || {
+        day: row.day,
+        sent: 0,
+        opened: 0,
+        clicked: 0,
+        bounced: 0,
+        replies: 0,
+      };
       cur.replies = row.replies || 0;
       byDayMap.set(row.day, cur);
     }
@@ -1207,9 +1412,14 @@ router.get(
         sent,
         delivered,
         opened,
+        clicked,
         replies,
+        bounced,
+        deferred,
         openRate: sent ? Math.round((opened / sent) * 1000) / 10 : 0,
+        clickRate: sent ? Math.round((clicked / sent) * 1000) / 10 : 0,
         replyRate: sent ? Math.round((replies / sent) * 1000) / 10 : 0,
+        bounceRate: sent ? Math.round((bounced / sent) * 1000) / 10 : 0,
         deliveryRate: sent ? Math.round((delivered / sent) * 1000) / 10 : 0,
       },
       team,
@@ -1394,6 +1604,19 @@ router.post(
   (req, res) => {
     try {
       res.json(campaigns.launchCampaign(req.params.id, { userId: req.user.id }));
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  },
+);
+
+router.post(
+  '/campaigns/:id/resume',
+  authRequired,
+  requirePermission('email:manage_campaigns'),
+  (req, res) => {
+    try {
+      res.json(campaigns.resumeCampaign(req.params.id, { userId: req.user.id }));
     } catch (err) {
       res.status(err.status || 500).json({ error: err.message });
     }

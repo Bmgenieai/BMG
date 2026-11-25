@@ -3,6 +3,7 @@
  * Enabled when BREVO_ENABLED=true and BREVO_API_KEY is set.
  */
 import { LEAD_SOURCES } from './permissions.js';
+import { db } from '../db.js';
 
 const BREVO_API = 'https://api.brevo.com/v3';
 
@@ -72,6 +73,38 @@ export function firstName(fullName) {
   const n = (fullName || '').trim();
   if (!n) return 'there';
   return n.split(/\s+/)[0] || n;
+}
+
+export const VALID_MERGE_TAGS = [
+  'name',
+  'first_name',
+  'firstName',
+  'company',
+  'company_name',
+  'companyName',
+  'country',
+  'email',
+  'source',
+  'source_label',
+  'sender_name',
+  'sender_email',
+];
+
+const VALID_MERGE_TAG_SET = new Set(VALID_MERGE_TAGS);
+
+/** Return array of unknown/misspelled merge tags like {{frist_name}} found in text. */
+export function findInvalidMergeTags(text) {
+  if (!text) return [];
+  const invalid = new Set();
+  const re = /\{\{\s*([^}]+?)\s*\}\}/g;
+  let m;
+  while ((m = re.exec(String(text))) !== null) {
+    const rawKey = m[1].trim();
+    if (!VALID_MERGE_TAG_SET.has(rawKey)) {
+      invalid.add(`{{${rawKey}}}`);
+    }
+  }
+  return [...invalid];
 }
 
 /**
@@ -211,6 +244,24 @@ export function getTemplatesForSource(source) {
 }
 
 export function getTemplateById(id) {
+  if (!id) return null;
+  try {
+    const row = db
+      .prepare(`SELECT * FROM email_templates WHERE id = ?`)
+      .get(id);
+    if (row) {
+      return {
+        id: row.id,
+        label: row.name,
+        name: row.name,
+        subject: row.subject,
+        htmlContent: row.html_content || '',
+        textContent: row.text_content || '',
+      };
+    }
+  } catch {
+    /* fallback to built-in */
+  }
   return COLD_EMAIL_TEMPLATES.find((t) => t.id === id) || null;
 }
 

@@ -4,6 +4,7 @@
 import { v4 as uuid } from 'uuid';
 import { db } from '../db.js';
 import { touchLeadContacted, onLeadReply } from './leadAutomation.js';
+import { suppressEmail } from './emailSuppression.js';
 import {
   findAccountMatchingEmails,
   getEmailAccountByEmail,
@@ -15,15 +16,115 @@ const OPEN_EVENTS = new Set(['opened', 'unique_opened', 'uniqueOpened']);
 const CLICK_EVENTS = new Set(['click', 'clicks']);
 const REPLY_EVENTS = new Set(['reply', 'replied']);
 const DELIVERED_EVENTS = new Set(['delivered', 'request']);
+const HARD_BOUNCE_EVENTS = new Set(['hardBounce', 'blocked', 'invalid', 'error']);
+const SOFT_BOUNCE_EVENTS = new Set(['softBounce', 'deferred']);
+const SPAM_EVENTS = new Set(['spam', 'complaint']);
+const UNSUBSCRIBE_EVENTS = new Set(['unsubscribed', 'unsubscribe']);
 const BOUNCE_EVENTS = new Set([
-  'hardBounce',
-  'softBounce',
-  'blocked',
-  'invalid',
-  'error',
-  'deferred',
-  'spam',
+  ...HARD_BOUNCE_EVENTS,
+  ...SOFT_BOUNCE_EVENTS,
+  ...SPAM_EVENTS,
 ]);
+
+/** Detect out-of-office / vacation / automated system replies that should NOT stop a sequence. */
+export function isAutoReplyMessage({ headers = {}, subject = '', bodyText = '', fromEmail = '' } = {}) {
+  const hdrs = {};
+  if (headers && typeof headers === 'object') {
+    if (headers instanceof Map) {
+      for (const [k, v] of headers.entries()) hdrs[String(k).toLowerCase()] = String(v ?? '');
+    } else if (Array.isArray(headers)) {
+      for (const h of headers) {
+        const k = String(h?.Name || h?.name || '').toLowerCase();
+        if (k) hdrs[k] = String(h?.Value || h?.value || '');
+      }
+    } else {
+      for (const [k, v] of Object.entries(headers)) {
+        hdrs[String(k).toLowerCase()] = String(v ?? '');
+      }
+    }
+  }
+
+  const autoSubmitted = (hdrs['auto-submitted'] || '').trim().toLowerCase();
+  if (autoSubmitted && autoSubmitted !== 'no') return true;
+  if (hdrs['x-auto-response-suppress'] && /oof|all|autoreply/i.test(hdrs['x-auto-response-suppress'])) {
+    return true;
+  }
+  if (hdrs['x-autoreply'] || hdrs['x-autorespond'] || hdrs['x-auto-reply']) return true;
+  const precedence = (hdrs['precedence'] || '').trim().toLowerCase();
+  if (['auto_reply', 'autoreply', 'bulk', 'junk', 'list'].includes(precedence)) return true;
+
+  const sub = String(subject || '').trim();
+  if (
+    /^(automatic reply|auto.?reply|out of office|ooo\b|away from|vacation|on leave|auto:|autoreply:)/i.test(
+      sub,
+    ) ||
+    /\b(out of (the )?office|automatic reply|auto-?response)\b/i.test(sub)
+  ) {
+    return true;
+  }
+
+  const from = String(fromEmail || '').trim().toLowerCase();
+  if (/^(no-?reply|do-?not-?reply|auto-?reply)@/i.test(from)) return true;
+
+  const snippet = String(bodyText || '').slice(0, 600);
+  if (
+    /\b(out of (the )?office|i am currently (out|away)|i will be (out of|away from)|on vacation|on paternity|on maternity|limited access to (my )?email|this is an automated (reply|response|message)|auto-?generated (reply|response)|i will return on|thank you for your email\.?\s+i am (currently )?(out|away))\b/i.test(
+      snippet,
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/** Detect SMTP Delivery Status Notification / bounce messages in IMAP inbox. */
+export function isBounceDsnMessage({ headers = {}, subject = '', fromEmail = '', bodyText = '' } = {}) {
+  const from = String(fromEmail || '').trim().toLowerCase();
+  if (/^(mailer-daemon|postmaster|mail-daemon|bounce|bounces)@/i.test(from)) return true;
+
+  const sub = String(subject || '').trim();
+  if (
+    /^(undeliverable|delivery status notification|mail delivery failed|returned mail|failure notice|delivery has failed)/i.test(
+      sub,
+    )
+  ) {
+    return true;
+  }
+
+  const contentType = String(
+    headers?.['content-type'] || headers?.get?.('content-type') || '',
+  ).toLowerCase();
+  if (contentType.includes('delivery-status') || contentType.includes('multipart/report')) {
+    return true;
+  }
+
+  const snippet = String(bodyText || '').slice(0, 800);
+  if (
+    /550\s+5\.1\.1|user unknown|address not found|recipient address rejected|mailbox unavailable|permanent error/i.test(
+      snippet,
+    ) &&
+    /final-recipient|original-recipient|delivery to the following recipient/i.test(snippet)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/** Detect direct unsubscribe reply (e.g. from List-Unsubscribe mailto: link). */
+export function isUnsubscribeMessage({ subject = '', bodyText = '' } = {}) {
+  const sub = String(subject || '').trim();
+  if (/^\s*unsubscribe\b/i.test(sub)) return true;
+  const cleanBody = String(bodyText || '').trim();
+  if (
+    cleanBody.length <= 160 &&
+    /^\s*(unsubscribe|remove me|opt out|stop emailing|take me off)\b/i.test(cleanBody)
+  ) {
+    return true;
+  }
+  return false;
+}
 
 function normalizeEvent(raw) {
   return String(raw || '')
@@ -163,6 +264,18 @@ function findLeadId({ message, email, tags }) {
       )
       .get(em);
     if (lead) return lead.id;
+
+    // Also match contacts stored under lead_employees
+    try {
+      const emp = db
+        .prepare(
+          `SELECT lead_id FROM lead_employees WHERE lower(email) = ? ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(em);
+      if (emp?.lead_id) return emp.lead_id;
+    } catch {
+      /* ignore */
+    }
   }
   return null;
 }
@@ -211,8 +324,17 @@ function activityForEvent(event, subject) {
   if (REPLY_EVENTS.has(event)) {
     return { type: 'reply', summary: `Email reply received${subj}`, outcome: 'neutral' };
   }
-  if (BOUNCE_EVENTS.has(event)) {
-    return { type: 'email_bounced', summary: `Email ${event}${subj}` };
+  if (HARD_BOUNCE_EVENTS.has(event)) {
+    return { type: 'email_bounced', summary: `Email hard bounce (${event})${subj}` };
+  }
+  if (SPAM_EVENTS.has(event)) {
+    return { type: 'email_bounced', summary: `Spam complaint (${event})${subj}` };
+  }
+  if (SOFT_BOUNCE_EVENTS.has(event)) {
+    return { type: 'email_deferred', summary: `Temporary delivery delay (${event})${subj}` };
+  }
+  if (UNSUBSCRIBE_EVENTS.has(event)) {
+    return { type: 'email_unsubscribed', summary: `Prospect unsubscribed${subj}` };
   }
   if (DELIVERED_EVENTS.has(event)) {
     return { type: 'email_delivered', summary: `Email delivered${subj}` };
@@ -322,15 +444,75 @@ export function ingestBrevoWebhookEvent(payload) {
       payload,
     });
   }
-  if (message && BOUNCE_EVENTS.has(event)) {
-    db.prepare(
-      `UPDATE email_messages SET status = 'bounced' WHERE id = ?`,
-    ).run(message.id);
+  if (HARD_BOUNCE_EVENTS.has(event)) {
+    if (message) {
+      db.prepare(
+        `UPDATE email_messages SET status = 'bounced', bounce_type = 'hard' WHERE id = ?`,
+      ).run(message.id);
+    }
+    if (email) {
+      try {
+        suppressEmail({
+          email,
+          reason: 'hard_bounce',
+          source: 'brevo_webhook',
+          leadId,
+          notes: payload.reason || event,
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+  } else if (SPAM_EVENTS.has(event)) {
+    if (message) {
+      db.prepare(
+        `UPDATE email_messages SET status = 'bounced', bounce_type = 'spam' WHERE id = ?`,
+      ).run(message.id);
+    }
+    if (email) {
+      try {
+        suppressEmail({
+          email,
+          reason: 'spam',
+          source: 'brevo_webhook',
+          leadId,
+          notes: payload.reason || 'Spam complaint',
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+  } else if (UNSUBSCRIBE_EVENTS.has(event)) {
+    if (email) {
+      try {
+        suppressEmail({
+          email,
+          reason: 'unsubscribed',
+          source: 'brevo_webhook',
+          leadId,
+          notes: 'Unsubscribed via Brevo',
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+  } else if (SOFT_BOUNCE_EVENTS.has(event)) {
+    // Track temporary delivery delays separately from hard bounces — do NOT suppress
+    if (message) {
+      db.prepare(
+        `UPDATE email_messages
+         SET deferred_count = COALESCE(deferred_count, 0) + 1,
+             last_deferred_at = ?,
+             bounce_type = CASE WHEN bounce_type IN ('hard','spam') THEN bounce_type ELSE 'soft' END,
+             status = CASE WHEN status = 'sent' THEN 'deferred' ELSE status END
+         WHERE id = ?`,
+      ).run(occurredAt, message.id);
+    }
   }
   if (message && event === 'delivered') {
     db.prepare(
       `UPDATE email_messages
-       SET status = CASE WHEN status IN ('opened','replied') THEN status ELSE 'delivered' END
+       SET status = CASE WHEN status IN ('opened','replied','bounced') THEN status ELSE 'delivered' END
        WHERE id = ?`,
     ).run(message.id);
   }
@@ -343,6 +525,7 @@ export function ingestBrevoWebhookEvent(payload) {
     CLICK_EVENTS.has(event) ||
     REPLY_EVENTS.has(event) ||
     BOUNCE_EVENTS.has(event) ||
+    UNSUBSCRIBE_EVENTS.has(event) ||
     event === 'delivered'
   ) {
     const act = activityForEvent(event, subject || message?.subject);
@@ -555,7 +738,8 @@ function upsertReplyStubFromEvent({
   const recentInbound = db
     .prepare(
       `SELECT id FROM email_replies
-       WHERE lead_id = ? AND source = 'brevo_inbound'
+       WHERE lead_id = ? AND source IN ('brevo_inbound', 'sender_mailbox')
+         AND COALESCE(is_auto_reply, 0) = 0
          AND datetime(received_at) >= datetime(?, '-1 day')
        LIMIT 1`,
     )
@@ -642,6 +826,8 @@ export function ingestParsedReply({
   spamScore = null,
   receivedAt = null,
   raw = null,
+  headers = null,
+  isAutoReply = null,
   source = 'brevo_inbound',
   requireLeadMatch = false,
 }) {
@@ -672,6 +858,34 @@ export function ingestParsedReply({
     return { ok: false, skipped: 'no_lead_match' };
   }
 
+  // Handle unsubscribe replies immediately: suppress address and stop sequence
+  if (isUnsubscribeMessage({ subject, bodyText: bodyMarkdown || bodyText })) {
+    if (fromEmail) {
+      try {
+        suppressEmail({
+          email: fromEmail,
+          reason: 'unsubscribed',
+          source: sourceKey,
+          leadId,
+          notes: subject || 'Unsubscribe reply',
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+    return { ok: true, skipped: 'unsubscribed', leadId };
+  }
+
+  const autoReply =
+    typeof isAutoReply === 'boolean'
+      ? isAutoReply
+      : isAutoReplyMessage({
+          headers: headers || {},
+          subject,
+          bodyText: bodyMarkdown || bodyText,
+          fromEmail,
+        });
+
   const when = receivedAt || new Date().toISOString();
   const id = uuid();
   const inboxKind = computeReplyInboxKind({
@@ -683,8 +897,8 @@ export function ingestParsedReply({
        id, lead_id, email_message_id, provider_message_id, in_reply_to,
        from_email, from_name, to_emails, subject,
        body_text, body_html, body_markdown, spam_score,
-       source, received_at, raw_json, inbox_kind
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       source, read_at, received_at, raw_json, inbox_kind, is_auto_reply
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     leadId,
@@ -700,10 +914,31 @@ export function ingestParsedReply({
     bodyMarkdown ? String(bodyMarkdown).slice(0, 100_000) : null,
     spamScore,
     sourceKey,
+    autoReply ? when : null,
     when,
     raw ? JSON.stringify(raw).slice(0, 16_000) : null,
     inboxKind,
+    autoReply ? 1 : 0,
   );
+
+  // Out-of-office / auto-replies: log activity for visibility, but keep the sequence running!
+  if (autoReply) {
+    if (leadId) {
+      try {
+        db.prepare(
+          `INSERT INTO lead_activities (id, lead_id, user_id, type, summary)
+           VALUES (?, ?, NULL, 'email_ooo', ?)`,
+        ).run(
+          uuid(),
+          leadId,
+          `Out-of-office auto-reply ignored (sequence kept running): ${subject || '(no subject)'}`,
+        );
+      } catch {
+        /* ignore */
+      }
+    }
+    return { ok: true, replyId: id, leadId, autoReply: true };
+  }
 
   if (leadId) {
     const alreadyCounted =
@@ -832,6 +1067,7 @@ export function ingestBrevoInboundEmail(item) {
     spamScore,
     receivedAt,
     raw: item,
+    headers,
     source: 'brevo_inbound',
   });
 }
@@ -852,7 +1088,7 @@ function inboxKindExpr(alias = 'r') {
 }
 
 function scopeReplyClauses({ user, canViewAll, unreadOnly = false, q = '', bucket = 'all' }) {
-  const clauses = [];
+  const clauses = ['COALESCE(r.is_auto_reply, 0) = 0'];
   const params = [];
 
   if (!canViewAll && user?.id) {

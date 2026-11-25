@@ -13,8 +13,100 @@ function normalizeEmail(raw) {
 const PUBLIC_COLS = `
   id, label, email, name, is_active, is_default, verified,
   imap_host, imap_port, imap_user, imap_enabled,
+  daily_limit, min_delay_seconds,
   created_at, updated_at
 `;
+
+export const DEFAULT_DAILY_LIMIT = 50;
+export const DEFAULT_MIN_DELAY_SECONDS = 60;
+
+/** Count outbound cold/campaign emails sent today (UTC date) by an inbox. */
+export function getAccountSentToday(accountId) {
+  if (!accountId) return 0;
+  try {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS c
+         FROM email_messages
+         WHERE email_account_id = ?
+           AND COALESCE(source, '') != 'crm_reply'
+           AND date(sent_at) = date('now')`,
+      )
+      .get(accountId);
+    return Number(row?.c || 0);
+  } catch {
+    return 0;
+  }
+}
+
+/** Return milliseconds since last outbound cold/campaign send on this inbox, or Infinity. */
+export function getAccountLastSentMs(accountId) {
+  if (!accountId) return null;
+  try {
+    const row = db
+      .prepare(
+        `SELECT sent_at
+         FROM email_messages
+         WHERE email_account_id = ?
+           AND COALESCE(source, '') != 'crm_reply'
+         ORDER BY sent_at DESC
+         LIMIT 1`,
+      )
+      .get(accountId);
+    if (!row?.sent_at) return null;
+    const iso = row.sent_at.includes('T') ? row.sent_at : `${row.sent_at.replace(' ', 'T')}Z`;
+    const ms = Date.parse(iso);
+    return Number.isNaN(ms) ? null : ms;
+  } catch {
+    return null;
+  }
+}
+
+/** Check daily cap & minimum send spacing for an inbox. */
+export function getAccountSendQuota(accountId) {
+  const acc = accountId ? getEmailAccount(accountId) : getDefaultEmailAccount();
+  if (!acc) {
+    return {
+      accountId: null,
+      dailyLimit: DEFAULT_DAILY_LIMIT,
+      sentToday: 0,
+      remaining: DEFAULT_DAILY_LIMIT,
+      minDelaySeconds: DEFAULT_MIN_DELAY_SECONDS,
+      capReached: false,
+      spacingBlocked: false,
+      waitSeconds: 0,
+    };
+  }
+  const dailyLimit = Math.max(1, Number(acc.daily_limit) || DEFAULT_DAILY_LIMIT);
+  const minDelaySeconds = Math.max(0, Number(acc.min_delay_seconds ?? DEFAULT_MIN_DELAY_SECONDS));
+  const sentToday = getAccountSentToday(acc.id);
+  const remaining = Math.max(0, dailyLimit - sentToday);
+  const capReached = remaining <= 0;
+
+  let spacingBlocked = false;
+  let waitSeconds = 0;
+  if (minDelaySeconds > 0) {
+    const lastMs = getAccountLastSentMs(acc.id);
+    if (lastMs != null) {
+      const elapsedSec = (Date.now() - lastMs) / 1000;
+      if (elapsedSec < minDelaySeconds) {
+        spacingBlocked = true;
+        waitSeconds = Math.ceil(minDelaySeconds - elapsedSec);
+      }
+    }
+  }
+
+  return {
+    accountId: acc.id,
+    dailyLimit,
+    sentToday,
+    remaining,
+    minDelaySeconds,
+    capReached,
+    spacingBlocked,
+    waitSeconds,
+  };
+}
 
 /** If table empty and BREVO_SENDER_EMAIL is set, create the default account. */
 export function ensureDefaultAccountFromEnv() {
@@ -92,21 +184,27 @@ export function emailAccountMatchSql(account, { alias = 'm' } = {}) {
 
 export function listEmailAccounts({ activeOnly = false } = {}) {
   ensureDefaultAccountFromEnv();
-  if (activeOnly) {
-    return db
-      .prepare(
-        `SELECT ${PUBLIC_COLS} FROM email_accounts
-         WHERE is_active = 1
-         ORDER BY is_default DESC, label COLLATE NOCASE ASC`,
-      )
-      .all();
-  }
-  return db
-    .prepare(
-      `SELECT ${PUBLIC_COLS} FROM email_accounts
-       ORDER BY is_default DESC, label COLLATE NOCASE ASC`,
-    )
-    .all();
+  const rows = activeOnly
+    ? db
+        .prepare(
+          `SELECT ${PUBLIC_COLS} FROM email_accounts
+           WHERE is_active = 1
+           ORDER BY is_default DESC, label COLLATE NOCASE ASC`,
+        )
+        .all()
+    : db
+        .prepare(
+          `SELECT ${PUBLIC_COLS} FROM email_accounts
+           ORDER BY is_default DESC, label COLLATE NOCASE ASC`,
+        )
+        .all();
+
+  return rows.map((r) => ({
+    ...r,
+    daily_limit: Math.max(1, Number(r.daily_limit) || DEFAULT_DAILY_LIMIT),
+    min_delay_seconds: Math.max(0, Number(r.min_delay_seconds ?? DEFAULT_MIN_DELAY_SECONDS)),
+    sent_today: getAccountSentToday(r.id),
+  }));
 }
 
 export function getEmailAccount(id) {
@@ -246,11 +344,21 @@ export function createEmailAccount(body, { userId = null } = {}) {
     db.prepare(`UPDATE email_accounts SET is_default = 0`).run();
   }
 
+  const dailyLimit = Math.max(
+    1,
+    Math.min(5000, Number(body.daily_limit ?? body.dailyLimit) || DEFAULT_DAILY_LIMIT),
+  );
+  const minDelaySeconds = Math.max(
+    0,
+    Math.min(3600, Number(body.min_delay_seconds ?? body.minDelaySeconds ?? DEFAULT_MIN_DELAY_SECONDS) || 0),
+  );
+
   db.prepare(
     `INSERT INTO email_accounts (
        id, label, email, name, is_active, is_default, verified,
-       imap_host, imap_port, imap_user, imap_pass, imap_enabled, created_by
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       imap_host, imap_port, imap_user, imap_pass, imap_enabled,
+       daily_limit, min_delay_seconds, created_by
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     label,
@@ -264,6 +372,8 @@ export function createEmailAccount(body, { userId = null } = {}) {
     body.imap_user ? String(body.imap_user).trim() : null,
     body.imap_pass ? String(body.imap_pass) : null,
     body.imap_enabled === true ? 1 : 0,
+    dailyLimit,
+    minDelaySeconds,
     userId,
   );
 
@@ -313,6 +423,17 @@ export function updateEmailAccount(id, body) {
     body.is_default === true ? 1 : body.is_default === false ? 0 : row.is_default;
   const verified = body.verified != null ? (body.verified ? 1 : 0) : row.verified;
 
+  const dailyLimitRaw = body.daily_limit ?? body.dailyLimit;
+  const dailyLimit =
+    dailyLimitRaw != null
+      ? Math.max(1, Math.min(5000, Number(dailyLimitRaw) || DEFAULT_DAILY_LIMIT))
+      : Math.max(1, Number(row.daily_limit) || DEFAULT_DAILY_LIMIT);
+  const minDelayRaw = body.min_delay_seconds ?? body.minDelaySeconds;
+  const minDelaySeconds =
+    minDelayRaw != null
+      ? Math.max(0, Math.min(3600, Number(minDelayRaw) || 0))
+      : Math.max(0, Number(row.min_delay_seconds ?? DEFAULT_MIN_DELAY_SECONDS));
+
   db.prepare(
     `UPDATE email_accounts SET
        label = ?, email = ?, name = ?,
@@ -320,6 +441,8 @@ export function updateEmailAccount(id, body) {
        imap_host = ?, imap_port = ?, imap_user = ?,
        imap_pass = CASE WHEN ? IS NOT NULL THEN ? ELSE imap_pass END,
        imap_enabled = ?,
+       daily_limit = ?,
+       min_delay_seconds = ?,
        updated_at = datetime('now')
      WHERE id = ?`,
   ).run(
@@ -335,6 +458,8 @@ export function updateEmailAccount(id, body) {
     body.imap_pass != null ? String(body.imap_pass) : null,
     body.imap_pass != null ? String(body.imap_pass) : null,
     body.imap_enabled != null ? (body.imap_enabled ? 1 : 0) : row.imap_enabled,
+    dailyLimit,
+    minDelaySeconds,
     id,
   );
 

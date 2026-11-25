@@ -935,6 +935,70 @@ export function migrate() {
       console.warn('[migrate] email_accounts_seed_v1:', err.message);
     }
   }
+
+  // Global email suppression list (hard bounces, spam complaints, unsubscribes, manual)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS email_suppressions (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      reason TEXT NOT NULL CHECK(reason IN ('hard_bounce','spam','unsubscribed','manual')),
+      source TEXT,
+      lead_id TEXT REFERENCES leads(id) ON DELETE SET NULL,
+      notes TEXT,
+      created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_suppressions_email
+      ON email_suppressions(email);
+    CREATE INDEX IF NOT EXISTS idx_email_suppressions_reason
+      ON email_suppressions(reason);
+
+    CREATE TABLE IF NOT EXISTS email_campaign_accounts (
+      campaign_id TEXT NOT NULL REFERENCES email_campaigns(id) ON DELETE CASCADE,
+      email_account_id TEXT NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (campaign_id, email_account_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_campaign_accounts_campaign
+      ON email_campaign_accounts(campaign_id, sort_order);
+
+    CREATE TABLE IF NOT EXISTS email_templates (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      html_content TEXT,
+      text_content TEXT,
+      category TEXT DEFAULT 'cold_outreach',
+      is_system INTEGER NOT NULL DEFAULT 0,
+      created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  const extraEmailAlters = [
+    `ALTER TABLE email_accounts ADD COLUMN daily_limit INTEGER NOT NULL DEFAULT 50`,
+    `ALTER TABLE email_accounts ADD COLUMN min_delay_seconds INTEGER NOT NULL DEFAULT 60`,
+    `ALTER TABLE email_campaigns ADD COLUMN send_window_start INTEGER NOT NULL DEFAULT 9`,
+    `ALTER TABLE email_campaigns ADD COLUMN send_window_end INTEGER NOT NULL DEFAULT 17`,
+    `ALTER TABLE email_campaigns ADD COLUMN use_prospect_timezone INTEGER NOT NULL DEFAULT 1`,
+    `ALTER TABLE email_campaigns ADD COLUMN thread_followups INTEGER NOT NULL DEFAULT 1`,
+    `ALTER TABLE email_campaign_leads ADD COLUMN email_account_id TEXT`,
+    `ALTER TABLE email_messages ADD COLUMN bounce_type TEXT`,
+    `ALTER TABLE email_messages ADD COLUMN deferred_count INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE email_messages ADD COLUMN last_deferred_at TEXT`,
+    `ALTER TABLE email_replies ADD COLUMN is_auto_reply INTEGER NOT NULL DEFAULT 0`,
+  ];
+  for (const sql of extraEmailAlters) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* column already exists */
+    }
+  }
 }
 
 migrate();

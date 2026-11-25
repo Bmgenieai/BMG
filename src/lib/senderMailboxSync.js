@@ -10,7 +10,12 @@
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { db } from '../db.js';
-import { ingestParsedReply } from './emailLog.js';
+import {
+  ingestParsedReply,
+  isBounceDsnMessage,
+  isUnsubscribeMessage,
+} from './emailLog.js';
+import { suppressEmail } from './emailSuppression.js';
 
 let timer = null;
 let running = false;
@@ -132,7 +137,42 @@ function looksLikeReply(parsed) {
     return true;
   }
   const sub = String(parsed.subject || '');
-  return /^(re|fw|fwd|automatic reply)\s*:/i.test(sub);
+  return /^(re|fw|fwd)\s*:/i.test(sub);
+}
+
+function isKnownLeadOrRecipient(email) {
+  if (!email) return false;
+  try {
+    const inLeads = db
+      .prepare(`SELECT 1 FROM leads WHERE lower(email) = ? LIMIT 1`)
+      .get(email);
+    if (inLeads) return true;
+    const inEmp = db
+      .prepare(`SELECT 1 FROM lead_employees WHERE lower(email) = ? LIMIT 1`)
+      .get(email);
+    if (inEmp) return true;
+    const inSent = db
+      .prepare(`SELECT 1 FROM email_messages WHERE lower(to_email) = ? LIMIT 1`)
+      .get(email);
+    return Boolean(inSent);
+  } catch {
+    return false;
+  }
+}
+
+function extractBouncedRecipientFromDsn(text = '') {
+  const raw = String(text || '');
+  const patterns = [
+    /final-recipient:\s*(?:rfc822;)?\s*([^\s<>]+@[^\s<>]+)/i,
+    /original-recipient:\s*(?:rfc822;)?\s*([^\s<>]+@[^\s<>]+)/i,
+    /delivery to the following recipient(?:s)? failed[^@]*?([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i,
+    /<([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})>:\s*(?:550|551|552|553|554|user unknown|no such user|mailbox unavailable)/i,
+  ];
+  for (const re of patterns) {
+    const m = raw.match(re);
+    if (m?.[1]) return m[1].trim().toLowerCase().replace(/[.,;>]+$/, '');
+  }
+  return null;
 }
 
 async function processMessage(client, uid, mailboxMeta) {
@@ -147,7 +187,51 @@ async function processMessage(client, uid, mailboxMeta) {
   const ours = ourAddresses();
   if (ours.has(fromEmail)) return { skipped: 'from_self' };
 
-  if (!looksLikeReply(parsed)) return { skipped: 'not_reply' };
+  // Handle SMTP DSN / bounce notifications: suppress the bounced address instead of logging a reply
+  if (
+    isBounceDsnMessage({
+      headers: parsed.headers,
+      subject: parsed.subject,
+      fromEmail,
+      bodyText: parsed.text || '',
+    })
+  ) {
+    const failedEmail = extractBouncedRecipientFromDsn(parsed.text || '');
+    if (failedEmail && !ours.has(failedEmail)) {
+      try {
+        suppressEmail({
+          email: failedEmail,
+          reason: 'hard_bounce',
+          source: 'imap_dsn',
+          notes: parsed.subject || 'SMTP bounce DSN',
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+    return { skipped: 'bounce_dsn' };
+  }
+
+  // Handle direct mailto: unsubscribe replies
+  if (isUnsubscribeMessage({ subject: parsed.subject, bodyText: parsed.text || '' })) {
+    try {
+      suppressEmail({
+        email: fromEmail,
+        reason: 'unsubscribed',
+        source: 'imap_unsubscribe',
+        notes: parsed.subject || 'Unsubscribe email',
+      });
+    } catch {
+      /* ignore */
+    }
+    return { skipped: 'unsubscribed' };
+  }
+
+  // Accept if it looks like a reply OR if it came from a known CRM lead / outbound recipient
+  // (catches genuine replies even when the prospect changes the subject or starts a new thread).
+  if (!looksLikeReply(parsed) && !isKnownLeadOrRecipient(fromEmail)) {
+    return { skipped: 'not_reply' };
+  }
 
   const messageId = parsed.messageId
     ? String(parsed.messageId).replace(/^<|>$/g, '')
@@ -190,6 +274,7 @@ async function processMessage(client, uid, mailboxMeta) {
       to: toEmails,
       subject: parsed.subject,
     },
+    headers: parsed.headers || null,
     source: 'sender_mailbox',
     requireLeadMatch: false,
   });

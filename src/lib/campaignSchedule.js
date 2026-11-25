@@ -12,6 +12,7 @@ import {
   normalizeCampaignSendHour,
   normalizeCampaignSendMinute,
   normalizeCampaignTimezone,
+  normalizeSendWindow,
 } from './campaignTimezones.js';
 
 /** @deprecated Prefer CAMPAIGN_SEND_* — kept for older imports */
@@ -105,20 +106,25 @@ export function partsInTz(date, timeZone = WORKING_TZ) {
 }
 
 /**
- * Snap into next valid send: weekday + preferred hour & minute local.
- * If before preferred time same day, snaps to today at preferred time.
- * If already past preferred time today, allows immediate dispatch.
+ * Snap into next valid Mon–Fri business-hours send window [startHour, endHour) local.
+ * - Weekend → next Monday at clamped preferred time
+ * - Before preferred time (or before startHour) today → same day at clamped preferred time
+ * - At/after endHour today → next business day at clamped preferred time
+ * - Inside [preferred, endHour) today → send at `date` (within business hours)
  */
 export function snapToSendWindow(
   date,
   timeZone = DEFAULT_CAMPAIGN_TIMEZONE,
   preferredHour = DEFAULT_CAMPAIGN_SEND_HOUR,
   preferredMinute = DEFAULT_CAMPAIGN_SEND_MINUTE,
+  startHour = CAMPAIGN_SEND_START_HOUR,
+  endHour = CAMPAIGN_SEND_END_HOUR,
 ) {
   const tz = normalizeCampaignTimezone(timeZone);
-  const prefH = normalizeCampaignSendHour(preferredHour);
+  const { startHour: sH, endHour: eH } = normalizeSendWindow(startHour, endHour);
+  const prefH = normalizeCampaignSendHour(preferredHour, sH, eH - 1);
   const prefM = normalizeCampaignSendMinute(preferredMinute);
-  let p = partsInTz(date, tz);
+  const p = partsInTz(date, tz);
   let ymd = p.ymd;
 
   if (isWeekendYmd(ymd, tz)) {
@@ -127,24 +133,33 @@ export function snapToSendWindow(
   }
 
   const curMinutes = p.hour * 60 + p.minute;
-  const prefMinutes = prefH * 60 + prefM;
+  const startMinutes = sH * 60;
+  const endMinutes = eH * 60;
+  const prefMinutes = Math.max(startMinutes, Math.min(endMinutes - 1, prefH * 60 + prefM));
+
+  // Past end of business hours today → next business day at preferred time
+  if (curMinutes >= endMinutes) {
+    const nextDay = addBusinessDays(ymd, 1, tz);
+    return zonedDateTime(nextDay, Math.floor(prefMinutes / 60), prefMinutes % 60, 0, tz);
+  }
 
   // Before preferred time today → same day at preferred time
   if (curMinutes < prefMinutes) {
-    return zonedDateTime(ymd, prefH, prefM, 0, tz);
+    return zonedDateTime(ymd, Math.floor(prefMinutes / 60), prefMinutes % 60, 0, tz);
   }
 
-  // At/after preferred time today → send immediately
+  // Inside business hours and at/after preferred time → keep instant
   return date;
 }
 
 /**
- * Resolve when a campaign step should send.
+ * Resolve when a campaign step should send, strictly within Mon–Fri business hours.
  * @param {Date|string} baseInstant
  * @param {number} delayBusinessDays
  * @param {string} [timeZone]
- * @param {number} [preferredHour] - local hour 0–23
+ * @param {number} [preferredHour] - local hour
  * @param {number} [preferredMinute] - local minute 0–59
+ * @param {{ startHour?: number, endHour?: number, staggerSeconds?: number }} [opts]
  */
 export function resolveCampaignSendAt(
   baseInstant,
@@ -152,21 +167,35 @@ export function resolveCampaignSendAt(
   timeZone = DEFAULT_CAMPAIGN_TIMEZONE,
   preferredHour = DEFAULT_CAMPAIGN_SEND_HOUR,
   preferredMinute = DEFAULT_CAMPAIGN_SEND_MINUTE,
+  opts = {},
 ) {
   const tz = normalizeCampaignTimezone(timeZone);
-  const prefH = normalizeCampaignSendHour(preferredHour);
+  const { startHour: sH, endHour: eH } = normalizeSendWindow(
+    opts.startHour ?? CAMPAIGN_SEND_START_HOUR,
+    opts.endHour ?? CAMPAIGN_SEND_END_HOUR,
+  );
+  const prefH = normalizeCampaignSendHour(preferredHour, sH, eH - 1);
   const prefM = normalizeCampaignSendMinute(preferredMinute);
+  const staggerSec = Math.max(0, Number(opts.staggerSeconds) || 0);
+
   const base = baseInstant instanceof Date ? baseInstant : new Date(baseInstant);
   const safeBase = Number.isNaN(base.getTime()) ? new Date() : base;
   const launchYmd = ymdInTz(safeBase, tz);
   const targetYmd = addBusinessDays(launchYmd, delayBusinessDays, tz);
 
+  let resolved;
   if ((Number(delayBusinessDays) || 0) === 0) {
-    return snapToSendWindow(safeBase, tz, prefH, prefM);
+    resolved = snapToSendWindow(safeBase, tz, prefH, prefM, sH, eH);
+  } else {
+    resolved = zonedDateTime(targetYmd, prefH, prefM, 0, tz);
   }
 
-  const atPref = zonedDateTime(targetYmd, prefH, prefM, 0, tz);
-  return atPref;
+  if (staggerSec > 0) {
+    const shifted = new Date(resolved.getTime() + staggerSec * 1000);
+    // If stagger pushed past business hours, wrap into next business day
+    resolved = snapToSendWindow(shifted, tz, sH, 0, sH, eH);
+  }
+  return resolved;
 }
 
 export function toScheduleSql(date) {
