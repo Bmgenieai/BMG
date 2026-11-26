@@ -54,6 +54,7 @@ function leadSelect(extraWhere = '1=1', params = []) {
         u.email AS assigned_email,
         c.name AS created_by_name,
         c.email AS created_by_email,
+        c.role AS created_by_role,
         b.filename AS import_batch_filename,
         b.created_at AS import_batch_at,
         COALESCE(l.date_added, l.created_at) AS date_added_effective,
@@ -80,6 +81,7 @@ function getLeadWithJoins(id) {
         u.email AS assigned_email,
         c.name AS created_by_name,
         c.email AS created_by_email,
+        c.role AS created_by_role,
         b.filename AS import_batch_filename,
         b.created_at AS import_batch_at,
         COALESCE(l.date_added, l.created_at) AS date_added_effective,
@@ -226,6 +228,52 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     canViewAll: canViewAllReplies,
   });
 
+  // Calling Work Session sidebar counts (same underlying leads table + personal cold_call_logs)
+  const bdGenerated = db
+    .prepare(
+      `SELECT COUNT(*) AS c
+       FROM leads l
+       LEFT JOIN users c ON c.id = l.created_by
+       WHERE (l.archived_at IS NULL OR l.archived_at = '')
+         AND ${excludeTestAndPakistanSql('l')}
+         AND (c.role = 'telesales' OR (c.role IS NULL AND l.source = 'telesales'))`,
+    )
+    .get().c;
+
+  const sdrGenerated =
+    req.user.role === 'caller'
+      ? db
+          .prepare(
+            `SELECT COUNT(*) AS c
+             FROM leads l
+             WHERE (l.archived_at IS NULL OR l.archived_at = '')
+               AND ${excludeTestAndPakistanSql('l')}
+               AND l.created_by = ?`,
+          )
+          .get(req.user.id).c
+      : db
+          .prepare(
+            `SELECT COUNT(*) AS c
+             FROM leads l
+             LEFT JOIN users c ON c.id = l.created_by
+             WHERE (l.archived_at IS NULL OR l.archived_at = '')
+               AND ${excludeTestAndPakistanSql('l')}
+               AND (c.role = 'caller' OR (c.role IS NULL AND l.source = 'cold_call'))`,
+          )
+          .get().c;
+
+  let coldCalls = 0;
+  try {
+    coldCalls =
+      req.user.role === 'ceo' || req.user.role === 'manager'
+        ? db.prepare(`SELECT COUNT(*) AS c FROM cold_call_logs`).get().c
+        : db
+            .prepare(`SELECT COUNT(*) AS c FROM cold_call_logs WHERE user_id = ?`)
+            .get(req.user.id).c;
+  } catch {
+    coldCalls = 0;
+  }
+
   res.json({
     total,
     statusCounts,
@@ -236,6 +284,9 @@ router.get('/counts', requireAnyPermission('leads:view_all', 'leads:view_own'), 
     chatsWaitingHuman,
     emailRepliesCount,
     emailRepliesUnread,
+    bdGenerated,
+    sdrGenerated,
+    coldCalls,
     cohort,
     cohortDate: refDate,
   });
@@ -258,6 +309,7 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     followUpFrom,
     followUpTo,
     hasPhone,
+    generatedBy,
   } = req.query;
   const clauses = [];
   const params = [];
@@ -279,6 +331,17 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
   }
   if (hasPhone === '1' || hasPhone === 'true') {
     clauses.push(`(l.phone IS NOT NULL AND TRIM(l.phone) != '')`);
+  }
+  const genBy = String(generatedBy || '').trim().toLowerCase();
+  if (genBy === 'bd') {
+    clauses.push(`(c.role = 'telesales' OR (c.role IS NULL AND l.source = 'telesales'))`);
+  } else if (genBy === 'sdr') {
+    if (req.user.role === 'caller') {
+      clauses.push(`l.created_by = ?`);
+      params.push(req.user.id);
+    } else {
+      clauses.push(`(c.role = 'caller' OR (c.role IS NULL AND l.source = 'cold_call'))`);
+    }
   }
   if (source) {
     clauses.push('l.source = ?');

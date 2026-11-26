@@ -999,6 +999,27 @@ export function migrate() {
       /* column already exists */
     }
   }
+
+  // Personal Cold Calls log for Calling Work Session (separate from main leads table)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cold_call_logs (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      contact_name TEXT NOT NULL,
+      company TEXT,
+      phone TEXT NOT NULL,
+      call_date TEXT NOT NULL DEFAULT (datetime('now')),
+      call_outcome TEXT NOT NULL,
+      follow_up_notes TEXT,
+      follow_up_date TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_cold_call_logs_user
+      ON cold_call_logs(user_id, call_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_cold_call_logs_outcome
+      ON cold_call_logs(call_outcome);
+  `);
 }
 
 migrate();

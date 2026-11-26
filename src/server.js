@@ -17,6 +17,7 @@ import emailRoutes from './routes/email.js';
 import demosRoutes from './routes/demos.js';
 import callBookingsRoutes from './routes/callBookings.js';
 import chatsRoutes from './routes/chats.js';
+import coldCallsRoutes from './routes/coldCalls.js';
 import { startScheduledEmailWorker } from './lib/scheduledEmailWorker.js';
 import { startSenderMailboxSync } from './lib/senderMailboxSync.js';
 import { reschedulePendingCampaignSends } from './lib/campaigns.js';
@@ -81,6 +82,7 @@ app.use('/api/ingest', ingestRoutes);
 app.use('/api/demos', demosRoutes);
 app.use('/api/call-bookings', callBookingsRoutes);
 app.use('/api/chats', chatsRoutes);
+app.use('/api/cold-calls', coldCallsRoutes);
 app.use('/api/email', emailRoutes);
 
 // cPanel / production: serve React build from frontend/dist at site root
