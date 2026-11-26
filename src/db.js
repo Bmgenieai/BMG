@@ -1024,6 +1024,8 @@ export function migrate() {
   const activityExtraAlters = [
     `ALTER TABLE lead_activities ADD COLUMN email_details_requested INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE lead_activities ADD COLUMN email_request_notes TEXT`,
+    `ALTER TABLE lead_activities ADD COLUMN interested_notes TEXT`,
+    `ALTER TABLE leads ADD COLUMN interested_notes TEXT`,
   ];
   for (const sql of activityExtraAlters) {
     try {

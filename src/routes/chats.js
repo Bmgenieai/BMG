@@ -441,4 +441,52 @@ router.post('/:id/reply', requirePermission('chats:reply'), async (req, res) => 
   });
 });
 
+/** Close a support chat thread. */
+router.post('/:id/close', requirePermission('chats:view'), async (req, res) => {
+  const row = db.prepare(`SELECT * FROM chat_threads WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Chat not found' });
+
+  if (row.provider === 'bmgenie' && row.external_chat_id) {
+    await postBmgenieJson(
+      `/support-chat/internal/sessions/${row.external_chat_id}/close`,
+      { agentId: req.user.id, agentName: req.user.name || req.user.email },
+    ).catch(() => {});
+  }
+
+  db.prepare(
+    `UPDATE chat_threads
+     SET status = 'closed', updated_at = datetime('now')
+     WHERE id = ?`,
+  ).run(row.id);
+
+  const updated = fetchChat(row.id);
+  res.json(mapChatRow(updated, req.user));
+});
+
+/** Hand a support chat back to the AI assistant (unassigns human & sets mode = 'ai'). */
+router.post('/:id/hand-back-ai', requirePermission('chats:view'), async (req, res) => {
+  const row = db.prepare(`SELECT * FROM chat_threads WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Chat not found' });
+
+  if (row.provider === 'bmgenie' && row.external_chat_id) {
+    await postBmgenieJson(
+      `/support-chat/internal/sessions/${row.external_chat_id}/hand-back-ai`,
+      { agentId: req.user.id, agentName: req.user.name || req.user.email },
+    ).catch(() => {});
+  }
+
+  db.prepare(
+    `UPDATE chat_threads
+     SET mode = 'ai',
+         status = CASE WHEN status = 'closed' THEN 'open' ELSE 'open' END,
+         assigned_to_user_id = NULL,
+         assigned_at = NULL,
+         updated_at = datetime('now')
+     WHERE id = ?`,
+  ).run(row.id);
+
+  const updated = fetchChat(row.id);
+  res.json(mapChatRow(updated, req.user));
+});
+
 export default router;

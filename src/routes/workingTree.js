@@ -8,6 +8,10 @@ import {
   normalizeStatus,
   roleHasPermission,
 } from '../lib/permissions.js';
+import { excludeTestAndPakistanSql } from '../lib/leadFilters.js';
+
+const DT = (col) => `datetime(REPLACE(REPLACE(${col}, 'T', ' '), 'Z', ''))`;
+const ACTIVE_QUEUE = `(l.archived_at IS NULL OR l.archived_at = '') AND ${excludeTestAndPakistanSql('l')}`;
 
 const router = Router();
 router.use(authRequired);
@@ -73,8 +77,52 @@ router.get('/', requireAnyPermission(
     });
 
   const statusCounts = db.prepare(
-    `SELECT status, COUNT(*) AS c FROM leads
-     WHERE assigned_to = ? GROUP BY status`,
+    `SELECT l.status, COUNT(*) AS c FROM leads l
+     WHERE l.assigned_to = ? AND ${ACTIVE_QUEUE}
+     GROUP BY l.status`,
+  );
+
+  // Match Leads tab follow-up counts: check both leads.next_follow_up_at AND pending follow_ups rows
+  const overdueCountStmt = db.prepare(
+    `SELECT COUNT(DISTINCT l.id) AS c
+     FROM leads l
+     WHERE l.assigned_to = ?
+       AND ${ACTIVE_QUEUE}
+       AND (
+         (l.next_follow_up_at IS NOT NULL AND TRIM(l.next_follow_up_at) != '' AND ${DT('l.next_follow_up_at')} < datetime('now'))
+         OR EXISTS (
+           SELECT 1 FROM follow_ups f
+           WHERE f.lead_id = l.id AND f.status IN ('pending','overdue') AND ${DT('f.due_at')} < datetime('now')
+         )
+       )`,
+  );
+
+  const dueTodayCountStmt = db.prepare(
+    `SELECT COUNT(DISTINCT l.id) AS c
+     FROM leads l
+     WHERE l.assigned_to = ?
+       AND ${ACTIVE_QUEUE}
+       AND (
+         (l.next_follow_up_at IS NOT NULL AND TRIM(l.next_follow_up_at) != '' AND date(${DT('l.next_follow_up_at')}) = date('now'))
+         OR EXISTS (
+           SELECT 1 FROM follow_ups f
+           WHERE f.lead_id = l.id AND f.status IN ('pending','overdue') AND date(${DT('f.due_at')}) = date('now')
+         )
+       )`,
+  );
+
+  const pendingFuCountStmt = db.prepare(
+    `SELECT COUNT(DISTINCT l.id) AS c
+     FROM leads l
+     WHERE l.assigned_to = ?
+       AND ${ACTIVE_QUEUE}
+       AND (
+         (l.next_follow_up_at IS NOT NULL AND TRIM(l.next_follow_up_at) != '')
+         OR EXISTS (
+           SELECT 1 FROM follow_ups f
+           WHERE f.lead_id = l.id AND f.status IN ('pending','overdue')
+         )
+       )`,
   );
 
   const people = reps.map((rep) => {
@@ -83,9 +131,25 @@ router.get('/', requireAnyPermission(
     );
     const open = OPEN_STATUSES.reduce((s, st) => s + (byStatus[st] || 0), 0);
     const ended = END_STATUSES.reduce((s, st) => s + (byStatus[st] || 0), 0);
+    const overdue = overdueCountStmt.get(rep.id).c;
+    const today = dueTodayCountStmt.get(rep.id).c;
+    const pending = pendingFuCountStmt.get(rep.id).c;
 
-    // Legacy manual follow-up buckets omitted from UI — campaign sequences live under Campaigns.
     const buckets = [
+      {
+        key: 'followups_overdue',
+        label: 'Overdue follow-ups',
+        count: overdue,
+        kind: 'followup',
+        tone: overdue > 0 ? 'red' : 'grey',
+      },
+      {
+        key: 'followups_today',
+        label: 'Due today',
+        count: today,
+        kind: 'followup',
+        tone: today > 0 ? 'amber' : 'grey',
+      },
       ...OPEN_STATUSES.map((st) => ({
         key: st,
         label: STATUS_LABELS[st] || st.replace(/_/g, ' '),
@@ -104,15 +168,16 @@ router.get('/', requireAnyPermission(
 
     return {
       user: rep,
-      totals: { open, ended, overdue: 0, pending: 0, today: 0 },
+      totals: { open, ended, overdue, pending, today },
       buckets,
     };
   });
 
   const unassigned = db
     .prepare(
-      `SELECT COUNT(*) AS c FROM leads
-       WHERE assigned_to IS NULL AND status IN (${OPEN_STATUSES.map(() => '?').join(',')})`,
+      `SELECT COUNT(*) AS c FROM leads l
+       WHERE l.assigned_to IS NULL AND ${ACTIVE_QUEUE}
+         AND l.status IN (${OPEN_STATUSES.map(() => '?').join(',')})`,
     )
     .get(...OPEN_STATUSES).c;
 
@@ -175,13 +240,14 @@ router.get('/leads', requireAnyPermission(
     rows = db
       .prepare(
         `SELECT ${leadCols} ${leadJoin}
-         WHERE l.assigned_to IS NULL AND l.status IN (${OPEN_STATUSES.map(() => '?').join(',')})
+         WHERE l.assigned_to IS NULL AND ${ACTIVE_QUEUE}
+           AND l.status IN (${OPEN_STATUSES.map(() => '?').join(',')})
          ORDER BY l.created_at DESC`,
       )
       .all(...OPEN_STATUSES);
     title = 'Unassigned open leads';
   } else if (bucket === 'open' || bucket === 'open_leads') {
-    const clauses = [`l.status IN (${OPEN_STATUSES.map(() => '?').join(',')})`];
+    const clauses = [ACTIVE_QUEUE, `l.status IN (${OPEN_STATUSES.map(() => '?').join(',')})`];
     const params = [...OPEN_STATUSES];
     if (assigneeFilter) {
       clauses.push('l.assigned_to = ?');
@@ -205,6 +271,7 @@ router.get('/leads', requireAnyPermission(
       'trial',
       'paid',
       'repeat',
+      'completed',
       'nurture',
       'conversation',
       'demo_booked',
@@ -217,7 +284,7 @@ router.get('/leads', requireAnyPermission(
       'not_interested',
     ].includes(bucket)
   ) {
-    const clauses = ['l.status = ?'];
+    const clauses = [ACTIVE_QUEUE, 'l.status = ?'];
     const params = [normalizeStatus(bucket) || bucket];
     if (assigneeFilter) {
       clauses.push('l.assigned_to = ?');
@@ -233,31 +300,47 @@ router.get('/leads', requireAnyPermission(
     bucket === 'followups_today' ||
     bucket === 'overdue'
   ) {
-    const fuClauses = [];
+    const clauses = [ACTIVE_QUEUE];
     const params = [];
     if (bucket === 'followups_overdue' || bucket === 'overdue') {
-      fuClauses.push(`f.status IN ('pending','overdue') AND f.due_at < datetime('now')`);
+      clauses.push(`(
+        (l.next_follow_up_at IS NOT NULL AND TRIM(l.next_follow_up_at) != '' AND ${DT('l.next_follow_up_at')} < datetime('now'))
+        OR EXISTS (
+          SELECT 1 FROM follow_ups f
+          WHERE f.lead_id = l.id AND f.status IN ('pending','overdue') AND ${DT('f.due_at')} < datetime('now')
+        )
+      )`);
       title = 'Overdue follow-ups';
     } else if (bucket === 'followups_pending') {
-      fuClauses.push(`f.status = 'pending'`);
+      clauses.push(`(
+        (l.next_follow_up_at IS NOT NULL AND TRIM(l.next_follow_up_at) != '')
+        OR EXISTS (
+          SELECT 1 FROM follow_ups f
+          WHERE f.lead_id = l.id AND f.status IN ('pending','overdue')
+        )
+      )`);
       title = 'Pending follow-ups';
     } else {
-      fuClauses.push(`f.status IN ('pending','overdue') AND date(f.due_at) = date('now')`);
+      clauses.push(`(
+        (l.next_follow_up_at IS NOT NULL AND TRIM(l.next_follow_up_at) != '' AND date(${DT('l.next_follow_up_at')}) = date('now'))
+        OR EXISTS (
+          SELECT 1 FROM follow_ups f
+          WHERE f.lead_id = l.id AND f.status IN ('pending','overdue') AND date(${DT('f.due_at')}) = date('now')
+        )
+      )`);
       title = 'Follow-ups due today';
     }
     if (assigneeFilter) {
-      fuClauses.push('f.assigned_to = ?');
+      clauses.push('l.assigned_to = ?');
       params.push(assigneeFilter);
+    } else {
+      clauses.push('l.assigned_to IS NOT NULL');
     }
     rows = db
       .prepare(
-        `SELECT DISTINCT ${leadCols},
-          f.id AS follow_up_id, f.due_at AS follow_up_due, f.status AS follow_up_status, f.note AS follow_up_note
-         FROM follow_ups f
-         JOIN leads l ON l.id = f.lead_id
-         LEFT JOIN users u ON u.id = l.assigned_to
-         WHERE ${fuClauses.join(' AND ')}
-         ORDER BY f.due_at ASC`,
+        `SELECT ${leadCols} ${leadJoin}
+         WHERE ${clauses.join(' AND ')}
+         ORDER BY COALESCE(l.next_follow_up_at, l.updated_at) ASC`,
       )
       .all(...params);
   } else {

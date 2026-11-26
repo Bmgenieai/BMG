@@ -310,6 +310,7 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     followUpTo,
     hasPhone,
     generatedBy,
+    quickFilter,
   } = req.query;
   const clauses = [];
   const params = [];
@@ -383,10 +384,33 @@ router.get('/', requireAnyPermission('leads:view_all', 'leads:view_own'), (req, 
     clauses.push('l.last_emailed_at IS NOT NULL');
   } else if (emailFilter === 'opened' || emailFilter === 'opened_email') {
     clauses.push('COALESCE(l.email_open_count, 0) > 0');
+  } else if (emailFilter === 'opened_no_reply') {
+    clauses.push('COALESCE(l.email_open_count, 0) > 0 AND COALESCE(l.email_reply_count, 0) = 0');
+  } else if (emailFilter === 'hot_opens') {
+    clauses.push('COALESCE(l.email_open_count, 0) >= 2');
   } else if (emailFilter === 'replied' || emailFilter === 'replied_email') {
     clauses.push('COALESCE(l.email_reply_count, 0) > 0');
   } else if (emailFilter === 'not_sent' || emailFilter === 'not_emailed') {
     clauses.push('l.last_emailed_at IS NULL');
+  }
+
+  const qf = String(quickFilter || '').toLowerCase();
+  if (qf === 'opened_no_reply') {
+    clauses.push('COALESCE(l.email_open_count, 0) > 0 AND COALESCE(l.email_reply_count, 0) = 0');
+  } else if (qf === 'hot_opens') {
+    clauses.push('COALESCE(l.email_open_count, 0) >= 2');
+  } else if (qf === 'replied') {
+    clauses.push('COALESCE(l.email_reply_count, 0) > 0');
+  } else if (qf === 'untouched_today') {
+    clauses.push(
+      `NOT EXISTS (
+         SELECT 1 FROM lead_activities a
+         WHERE a.lead_id = l.id
+           AND date(REPLACE(REPLACE(a.created_at, 'T', ' '), 'Z', '')) = date('now')
+       )
+       AND (l.last_contacted_at IS NULL OR date(REPLACE(REPLACE(l.last_contacted_at, 'T', ' '), 'Z', '')) < date('now'))
+       AND (l.last_emailed_at IS NULL OR date(REPLACE(REPLACE(l.last_emailed_at, 'T', ' '), 'Z', '')) < date('now'))`,
+    );
   }
 
   const includeArchived =
@@ -911,6 +935,7 @@ router.post(
       status: rawStatus,
       email_details_requested,
       email_request_notes,
+      interested_notes,
     } = req.body || {};
     if (!summary) return res.status(400).json({ error: 'summary required' });
 
@@ -964,11 +989,15 @@ router.post(
     const actId = uuid();
     const emailReqFlag = email_details_requested ? 1 : 0;
     const emailReqNotes = email_request_notes ? String(email_request_notes).trim() : null;
+    const interestedNotesClean =
+      interested_notes !== undefined && interested_notes !== null
+        ? String(interested_notes).trim() || null
+        : null;
     db.prepare(
       `INSERT INTO lead_activities (
          id, lead_id, user_id, type, summary, outcome, next_follow_up_at,
-         email_details_requested, email_request_notes
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         email_details_requested, email_request_notes, interested_notes
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       actId,
       lead.id,
@@ -979,7 +1008,14 @@ router.post(
       next_follow_up_at || null,
       emailReqFlag,
       emailReqNotes,
+      interestedNotesClean,
     );
+
+    if (interestedNotesClean) {
+      db.prepare(
+        `UPDATE leads SET interested_notes = ?, updated_at = datetime('now') WHERE id = ?`,
+      ).run(interestedNotesClean, lead.id);
+    }
 
     // LinkedIn metric counters on the lead (only for LinkedIn-sourced / non-social leads)
     const liBump = {
@@ -1043,6 +1079,39 @@ router.post(
     }
 
     res.status(201).json(db.prepare(`SELECT * FROM lead_activities WHERE id = ?`).get(actId));
+  },
+);
+
+/** Save or update SDR Interested Prospect handoff notes on a lead (for BD follow-up). */
+router.patch(
+  '/:id/interested-notes',
+  requireAnyPermission('leads:update_any', 'leads:update_own'),
+  (req, res) => {
+    const lead = requireLeadAccess(req, res, { forUpdate: true });
+    if (!lead) return;
+    const notes = String(req.body?.interested_notes ?? req.body?.notes ?? '').trim();
+    db.prepare(
+      `UPDATE leads SET interested_notes = ?, updated_at = datetime('now') WHERE id = ?`,
+    ).run(notes || null, lead.id);
+
+    // Also mirror onto the latest call activity for this lead if one exists today
+    if (notes) {
+      const latestAct = db
+        .prepare(
+          `SELECT id FROM lead_activities
+           WHERE lead_id = ? AND type IN ('call','call_attempted','call_connected')
+           ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(lead.id);
+      if (latestAct) {
+        db.prepare(`UPDATE lead_activities SET interested_notes = ? WHERE id = ?`).run(
+          notes,
+          latestAct.id,
+        );
+      }
+    }
+
+    res.json({ ok: true, id: lead.id, interested_notes: notes || null });
   },
 );
 

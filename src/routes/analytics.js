@@ -1662,6 +1662,7 @@ router.get(
     const stage = req.query.stage ? String(req.query.stage).trim() : null;
     const businessType = req.query.businessType ? String(req.query.businessType).trim() : null;
     const reason = req.query.reason ? String(req.query.reason).trim() : null;
+    const sourceQ = req.query.source ? String(req.query.source).trim() : null;
     const stateQ = req.query.state ? String(req.query.state).trim() : null;
     const stateClause = !stateQ
       ? ''
@@ -2430,12 +2431,36 @@ router.get(
         .all(limit);
     }
 
+    // Preserve selected source filter across every drilldown metric
+    if (sourceQ && Array.isArray(items) && items.length) {
+      const needLookupIds = [
+        ...new Set(
+          items
+            .filter((it) => !it.source && !it.lead_source && (it.lead_id || it.id))
+            .map((it) => it.lead_id || it.id),
+        ),
+      ];
+      const sourceById = new Map();
+      if (needLookupIds.length) {
+        const ph = needLookupIds.map(() => '?').join(',');
+        const srcRows = db
+          .prepare(`SELECT id, source FROM leads WHERE id IN (${ph})`)
+          .all(...needLookupIds);
+        for (const r of srcRows) sourceById.set(r.id, r.source);
+      }
+      items = items.filter((it) => {
+        const s = it.source || it.lead_source || sourceById.get(it.lead_id || it.id) || '';
+        return s === sourceQ;
+      });
+    }
+
     res.json({
       metric,
-      title,
+      title: sourceQ ? `${title} · ${sourceQ}` : title,
       period: bounds.period,
       periodLabel: bounds.label,
       dateRange: `${bounds.fromYmd} to ${bounds.toYmd}`,
+      source: sourceQ || null,
       total: items.length,
       items,
     });
@@ -2662,8 +2687,10 @@ router.get(
                 a.next_follow_up_at, a.created_at AS at,
                 COALESCE(a.email_details_requested, 0) AS email_details_requested,
                 a.email_request_notes,
+                a.interested_notes AS activity_interested_notes,
                 l.name AS lead_name, l.company, l.phone, l.email, l.status AS lead_status,
-                l.source AS lead_source, l.created_by AS lead_created_by, l.created_at AS lead_created_at
+                l.source AS lead_source, l.created_by AS lead_created_by, l.created_at AS lead_created_at,
+                l.interested_notes AS lead_interested_notes
          FROM lead_activities a
          JOIN leads l ON l.id = a.lead_id
          WHERE a.user_id = ?
@@ -2739,6 +2766,7 @@ router.get(
         notes: a.summary || '',
         email_details_requested: emailReq,
         email_request_notes: a.email_request_notes || (emailReq ? a.summary : null),
+        interested_notes: a.lead_interested_notes || a.activity_interested_notes || '',
         email_status: emailReq ? (sentEmail ? 'sent' : 'pending') : null,
         email_sent_at: sentEmail?.sent_at || null,
         email_sent_subject: sentEmail?.subject || null,
@@ -2879,6 +2907,7 @@ router.get(
           notes: a.summary || '',
           email_details_requested: true,
           email_request_notes: a.email_request_notes || a.summary || '',
+          interested_notes: a.lead_interested_notes || a.activity_interested_notes || '',
           email_status: sentEmail ? 'sent' : 'pending',
           email_sent_at: sentEmail?.sent_at || null,
           email_sent_subject: sentEmail?.subject || null,
@@ -2917,6 +2946,7 @@ router.get(
           notes: a.summary || '',
           email_details_requested: true,
           email_request_notes: a.email_request_notes || a.summary || '',
+          interested_notes: a.lead_interested_notes || a.activity_interested_notes || '',
           email_status: sentEmail ? 'sent' : 'pending',
           email_sent_at: sentEmail?.sent_at || null,
           email_sent_subject: sentEmail?.subject || null,
