@@ -903,13 +903,22 @@ router.post(
   (req, res) => {
     const lead = requireLeadAccess(req, res, { forUpdate: true });
     if (!lead) return;
-    const { type = 'note', summary, outcome, next_follow_up_at, status: rawStatus } = req.body || {};
+    const {
+      type = 'note',
+      summary,
+      outcome,
+      next_follow_up_at,
+      status: rawStatus,
+      email_details_requested,
+      email_request_notes,
+    } = req.body || {};
     if (!summary) return res.status(400).json({ error: 'summary required' });
 
     const allowedTypes = new Set([
       ...ACTIVITY_TYPES,
       'created',
       'status_change',
+      'prospect_researched',
       ...LINKEDIN_ACTIVITY_TYPES,
       ...FACEBOOK_ACTIVITY_TYPES,
       ...INSTAGRAM_ACTIVITY_TYPES,
@@ -953,10 +962,24 @@ router.post(
     }
 
     const actId = uuid();
+    const emailReqFlag = email_details_requested ? 1 : 0;
+    const emailReqNotes = email_request_notes ? String(email_request_notes).trim() : null;
     db.prepare(
-      `INSERT INTO lead_activities (id, lead_id, user_id, type, summary, outcome, next_follow_up_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(actId, lead.id, req.user.id, type, summary, outcome || null, next_follow_up_at || null);
+      `INSERT INTO lead_activities (
+         id, lead_id, user_id, type, summary, outcome, next_follow_up_at,
+         email_details_requested, email_request_notes
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      actId,
+      lead.id,
+      req.user.id,
+      type,
+      summary,
+      outcome || null,
+      next_follow_up_at || null,
+      emailReqFlag,
+      emailReqNotes,
+    );
 
     // LinkedIn metric counters on the lead (only for LinkedIn-sourced / non-social leads)
     const liBump = {

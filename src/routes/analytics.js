@@ -2578,4 +2578,387 @@ router.get(
   },
 );
 
+/**
+ * Daily SDR Activity for BD / CEO / Manager dashboard.
+ * Shows an SDR/Caller's daily work on BOTH new prospects and existing CRM leads:
+ * prospects researched, new leads added, call attempts, unique people called,
+ * interested prospects, and email-details requests (pending vs sent).
+ *
+ * Query: ?date=YYYY-MM-DD (default today in office TZ), optional ?userId=
+ */
+router.get(
+  '/sdr-daily',
+  requireAnyPermission('analytics:view_all', 'analytics:view_team', 'analytics:view_own'),
+  (req, res) => {
+    const callers = db
+      .prepare(
+        `SELECT id, name, email
+         FROM users
+         WHERE role = 'caller' AND is_active = 1
+         ORDER BY CASE WHEN lower(name) LIKE '%ali%' THEN 0 ELSE 1 END, name COLLATE NOCASE`,
+      )
+      .all();
+
+    if (!callers.length) {
+      return res.json({
+        date: req.query.date || new Date().toISOString().slice(0, 10),
+        sdr: null,
+        sdrs: [],
+        counts: {
+          prospectsResearched: 0,
+          newLeadsAdded: 0,
+          totalCalls: 0,
+          uniquePeopleCalled: 0,
+          interested: 0,
+          emailRequested: 0,
+          pendingEmails: 0,
+          sentEmails: 0,
+        },
+        items: {
+          researched: [],
+          newLeads: [],
+          calls: [],
+          uniqueCalled: [],
+          interested: [],
+          emailRequests: [],
+          pendingEmails: [],
+          sentEmails: [],
+        },
+      });
+    }
+
+    const requestedUserId = req.query.userId ? String(req.query.userId) : null;
+    const sdr =
+      (requestedUserId && callers.find((c) => c.id === requestedUserId)) || callers[0];
+
+    const dateParam =
+      req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date))
+        ? String(req.query.date)
+        : null;
+    const bounds = dateParam
+      ? resolveAnalyticsBounds({ from: dateParam, to: dateParam })
+      : resolveAnalyticsBounds({ period: 'today' });
+    const { from, to } = bounds;
+
+    // 1. New leads created by this SDR on the selected date
+    const newLeadsRows = db
+      .prepare(
+        `SELECT l.id AS lead_id, l.name, l.company, l.phone, l.email, l.status, l.source,
+                l.state, l.created_at AS at
+         FROM leads l
+         WHERE l.created_by = ?
+           AND ${DT('l.created_at')} >= datetime(?)
+           AND ${DT('l.created_at')} < datetime(?)
+         ORDER BY l.created_at DESC`,
+      )
+      .all(sdr.id, from, to);
+
+    const newLeadIdSet = new Set(newLeadsRows.map((r) => r.lead_id));
+
+    // 2. All CRM activities logged by this SDR on the selected date (both new and existing leads)
+    const activityRows = db
+      .prepare(
+        `SELECT a.id AS activity_id, a.lead_id, a.type, a.summary, a.outcome,
+                a.next_follow_up_at, a.created_at AS at,
+                COALESCE(a.email_details_requested, 0) AS email_details_requested,
+                a.email_request_notes,
+                l.name AS lead_name, l.company, l.phone, l.email, l.status AS lead_status,
+                l.source AS lead_source, l.created_by AS lead_created_by, l.created_at AS lead_created_at
+         FROM lead_activities a
+         JOIN leads l ON l.id = a.lead_id
+         WHERE a.user_id = ?
+           AND ${DT('a.created_at')} >= datetime(?)
+           AND ${DT('a.created_at')} < datetime(?)
+         ORDER BY a.created_at DESC`,
+      )
+      .all(sdr.id, from, to);
+
+    // 3. Personal cold_call_logs logged by this SDR on the selected date
+    let coldCallRows = [];
+    try {
+      coldCallRows = db
+        .prepare(
+          `SELECT id, contact_name, company, phone, call_date AS at,
+                  call_outcome AS outcome, follow_up_notes AS summary, follow_up_date
+           FROM cold_call_logs
+           WHERE user_id = ?
+             AND ${DT('call_date')} >= datetime(?)
+             AND ${DT('call_date')} < datetime(?)
+           ORDER BY call_date DESC`,
+        )
+        .all(sdr.id, from, to);
+    } catch {
+      coldCallRows = [];
+    }
+
+    const EMAIL_REQUEST_REGEX =
+      /\b(send|sent|share|ask(?:ed|ing)?\s+for|want(?:s|ed)?|request(?:ed|ing)?)\b.{0,30}\b(email|details|info|pricing|brochure|deck|samples?)\b|\bdetails\s+by\s+email\b|\bemail\s+(?:him|her|them|details|info|pricing)\b/i;
+
+    const isEmailRequestedRow = (row) => {
+      if (Number(row.email_details_requested) === 1) return true;
+      if (row.email_request_notes && String(row.email_request_notes).trim()) return true;
+      const text = `${row.summary || ''}`;
+      return EMAIL_REQUEST_REGEX.test(text);
+    };
+
+    const isInterestedOutcome = (outcome, emailReq) =>
+      emailReq ||
+      outcome === 'connected_interested' ||
+      outcome === 'demo_booked' ||
+      outcome === 'connected_callback';
+
+    // Helper: check if any outbound email was sent to a lead at or after `sinceIso`
+    const findSentEmailAfter = db.prepare(
+      `SELECT id, subject, sent_at, status
+       FROM email_messages
+       WHERE lead_id = ?
+         AND ${DT('sent_at')} >= ${DT('?')}
+       ORDER BY sent_at DESC
+       LIMIT 1`,
+    );
+
+    // Build calls list (CRM lead calls + personal cold_call_logs)
+    const callTypes = new Set(['call', 'call_attempted', 'call_connected']);
+    const calls = [];
+
+    for (const a of activityRows) {
+      if (!callTypes.has(a.type)) continue;
+      const emailReq = isEmailRequestedRow(a);
+      const sentEmail = emailReq ? findSentEmailAfter.get(a.lead_id, a.at) : null;
+      calls.push({
+        id: a.activity_id,
+        lead_id: a.lead_id,
+        source_type: 'crm_lead',
+        is_new_lead: newLeadIdSet.has(a.lead_id),
+        contact_name: a.lead_name || a.company || a.email || '(unnamed)',
+        company: a.company || null,
+        phone: a.phone || null,
+        email: a.email || null,
+        lead_status: a.lead_status || null,
+        outcome: a.outcome || a.type,
+        notes: a.summary || '',
+        email_details_requested: emailReq,
+        email_request_notes: a.email_request_notes || (emailReq ? a.summary : null),
+        email_status: emailReq ? (sentEmail ? 'sent' : 'pending') : null,
+        email_sent_at: sentEmail?.sent_at || null,
+        email_sent_subject: sentEmail?.subject || null,
+        next_follow_up_at: a.next_follow_up_at || null,
+        at: a.at,
+      });
+    }
+
+    for (const cc of coldCallRows) {
+      const emailReq = EMAIL_REQUEST_REGEX.test(cc.summary || '');
+      calls.push({
+        id: cc.id,
+        lead_id: null,
+        source_type: 'cold_call',
+        is_new_lead: false,
+        contact_name: cc.contact_name,
+        company: cc.company || null,
+        phone: cc.phone || null,
+        email: null,
+        lead_status: null,
+        outcome: cc.outcome,
+        notes: cc.summary || '',
+        email_details_requested: emailReq,
+        email_request_notes: emailReq ? cc.summary : null,
+        email_status: emailReq ? 'pending' : null,
+        email_sent_at: null,
+        email_sent_subject: null,
+        next_follow_up_at: cc.follow_up_date || null,
+        at: cc.at,
+      });
+    }
+
+    calls.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
+
+    // Unique people called (deduped by lead_id or normalized phone/name)
+    const uniqueCalledMap = new Map();
+    for (const c of calls) {
+      const key = c.lead_id
+        ? `lead:${c.lead_id}`
+        : `cc:${String(c.phone || c.contact_name || c.id).replace(/\D+/g, '') || c.contact_name}`;
+      const existing = uniqueCalledMap.get(key);
+      if (!existing) {
+        uniqueCalledMap.set(key, { ...c, attempt_count: 1 });
+      } else {
+        existing.attempt_count += 1;
+      }
+    }
+    const uniqueCalled = [...uniqueCalledMap.values()];
+
+    // Prospects researched = union of new leads created + distinct leads with any SDR activity + unique cold calls
+    const researchedMap = new Map();
+    for (const nl of newLeadsRows) {
+      researchedMap.set(`lead:${nl.lead_id}`, {
+        lead_id: nl.lead_id,
+        contact_name: nl.name || nl.company || nl.email || '(unnamed)',
+        company: nl.company || null,
+        phone: nl.phone || null,
+        email: nl.email || null,
+        lead_status: nl.status || null,
+        source: nl.source || null,
+        is_new_lead: true,
+        activity_type: 'new_lead',
+        notes: 'New lead added',
+        at: nl.at,
+      });
+    }
+    for (const a of activityRows) {
+      const key = `lead:${a.lead_id}`;
+      if (!researchedMap.has(key)) {
+        researchedMap.set(key, {
+          lead_id: a.lead_id,
+          contact_name: a.lead_name || a.company || a.email || '(unnamed)',
+          company: a.company || null,
+          phone: a.phone || null,
+          email: a.email || null,
+          lead_status: a.lead_status || null,
+          source: a.lead_source || null,
+          is_new_lead: newLeadIdSet.has(a.lead_id),
+          activity_type: a.type,
+          outcome: a.outcome || null,
+          notes: a.summary || '',
+          at: a.at,
+        });
+      }
+    }
+    for (const u of uniqueCalled) {
+      if (!u.lead_id) {
+        const key = `cc:${u.id}`;
+        if (!researchedMap.has(key)) {
+          researchedMap.set(key, {
+            lead_id: null,
+            contact_name: u.contact_name,
+            company: u.company,
+            phone: u.phone,
+            email: null,
+            lead_status: null,
+            source: 'cold_call',
+            is_new_lead: false,
+            activity_type: 'cold_call',
+            outcome: u.outcome,
+            notes: u.notes,
+            at: u.at,
+          });
+        }
+      }
+    }
+    const researched = [...researchedMap.values()].sort((a, b) =>
+      String(b.at || '').localeCompare(String(a.at || '')),
+    );
+
+    // Interested prospects (unique per lead/contact)
+    const interestedMap = new Map();
+    for (const c of calls) {
+      if (!isInterestedOutcome(c.outcome, c.email_details_requested)) continue;
+      const key = c.lead_id ? `lead:${c.lead_id}` : `cc:${c.id}`;
+      if (!interestedMap.has(key)) {
+        interestedMap.set(key, c);
+      }
+    }
+    // Also catch non-call activities where email_details_requested = 1
+    for (const a of activityRows) {
+      if (callTypes.has(a.type)) continue;
+      if (!isEmailRequestedRow(a)) continue;
+      const key = `lead:${a.lead_id}`;
+      if (!interestedMap.has(key)) {
+        const sentEmail = findSentEmailAfter.get(a.lead_id, a.at);
+        interestedMap.set(key, {
+          id: a.activity_id,
+          lead_id: a.lead_id,
+          source_type: 'crm_lead',
+          is_new_lead: newLeadIdSet.has(a.lead_id),
+          contact_name: a.lead_name || a.company || a.email || '(unnamed)',
+          company: a.company || null,
+          phone: a.phone || null,
+          email: a.email || null,
+          lead_status: a.lead_status || null,
+          outcome: a.outcome || a.type,
+          notes: a.summary || '',
+          email_details_requested: true,
+          email_request_notes: a.email_request_notes || a.summary || '',
+          email_status: sentEmail ? 'sent' : 'pending',
+          email_sent_at: sentEmail?.sent_at || null,
+          email_sent_subject: sentEmail?.subject || null,
+          at: a.at,
+        });
+      }
+    }
+    const interested = [...interestedMap.values()];
+
+    // Email detail requests (unique per lead/contact, latest request wins)
+    const emailReqMap = new Map();
+    for (const c of calls) {
+      if (!c.email_details_requested) continue;
+      const key = c.lead_id ? `lead:${c.lead_id}` : `cc:${c.id}`;
+      if (!emailReqMap.has(key)) {
+        emailReqMap.set(key, c);
+      }
+    }
+    for (const a of activityRows) {
+      if (callTypes.has(a.type)) continue;
+      if (!isEmailRequestedRow(a)) continue;
+      const key = `lead:${a.lead_id}`;
+      if (!emailReqMap.has(key)) {
+        const sentEmail = findSentEmailAfter.get(a.lead_id, a.at);
+        emailReqMap.set(key, {
+          id: a.activity_id,
+          lead_id: a.lead_id,
+          source_type: 'crm_lead',
+          is_new_lead: newLeadIdSet.has(a.lead_id),
+          contact_name: a.lead_name || a.company || a.email || '(unnamed)',
+          company: a.company || null,
+          phone: a.phone || null,
+          email: a.email || null,
+          lead_status: a.lead_status || null,
+          outcome: a.outcome || a.type,
+          notes: a.summary || '',
+          email_details_requested: true,
+          email_request_notes: a.email_request_notes || a.summary || '',
+          email_status: sentEmail ? 'sent' : 'pending',
+          email_sent_at: sentEmail?.sent_at || null,
+          email_sent_subject: sentEmail?.subject || null,
+          at: a.at,
+        });
+      }
+    }
+    const emailRequests = [...emailReqMap.values()];
+    const pendingEmails = emailRequests.filter((r) => r.email_status === 'pending');
+    const sentEmails = emailRequests.filter((r) => r.email_status === 'sent');
+
+    res.json({
+      date: bounds.fromYmd,
+      sdr,
+      sdrs: callers,
+      counts: {
+        prospectsResearched: researched.length,
+        newLeadsAdded: newLeadsRows.length,
+        totalCalls: calls.length,
+        uniquePeopleCalled: uniqueCalled.length,
+        interested: interested.length,
+        emailRequested: emailRequests.length,
+        pendingEmails: pendingEmails.length,
+        sentEmails: sentEmails.length,
+      },
+      items: {
+        researched,
+        newLeads: newLeadsRows.map((r) => ({
+          ...r,
+          contact_name: r.name || r.company || r.email || '(unnamed)',
+          lead_status: r.status,
+          is_new_lead: true,
+        })),
+        calls,
+        uniqueCalled,
+        interested,
+        emailRequests,
+        pendingEmails,
+        sentEmails,
+      },
+    });
+  },
+);
+
 export default router;

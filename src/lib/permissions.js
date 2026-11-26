@@ -10,6 +10,8 @@
  * - caller — cold caller (all CRM leads, add leads, log call status & talk notes, own Caller Working)
  */
 
+import { db } from '../db.js';
+
 export const ROLES = ['ceo', 'manager', 'telesales', 'chat_support', 'caller'];
 
 /** Display names for UI (DB still stores ceo / manager / telesales / chat_support / caller). */
@@ -111,6 +113,32 @@ export function leadVisibilityClause(user, { columnPrefix = '' } = {}) {
   };
 }
 
+/** Check if a lead was created or worked by a Caller/SDR (so BD can open & follow up from their login). */
+function isSdrSharedLead(lead) {
+  if (!lead) return false;
+  if (lead.source === 'cold_call') return true;
+  try {
+    if (lead.created_by) {
+      const creator = db.prepare(`SELECT role FROM users WHERE id = ?`).get(lead.created_by);
+      if (creator?.role === 'caller') return true;
+    }
+    if (lead.id) {
+      const sdrAct = db
+        .prepare(
+          `SELECT 1 FROM lead_activities a
+           JOIN users u ON u.id = a.user_id
+           WHERE a.lead_id = ? AND u.role = 'caller'
+           LIMIT 1`,
+        )
+        .get(lead.id);
+      if (sdrAct) return true;
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
 export function canAccessLead(user, lead) {
   if (!lead) return false;
   if (roleHasPermission(user.role, 'leads:view_all')) return true;
@@ -122,17 +150,23 @@ export function canAccessLead(user, lead) {
   ) {
     return true;
   }
+  // BD can view leads created or called by SDR/Caller (e.g. from Daily SDR Activity section)
+  if (user.role === 'telesales' && isSdrSharedLead(lead)) {
+    return true;
+  }
   return false;
 }
 
-/** BD may update / email shared product-pool leads (and own leads). Caller may log calls & update any CRM lead. */
+/** BD may update / email shared product-pool leads, SDR-worked leads, and own leads. Caller may log calls & update any CRM lead. */
 export function canUpdateLead(user, lead) {
   if (!lead) return false;
   if (roleHasPermission(user.role, 'leads:update_any')) return true;
   if (!roleHasPermission(user.role, 'leads:update_own')) return false;
   if (user.role === 'caller') return true;
   if (lead.assigned_to === user.id || lead.created_by === user.id) return true;
-  return isBdSharedProductSource(lead.source);
+  if (isBdSharedProductSource(lead.source)) return true;
+  if (user.role === 'telesales' && isSdrSharedLead(lead)) return true;
+  return false;
 }
 
 export const LEAD_SOURCES = {

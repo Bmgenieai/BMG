@@ -1020,6 +1020,18 @@ export function migrate() {
     CREATE INDEX IF NOT EXISTS idx_cold_call_logs_outcome
       ON cold_call_logs(call_outcome);
   `);
+
+  const activityExtraAlters = [
+    `ALTER TABLE lead_activities ADD COLUMN email_details_requested INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE lead_activities ADD COLUMN email_request_notes TEXT`,
+  ];
+  for (const sql of activityExtraAlters) {
+    try {
+      db.exec(sql);
+    } catch {
+      /* column already exists */
+    }
+  }
 }
 
 migrate();
