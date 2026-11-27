@@ -1444,6 +1444,8 @@ router.post(
     let skipped = 0;
     let duplicates = 0;
     const skipReasons = { missing_name: 0, duplicate: 0 };
+    const importedLeadIds = [];
+    const matchedLeadIds = [];
     const insert = db.prepare(
       `INSERT INTO leads (
         id, name, email, phone, company, country, state, job_title, industry, contact_format,
@@ -1594,11 +1596,13 @@ router.post(
           company: companyVal,
         });
         if (existing.length) {
+          const existingIds = existing.map((d) => d.id);
           bumpTimesAdded(
-            existing.map((d) => d.id),
+            existingIds,
             req.user.id,
             `Duplicate CSV row skipped — times_added incremented (${req.file.originalname})`,
           );
+          for (const exId of existingIds) matchedLeadIds.push(exId);
           duplicates += 1;
           skipped += 1;
           skipReasons.duplicate += 1;
@@ -1639,6 +1643,7 @@ router.post(
           req.user.id,
           `${sourceNoun} CSV import by ${req.user.name} · Date added ${dateAdded.slice(0, 10)}`,
         );
+        importedLeadIds.push(id);
         imported += 1;
       }
       db.prepare(
@@ -1657,6 +1662,8 @@ router.post(
       sourceLabel: sourceDisplayLabel(source),
       skipReasons,
       dateAdded,
+      leadIds: importedLeadIds,
+      matchedLeadIds: [...new Set(matchedLeadIds)],
     });
   },
 );

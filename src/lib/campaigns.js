@@ -1625,12 +1625,18 @@ export function addLeads(campaignId, leadIds, { user, skipPerm = false, emails }
     throw err;
   }
 
-  const placeholders = ids.map(() => '?').join(',');
-  let leads = db
-    .prepare(
-      `SELECT * FROM leads WHERE id IN (${placeholders}) AND email IS NOT NULL AND email != ''`,
-    )
-    .all(...ids);
+  let leads = [];
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = ids.slice(i, i + 500);
+    const placeholders = chunk.map(() => '?').join(',');
+    leads.push(
+      ...db
+        .prepare(
+          `SELECT * FROM leads WHERE id IN (${placeholders}) AND email IS NOT NULL AND email != ''`,
+        )
+        .all(...chunk),
+    );
+  }
 
   if (!skipPerm && user) {
     leads = leads.filter((l) => canUpdateLead(user, l));
