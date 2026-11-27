@@ -966,6 +966,34 @@ router.post(
   },
 );
 
+function parseScheduledUtc(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(s)
+    ? s
+    : s.includes('T')
+      ? `${s}Z`
+      : `${s.replace(' ', 'T')}Z`;
+  const d = new Date(normalized);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function getLocalDateKey(raw, timeZone) {
+  const d = parseScheduledUtc(raw);
+  if (!d) return String(raw || '').slice(0, 10);
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timeZone || 'Asia/Karachi',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(d);
+  } catch {
+    return d.toISOString().slice(0, 10);
+  }
+}
+
 /** List scheduled emails (own for telesales; team/all for manager/ceo). */
 router.get(
   '/scheduled',
@@ -981,12 +1009,14 @@ router.get(
               l.name AS lead_name, l.email AS lead_email, u.name AS scheduled_by_name,
               c.name AS campaign_name, c.id AS campaign_id_join,
               c.timezone AS campaign_timezone,
-              cs.step_order, cs.delay_days
+              cs.step_order, cs.delay_days,
+              ea.email AS sender_email, ea.label AS sender_label
        FROM scheduled_emails s
        LEFT JOIN leads l ON l.id = s.lead_id
        LEFT JOIN users u ON u.id = s.user_id
        LEFT JOIN email_campaigns c ON c.id = s.campaign_id
-       LEFT JOIN email_campaign_steps cs ON cs.id = s.campaign_step_id`;
+       LEFT JOIN email_campaign_steps cs ON cs.id = s.campaign_step_id
+       LEFT JOIN email_accounts ea ON ea.id = s.email_account_id`;
 
     let rows;
     if (canSeeAll) {
@@ -1011,12 +1041,13 @@ router.get(
               .all(req.user.id, status, limit);
     }
 
-    // Campaign rows: one group per campaign + step + scheduled time.
+    // Campaign rows: one group per campaign + step + local date in campaign timezone
+    // (collapses per-sender staggered minute slots into a single clean row).
     // Cold-email rows: keep batch_id grouping.
     const batches = new Map();
     for (const r of rows) {
       const groupKey = r.campaign_id
-        ? `campaign:${r.campaign_id}:step:${r.campaign_step_id || 'x'}:${r.scheduled_at || ''}`
+        ? `campaign:${r.campaign_id}:step:${r.campaign_step_id || 'x'}:${getLocalDateKey(r.scheduled_at, r.campaign_timezone)}`
         : `batch:${r.batch_id}`;
       if (!batches.has(groupKey)) {
         const stepOrder = Number(r.step_order) || null;
@@ -1024,6 +1055,11 @@ router.get(
           id: groupKey,
           batchId: r.batch_id,
           scheduledAt: r.scheduled_at,
+          scheduledEndAt: r.scheduled_at,
+          _minMs: parseScheduledUtc(r.scheduled_at)?.getTime() ?? null,
+          _maxMs: parseScheduledUtc(r.scheduled_at)?.getTime() ?? null,
+          _variants: new Set(),
+          _senders: new Set(),
           status: r.status,
           subject: r.subject,
           templateId: r.template_id,
@@ -1051,6 +1087,19 @@ router.get(
         });
       }
       const b = batches.get(groupKey);
+      const rowMs = parseScheduledUtc(r.scheduled_at)?.getTime() ?? null;
+      if (rowMs !== null) {
+        if (b._minMs === null || rowMs < b._minMs) {
+          b._minMs = rowMs;
+          b.scheduledAt = r.scheduled_at;
+        }
+        if (b._maxMs === null || rowMs > b._maxMs) {
+          b._maxMs = rowMs;
+          b.scheduledEndAt = r.scheduled_at;
+        }
+      }
+      if (r.variant_key) b._variants.add(r.variant_key);
+      if (r.sender_email) b._senders.add(r.sender_email);
       b.count += 1;
       if (r.status === 'sent') b.sent += 1;
       else if (r.status === 'failed') b.failed += 1;
@@ -1062,13 +1111,28 @@ router.get(
         leadId: r.lead_id,
         leadName: r.lead_name,
         leadEmail: r.lead_email,
+        scheduledAt: r.scheduled_at,
+        senderEmail: r.sender_email || null,
+        senderLabel: r.sender_label || null,
         status: r.status,
         error: r.error,
         variantKey: r.variant_key || null,
       });
     }
 
-    res.json({ batches: [...batches.values()] });
+    const result = [...batches.values()].map((b) => {
+      const variants = [...b._variants].sort();
+      const senders = [...b._senders];
+      const { _minMs, _maxMs, _variants, _senders, ...clean } = b;
+      return {
+        ...clean,
+        variantKey: variants.length ? variants.join(', ') : clean.variantKey,
+        senderCount: senders.length,
+        senders,
+      };
+    });
+
+    res.json({ batches: result });
   },
 );
 
@@ -1083,12 +1147,18 @@ router.post(
     if (!ids.length) {
       return res.status(400).json({ error: 'ids[] required' });
     }
-    const placeholders = ids.map(() => '?').join(',');
-    let rows = db
-      .prepare(
-        `SELECT id, user_id, status FROM scheduled_emails WHERE id IN (${placeholders})`,
-      )
-      .all(...ids);
+    let rows = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      const placeholders = chunk.map(() => '?').join(',');
+      rows.push(
+        ...db
+          .prepare(
+            `SELECT id, user_id, status FROM scheduled_emails WHERE id IN (${placeholders})`,
+          )
+          .all(...chunk),
+      );
+    }
     if (!canSeeAll) rows = rows.filter((r) => r.user_id === req.user.id);
     const pending = rows.filter((r) => r.status === 'pending');
     if (!pending.length) {
